@@ -17,7 +17,7 @@ use std::{
 
 pub(crate) const VERSION: &str = env!("LITETEXT_VERSION");
 const REPOSITORY: &str = "https://github.com/Heartfilia/LiteText";
-const API: &str = "https://api.github.com/repos/Heartfilia/LiteText/releases/latest";
+const API: &str = "https://api.github.com/repos/Heartfilia/LiteText/releases";
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -43,7 +43,7 @@ struct Release {
 }
 
 enum Event {
-    Checked(Release),
+    Checked(Option<Release>),
     Progress(String),
     Ready(Box<Prepared>),
     Failed(String),
@@ -146,18 +146,55 @@ fn read_limited(mut reader: impl Read, limit: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn check(settings: &Settings) -> Result<Release> {
-    let response = client(settings, Duration::from_secs(15))?
-        .get(API)
-        .header("Accept", "application/vnd.github+json")
-        .send()?
-        .error_for_status()?;
-    let release: Release = serde_json::from_slice(&read_limited(response, 4 * 1024 * 1024)?)?;
-    version(&release.tag_name)?;
-    if release.draft || release.prerelease {
-        return Err("Not a stable release".into());
+fn includes_prereleases(current: &str) -> Result<bool> {
+    Ok(current == "dev" || !version(current)?.pre.is_empty())
+}
+
+fn select_release(releases: Vec<Release>, current: &str, package: &str) -> Result<Option<Release>> {
+    let include_pre = includes_prereleases(current)?;
+    Ok(releases
+        .into_iter()
+        .filter_map(|release| {
+            let parsed = version(&release.tag_name).ok()?;
+            if release.draft
+                || (!include_pre && (release.prerelease || !parsed.pre.is_empty()))
+                || !release.assets.iter().any(|a| a.name == package)
+                || !release.assets.iter().any(|a| a.name == "SHA256SUMS")
+            {
+                return None;
+            }
+            Some((parsed, release))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, release)| release))
+}
+
+fn check(settings: &Settings) -> Result<Option<Release>> {
+    let http = client(settings, Duration::from_secs(15))?;
+    let mut releases = Vec::new();
+    // The list endpoint includes prereleases and returns [] for an empty repo.
+    // /latest returns 404 when only beta/rc releases exist.
+    for page in 1..=10 {
+        let response = http
+            .get(API)
+            .query(&[("per_page", 100), ("page", page)])
+            .header("Accept", "application/vnd.github+json")
+            .send()?
+            .error_for_status()?;
+        let has_next = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("rel=\"next\""));
+        releases.extend(serde_json::from_slice::<Vec<Release>>(&read_limited(
+            response,
+            4 * 1024 * 1024,
+        )?)?);
+        if !has_next {
+            return select_release(releases, VERSION, &asset_name()?);
+        }
     }
-    Ok(release)
+    Err("Release list exceeds safety limit; cannot determine latest version".into())
 }
 fn checksum(manifest: &str, name: &str) -> Result<String> {
     let entries: Vec<_> = manifest
@@ -542,13 +579,17 @@ impl LiteTextApp {
             match event {
                 Some(Ok(Event::Progress(message))) => self.updater.message = message,
                 Some(Ok(Event::Checked(release))) => {
-                    let newer = is_newer(&release.tag_name, VERSION).unwrap_or(false);
-                    self.updater.message = if newer {
-                        format!("发现新版本 / Available: {}", release.tag_name)
-                    } else {
-                        "已是最新版本 / Up to date".into()
+                    self.updater.message = match &release {
+                        Some(release) if is_newer(&release.tag_name, VERSION).unwrap_or(false) => {
+                            format!("发现新版本 / Available: {}", release.tag_name)
+                        }
+                        Some(_) => "已是最新版本 / Up to date".into(),
+                        None if includes_prereleases(VERSION).unwrap_or(false) => {
+                            "暂无适用于当前平台的已发布版本，请等待打包完成 / No compatible release available yet".into()
+                        }
+                        None => "暂无适用于当前平台的稳定版，仓库可能仅有测试版 / No compatible stable release; prereleases may exist".into(),
                     };
-                    self.updater.release = Some(release);
+                    self.updater.release = release;
                     self.updater.checked = Some((Instant::now(), self.updates.clone()));
                     self.updater.receiver = None;
                 }
@@ -647,7 +688,6 @@ impl LiteTextApp {
             ui.add_enabled(
                 self.updates.proxy_enabled,
                 egui::TextEdit::singleline(&mut self.updates.proxy_url)
-                    .password(true)
                     .hint_text("http://127.0.0.1:7890 / socks5h://…")
                     .desired_width(ui.available_width()),
             );
@@ -837,6 +877,104 @@ mod tests {
             assert!(installed_target(Path::new("/some/program")).is_err());
         }
         assert!(asset_name().unwrap().starts_with("LiteText-"));
+    }
+
+    fn release_for_test(tag: &str, prerelease: bool) -> Release {
+        Release {
+            tag_name: tag.into(),
+            draft: false,
+            prerelease,
+            assets: ["package.zip", "SHA256SUMS"]
+                .into_iter()
+                .map(|name| Asset {
+                    name: name.into(),
+                    browser_download_url: String::new(),
+                    size: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn beta_and_dev_channels_include_prereleases_and_stable_promotions() {
+        for current in ["dev", "v0.1.1-beta.3", "v0.1.1-rc.1"] {
+            let releases = vec![
+                release_for_test("v0.1.1-beta.10", true),
+                release_for_test("v0.1.1-beta.9", true),
+            ];
+            let latest = select_release(releases, current, "package.zip")
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.tag_name, "v0.1.1-beta.10");
+        }
+        let releases = vec![
+            release_for_test("v0.1.1-beta.10", true),
+            release_for_test("v0.1.1", false),
+        ];
+        let latest = select_release(releases, "v0.1.1-beta.3", "package.zip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.tag_name, "v0.1.1");
+        assert!(is_newer(&latest.tag_name, "v0.1.1-beta.3").unwrap());
+    }
+
+    #[test]
+    fn stable_channel_ignores_betas_drafts_invalid_tags_and_incomplete_packages() {
+        let mut draft = release_for_test("v9.0.0", false);
+        draft.draft = true;
+        let mut incomplete = release_for_test("v8.0.0", false);
+        incomplete.assets.pop();
+        let releases = vec![
+            release_for_test("v0.2.0-beta.1", true),
+            release_for_test("v0.2.0-rc.1", false),
+            draft,
+            incomplete,
+            release_for_test("not-semver", false),
+            release_for_test("v0.1.1", false),
+        ];
+        let latest = select_release(releases, "v0.1.0", "package.zip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.tag_name, "v0.1.1");
+        assert!(
+            select_release(
+                vec![release_for_test("v0.1.1-beta.3", true)],
+                "v0.1.0",
+                "package.zip"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            select_release(vec![], "dev", "package.zip")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_release(
+                vec![release_for_test("v0.1.1", false)],
+                "dev",
+                "other-platform.zip"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_release_check_is_not_an_http_failure_and_clears_previous_result() {
+        let (tx, rx) = mpsc::channel();
+        assert!(tx.send(Event::Checked(None)).is_ok());
+        let mut app = LiteTextApp::default();
+        app.updater.status_loaded = true;
+        app.updater.release = Some(release_for_test("v0.1.1", false));
+        app.updater.receiver = Some(rx);
+        app.poll_updates();
+        assert!(app.updater.release.is_none());
+        assert!(app.updater.receiver.is_none());
+        assert!(app.updater.checked.is_some());
+        assert!(!app.updater.message.contains("Update failed"));
+        assert!(app.updater.message.contains("暂无"));
     }
 
     #[test]
@@ -1039,6 +1177,8 @@ mod tests {
                 show_settings: true,
                 ..Default::default()
             };
+            app.updates.proxy_enabled = true;
+            app.updates.proxy_url = "http://127.0.0.1:7890".into();
             let mut output = None;
             for _ in 0..5 {
                 output = Some(ctx.run(
@@ -1068,6 +1208,10 @@ mod tests {
                     .any(|s| s.contains(&format!("LiteText  {VERSION}")))
             );
             assert!(!labels.contains(&crate::tr(lang).done));
+            assert!(
+                labels.contains(&"http://127.0.0.1:7890"),
+                "Proxy must be rendered as plaintext"
+            );
         }
     }
 

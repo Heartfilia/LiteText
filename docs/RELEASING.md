@@ -6,7 +6,7 @@
 - 发布通过 `LITETEXT_VERSION` 注入 tag（例如 `v1.2.3`），构建时验证 SemVer。
 - 版本 tag 由维护者手动创建和推送，助手不代建、不移动既有 tag。推送 `v*` tag 触发 `.github/workflows/release.yml`；普通 main 推送不发布。每个平台先测试、Clippy，再构建；全部成功才发布 GitHub Release。
 - 产物：macOS arm64（Apple Silicon）的 `.dmg`（首次安装）与 `.zip`（自动更新）、Windows x64 ZIP、Linux x64 ZIP，以及统一 `SHA256SUMS`。不再编译或上传 macOS x64（Intel）。
-- `-rc.1` 等带连字符的 tag 发布为 prerelease；应用内目前仅查询 GitHub `/releases/latest` 的稳定版本。
+- `-rc.1` 等带连字符的 tag 发布为 prerelease；应用内查询 GitHub Releases 列表并按 SemVer 选择当前平台的最高完整版本。稳定安装版只接受稳定版，beta／rc 安装版与 dev 同时接受稳定版和预发布版本；不会因发布时间顺序或 beta.9/beta.10 的字典序选错版本。
 - 配置目标仓库：**Heartfilia/LiteText**。发布前必须把 Cargo.lock、源码、assets、scripts 和 workflow 一并提交。失败任务的重跑仍使用原 tag 的旧提交，不会自动带入 main 上的修复；请在包含修复的提交上手动创建新版本 tag。
 
 示例（自行确认代码和版本后执行）：
@@ -26,7 +26,9 @@ git push origin v0.1.1
 
 开发构建仅能检查版本，不自动覆盖 `target/` 中的程序。只读安装目录会报错，不自动提权。macOS 磁盘映像和 App Translocation 位置拒绝原位更新。
 
-代理只用于本模块的 GitHub API、校验文件与下载请求。关闭代理时明确不读取 `HTTP_PROXY` 等环境变量。填写 `http://127.0.0.1:7890` 或 `socks5h://127.0.0.1:1080`，**不是** GitHub 镜像 URL 前缀。代理地址随设置持久化，不做加密；建议使用本机无凭据代理，不在共享机器的配置里保存密码。
+代理只用于本模块的 GitHub API、校验文件与下载请求。关闭代理时明确不读取 `HTTP_PROXY` 等环境变量。填写 `http://127.0.0.1:7890` 或 `socks5h://127.0.0.1:1080`，**不是** GitHub 镜像 URL 前缀。输入框明文显示地址，随设置持久化，不做加密；建议使用本机无凭据代理，不在共享机器的配置里保存密码。
+
+只有预发布时 `/releases/latest` 返回404是GitHub的正常行为，因此不再使用该端点。列表为空、没有匹配通道或当前平台缺少ZIP/SHA256SUMS时显示「暂无可用版本」；真正的HTTP错误（包括列表端点404、403/限流）仍报错，不掩盖连接或仓库权限问题。
 
 ## 安全边界与待验证项
 
