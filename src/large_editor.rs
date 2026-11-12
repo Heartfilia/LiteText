@@ -651,7 +651,7 @@ pub(crate) fn show(
                         egui::pos2(gutter.right() + 1.0, bounds.top()),
                         bounds.max,
                     )));
-                    egui::TextEdit::multiline(&mut state.large.window)
+                    let mut output = egui::TextEdit::multiline(&mut state.large.window)
                         .id(id)
                         .font(font.clone())
                         .text_color(colors.map_or(pal.text_main, |c| c.text))
@@ -661,7 +661,14 @@ pub(crate) fn show(
                         .desired_rows(1)
                         .layouter(&mut layouter)
                         .lock_focus(true)
-                        .show(ui)
+                        .show(ui);
+                    editor::select_word_on_double_click(
+                        ui,
+                        &mut output,
+                        &state.large.window,
+                        || layouter(ui, &state.large.window, rect.width()),
+                    );
+                    output
                 })
                 .inner;
             if let Some(render) = &tools.workspace {

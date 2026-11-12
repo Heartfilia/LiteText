@@ -6,6 +6,113 @@ use std::ops::Range;
 const GUTTER_NUMBER_GAP: f32 = 2.0;
 const EDITOR_LEFT_PADDING: f32 = 4.0;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Han,
+    Word,
+    Space,
+    Other,
+}
+
+fn word_class(c: char) -> WordClass {
+    if matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+        | 0x20000..=0x2FA1F | 0x30000..=0x3347F)
+        || c == '〇'
+    {
+        WordClass::Han
+    } else if c.is_alphanumeric() || c == '_' {
+        WordClass::Word
+    } else if c.is_whitespace() && c != '\r' && c != '\n' {
+        WordClass::Space
+    } else {
+        WordClass::Other
+    }
+}
+
+fn word_range(text: &str, index: usize) -> Range<usize> {
+    let chars: Vec<_> = text.chars().collect();
+    if index >= chars.len() {
+        return chars.len()..chars.len();
+    }
+    let class = word_class(chars[index]);
+    if class == WordClass::Other {
+        return index..index + 1;
+    }
+    let mut start = index;
+    let mut end = index + 1;
+    while start > 0 && word_class(chars[start - 1]) == class {
+        start -= 1;
+    }
+    while end < chars.len() && word_class(chars[end]) == class {
+        end += 1;
+    }
+    start..end
+}
+
+/// Override egui's ASCII-only word selection in both document editors. Rebuild
+/// only the double-click frame so selection paint, copy and cursor agree at once.
+pub(crate) fn select_word_on_double_click(
+    ui: &egui::Ui,
+    output: &mut egui::text_edit::TextEditOutput,
+    text: &str,
+    layout: impl FnOnce() -> std::sync::Arc<egui::Galley>,
+) {
+    if !output.response.double_clicked() || output.response.triple_clicked() {
+        return;
+    }
+    let Some(pointer) = output.response.interact_pointer_pos() else {
+        return;
+    };
+    let local = pointer - output.galley_pos;
+    let hit = output.galley.cursor_from_pos(local);
+    let row = &output.galley.rows[hit.rcursor.row];
+    let mut index = hit.ccursor.index;
+    // cursor_from_pos rounds to the closest caret. On the right half of a
+    // glyph, select that glyph, not the punctuation/word after it.
+    if hit.rcursor.column > 0 && local.x < row.x_offset(hit.rcursor.column) {
+        index = index.saturating_sub(1);
+    }
+    let range = word_range(text, index);
+    let cursor = egui::text::CCursorRange::two(
+        egui::text::CCursor::new(range.start),
+        egui::text::CCursor::new(range.end),
+    );
+    output.state.cursor.set_char_range(Some(cursor));
+    output.state.clone().store(ui.ctx(), output.response.id);
+    output.cursor_range = Some(egui::text::CursorRange {
+        primary: output.galley.from_ccursor(cursor.primary),
+        secondary: output.galley.from_ccursor(cursor.secondary),
+    });
+    let old = output.galley.clone();
+    let mut galley = layout();
+    egui::text_selection::visuals::paint_text_selection(
+        &mut galley,
+        ui.visuals(),
+        output.cursor_range.as_ref().unwrap(),
+        None,
+    );
+    ui.ctx().graphics_mut(|graphics| {
+        let list = graphics.entry(ui.layer_id());
+        let indices: Vec<_> = list
+            .all_entries()
+            .enumerate()
+            .filter_map(|(index, shape)| match &shape.shape {
+                egui::Shape::Text(t) if std::sync::Arc::ptr_eq(&t.galley, &old) => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in indices {
+            list.mutate_shape(egui::layers::ShapeIdx(index), |shape| {
+                if let egui::Shape::Text(t) = &mut shape.shape {
+                    t.galley = galley.clone();
+                }
+            });
+        }
+    });
+    output.galley = galley;
+    ui.ctx().request_repaint();
+}
+
 /// ScrollArea includes the frozen gutter in its viewport, but TextEdit does not
 /// know that it is covered. Reserve that width on the left of its reveal target.
 /// Only reveal on cursor/edit changes, so manual scrolling can leave it offscreen.
@@ -200,7 +307,7 @@ pub(crate) fn show(
                         egui::pos2(gutter.right() + 1.0, bounds.top()),
                         bounds.max,
                     )));
-                    egui::TextEdit::multiline(text)
+                    let mut output = egui::TextEdit::multiline(&mut *text)
                         .id(editor_id)
                         .font(font.clone())
                         .text_color(colors.map_or(pal.text_main, |c| c.text))
@@ -210,7 +317,11 @@ pub(crate) fn show(
                         .min_size(editor_rect.size())
                         .layouter(&mut layouter)
                         .lock_focus(true)
-                        .show(ui)
+                        .show(ui);
+                    select_word_on_double_click(ui, &mut output, text, || {
+                        layouter(ui, text, editor_rect.width())
+                    });
+                    output
                 });
             // Propagate the full text extent to the scroll area, not just the viewport-sized child.
             let mut output = editor_output.inner;
@@ -456,6 +567,135 @@ pub(crate) fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_words_stop_at_ascii_and_chinese_punctuation() {
+        let text = r#"{"message":"中文内容,English_word42！测试。"}"#;
+        for expected in ["中文内容", "English_word42", "测试", ",", "！", "。", "\""] {
+            let start = text[..text.find(expected).unwrap()].chars().count();
+            for offset in 0..expected.chars().count() {
+                let range = word_range(text, start + offset);
+                assert_eq!(
+                    text.chars()
+                        .skip(range.start)
+                        .take(range.len())
+                        .collect::<String>(),
+                    expected
+                );
+            }
+        }
+        assert_eq!(word_range("", 0), 0..0);
+        assert_eq!(word_range("中文", 2), 2..2);
+        for (text, index, expected) in [
+            ("中文English", 1, "中文"),
+            ("中文English", 3, "English"),
+            ("甲\r\n乙", 0, "甲"),
+            ("甲\r\n乙", 3, "乙"),
+            ("café!", 2, "café"),
+            ("𠀀中文,", 0, "𠀀中文"),
+        ] {
+            let range = word_range(text, index);
+            assert_eq!(
+                text.chars()
+                    .skip(range.start)
+                    .take(range.len())
+                    .collect::<String>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn real_double_click_selects_and_copies_words_in_both_editors() {
+        let sample = r#"{"msg":"中文内容,English_word42！测试。"}"#;
+        for (large, wrap) in [(false, false), (false, true), (true, false), (true, true)] {
+            for (expected, offset) in [
+                ("中文内容", 0),
+                ("中文内容", 3),
+                ("English_word42", 4),
+                ("测试", 1),
+                (",", 0),
+            ] {
+                let prefix = if large {
+                    "padding\n".repeat(20)
+                } else {
+                    String::new()
+                };
+                let suffix = if large {
+                    "\npadding".repeat(40000)
+                } else {
+                    "\nend".into()
+                };
+                let original = format!("{prefix}{sample}{suffix}");
+                let mut harness = Harness::new(&original);
+                harness.state.tools.wrap = wrap;
+                let start = prefix.chars().count()
+                    + sample[..sample.find(expected).unwrap()].chars().count();
+                for _ in 0..4 {
+                    harness.run(vec![]);
+                }
+                let output = harness.run(vec![]);
+                let (pos, galley) = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text().contains(sample) => {
+                            Some((t.pos, t.galley.clone()))
+                        }
+                        _ => None,
+                    })
+                    .expect("Document text must be rendered");
+                let local_start = galley.text()[..galley.text().find(expected).unwrap()]
+                    .chars()
+                    .count();
+                let a = galley.pos_from_ccursor(egui::text::CCursor::new(local_start + offset));
+                let b = galley.pos_from_ccursor(egui::text::CCursor::new(local_start + offset + 1));
+                // Hit the glyph's right half to exercise nearest-caret rounding.
+                let pointer =
+                    pos + egui::vec2(a.center().x * 0.25 + b.center().x * 0.75, a.center().y);
+                for _ in 0..2 {
+                    harness.button(pointer, egui::PointerButton::Primary, true);
+                    harness.button(pointer, egui::PointerButton::Primary, false);
+                }
+                let cursor = harness.state.cursor.unwrap();
+                assert_eq!(
+                    cursor.secondary.index.min(cursor.primary.index),
+                    start,
+                    "large={large} {expected}"
+                );
+                assert_eq!(
+                    cursor.secondary.index.max(cursor.primary.index),
+                    start + expected.chars().count(),
+                    "large={large} {expected} pointer={pointer:?}"
+                );
+                assert_eq!(harness.state.selected_characters, expected.chars().count());
+                let copied = harness.run(vec![egui::Event::Copy]);
+                assert!(
+                    copied.platform_output.commands.iter().any(
+                        |c| matches!(c, egui::OutputCommand::CopyText(value) if value == expected)
+                    ),
+                    "large={large} {expected}"
+                );
+                assert_eq!(harness.text, original);
+                if large {
+                    assert!(harness.state.large.laid_out_bytes < 64 * 1024);
+                }
+                harness.run(vec![egui::Event::Text("replacement".into())]);
+                let at = original.find(expected).unwrap();
+                let mut replaced = original.clone();
+                replaced.replace_range(at..at + expected.len(), "replacement");
+                assert_eq!(harness.text, replaced);
+                harness.run(vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }]);
+                assert_eq!(harness.text, original);
+            }
+        }
+    }
 
     #[test]
     fn wrapping_whitespace_and_unicode_selection_do_not_modify_document() {
