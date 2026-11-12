@@ -1,0 +1,37 @@
+[package]
+name = "litetext"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, cross-platform text reader built with Rust"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+    "persistence",
+] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ab_glyph = "0.2.32"
+tempfile = "3.27"
+encoding_rs = "0.8"
+regex = "1"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "socks"] }
+semver = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+fs2 = "0.4"
+
+[build-dependencies]
+semver = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

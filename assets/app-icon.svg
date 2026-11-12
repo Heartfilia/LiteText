@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>LiteText</title>
+  <rect x="40" y="40" width="432" height="432" rx="112" fill="#0e1116"/>
+  <path d="M154 147H358Q364 147 364 153V191Q364 197 358 197H281V367Q281 373 275 373H237Q231 373 231 367V197H154Q148 197 148 191V153Q148 147 154 147Z" fill="#f8fafc"/>
+</svg>
