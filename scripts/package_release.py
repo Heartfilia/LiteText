@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import zipfile
+from macos_documents import document_types
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--os", choices=["macos", "linux", "windows"], required=True)
@@ -37,6 +38,7 @@ if args.os == "macos":
             "CFBundleShortVersionString": tag.removeprefix("v").split("-")[0].split("+")[0],
             "CFBundleVersion": tag.removeprefix("v").split("-")[0].split("+")[0],
             "LSMinimumSystemVersion": "11.0", "NSHighResolutionCapable": True,
+            **document_types(),
         }, stream)
     # Ad-hoc signing makes the bundle structurally valid on Apple Silicon.
     # This is NOT Developer ID signing/notarization and does not bypass Gatekeeper.

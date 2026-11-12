@@ -32,6 +32,7 @@ pub(crate) struct State {
     visual_starts: Vec<usize>,
     visual_rows: Vec<usize>,
     visual_width: Option<u32>,
+    font_key: Option<(u32, u32)>,
     fold_generation: Option<u64>,
     visible_lines: Vec<usize>,
     fingerprints: Vec<u64>,
@@ -327,6 +328,13 @@ impl State {
         width: f32,
         wrap: bool,
     ) {
+        let font_key = (font.size.to_bits(), ui.ctx().pixels_per_point().to_bits());
+        if self.font_key != Some(font_key) {
+            self.font_key = Some(font_key);
+            self.wrap_key = None;
+            self.visual_width = None;
+            self.invalidate_window();
+        }
         let key = (if wrap { width.to_bits() } else { 0 }, self.ranges.len());
         if self.wrap_key == Some(key) {
             return;
@@ -406,14 +414,14 @@ pub(crate) fn show(
         .prepare_input(ui, state.pending_selection.is_some(), id);
     let folds = state.folds.clone();
     let fold_w = folds.width();
-    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-    let font = FontId::monospace(13.5);
+    editor::scroll_style(ui, pal);
+    let font = state.font();
     let mut tools = state.tools.clone();
     if let Some(render) = &tools.workspace {
         render.apply_style(ui);
     }
     let colors = tools.workspace.as_ref().map(|r| r.colors);
-    let row_height = ui.fonts(|f| f.row_height(&font));
+    let row_height = editor::row_height(ui, &font);
     let probe = ui
         .painter()
         .layout_no_wrap("0000000000".to_owned(), font.clone(), pal.text_main);
@@ -474,7 +482,7 @@ pub(crate) fn show(
         ));
         state.large.invalidate_window();
         let line = state.large.line_for_char(range.start);
-        let scroll_id = ui.make_persistent_id(("draft_scroll", file_id));
+        let scroll_id = ui.make_persistent_id(egui::Id::new(("draft_scroll", file_id)));
         let mut scroll = egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
         scroll.offset.y =
             state.large.visual_starts.get(line).copied().unwrap_or(line) as f32 * row_height;
@@ -495,6 +503,7 @@ pub(crate) fn show(
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
             let origin = ui.cursor().min;
+            let viewport_clip = ui.clip_rect();
             let at_row = |row: usize| {
                 let at = state
                     .large
@@ -649,7 +658,7 @@ pub(crate) fn show(
                 .allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.set_clip_rect(ui.clip_rect().intersect(egui::Rect::from_min_max(
                         egui::pos2(gutter.right() + 1.0, bounds.top()),
-                        bounds.max,
+                        viewport_clip.max,
                     )));
                     let mut output = egui::TextEdit::multiline(&mut state.large.window)
                         .id(id)
@@ -915,12 +924,44 @@ pub(crate) fn show(
             .cursor
             .map_or(0, |c| c.primary.index.abs_diff(c.secondary.index))
     };
+    state.cursor_line = state
+        .large
+        .cursor
+        .map_or(0, |c| state.large.line_for_char(c.primary.index));
     changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_rebuilds_wrapped_visual_index_without_changing_document_or_cursor() {
+        let text = "中文 hello world 🙂 ".repeat(60) + "\nlast";
+        let mut state = State::default();
+        state.index(&text);
+        let ctx = egui::Context::default();
+        let mut row_counts = Vec::new();
+        for size in [9.0, 32.0, 9.0] {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    state.visual_index(
+                        ui,
+                        &text,
+                        &FontId::monospace(size),
+                        &crate::DARK,
+                        400.0,
+                        true,
+                    );
+                    row_counts.push(state.visual_starts.last().copied().unwrap());
+                });
+            });
+        }
+        assert!(row_counts[0] < row_counts[1]);
+        assert_eq!(row_counts[0], row_counts[2]);
+        assert_eq!(state.characters, text.chars().count());
+        assert_eq!(state.revision, 0);
+    }
 
     #[test]
     fn jsonl_viewport_is_bounded_reused_for_small_scrolls_and_editable_at_depth() {

@@ -146,6 +146,8 @@ pub(crate) struct EditorState {
     pub(crate) tools: crate::text_tools::Tools,
     pub(crate) cursor: Option<egui::text::CCursorRange>,
     pub(crate) selected_characters: usize,
+    pub(crate) cursor_line: usize,
+    pub(crate) font_size: f32,
     pub(crate) pending_selection: Option<Range<usize>>,
     pub(crate) changes: crate::changes::Changes,
     pub(crate) folds: crate::json_plugin::Folds,
@@ -153,10 +155,35 @@ pub(crate) struct EditorState {
 }
 
 impl EditorState {
+    pub(crate) fn font(&self) -> FontId {
+        FontId::monospace(if self.font_size > 0.0 {
+            self.font_size
+        } else {
+            13.5
+        })
+    }
+
     pub(crate) fn invalidate(&mut self) {
         self.large.indexed_len = None;
         self.large.invalidate_window();
     }
+}
+
+/// Match epaint's per-row physical-pixel rounding, not the raw font metric.
+pub(crate) fn row_height(ui: &egui::Ui, font: &FontId) -> f32 {
+    let ppp = ui.ctx().pixels_per_point();
+    (ui.fonts(|f| f.row_height(font)) * ppp).round() / ppp
+}
+
+pub(crate) fn scroll_style(ui: &mut egui::Ui, pal: &Palette) {
+    let mut style = egui::style::ScrollStyle::solid();
+    style.foreground_color = true;
+    style.bar_width = 10.0;
+    ui.style_mut().spacing.scroll = style;
+    let v = ui.visuals_mut();
+    v.widgets.inactive.fg_stroke.color = pal.text_faint;
+    v.widgets.hovered.fg_stroke.color = pal.text_main;
+    v.widgets.active.fg_stroke.color = pal.accent;
 }
 
 /// Byte ranges exclude line terminators; even a blank document has one line.
@@ -222,8 +249,8 @@ pub(crate) fn show(
         .prepare_input(ui, state.pending_selection.is_some(), editor_id);
     let folds = state.folds.clone();
     let fold_w = folds.width();
-    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-    let font = FontId::monospace(13.5);
+    scroll_style(ui, pal);
+    let font = state.font();
     let tools = state.tools.clone();
     if let Some(render) = &tools.workspace {
         render.apply_style(ui);
@@ -261,6 +288,7 @@ pub(crate) fn show(
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, _| {
             let origin = ui.cursor().min;
+            let viewport_clip = ui.clip_rect();
             let editor_rect = egui::Rect::from_min_size(
                 origin + egui::vec2(gutter_w + EDITOR_LEFT_PADDING, 12.0),
                 egui::vec2(
@@ -305,7 +333,7 @@ pub(crate) fn show(
                     // Keep the gutter frozen during horizontal scrolling.
                     ui.set_clip_rect(ui.clip_rect().intersect(egui::Rect::from_min_max(
                         egui::pos2(gutter.right() + 1.0, bounds.top()),
-                        bounds.max,
+                        viewport_clip.max,
                     )));
                     let mut output = egui::TextEdit::multiline(&mut *text)
                         .id(editor_id)
@@ -334,6 +362,12 @@ pub(crate) fn show(
             }
             changed |= output.response.changed();
             state.cursor = output.state.cursor.char_range();
+            state.cursor_line = state.cursor.map_or(0, |c| {
+                text.chars()
+                    .take(c.primary.index)
+                    .filter(|&c| c == '\n')
+                    .count()
+            });
             state.tools.handle_marker(ui, &output, text, 0);
             reveal_cursor(ui, &output, previous, gutter_w, reveal);
             if tools.whitespace {
@@ -567,6 +601,154 @@ pub(crate) fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_jsonl_rows_align_and_scrollbar_thumb_tracks_progress_at_all_scales() {
+        for large in [false, true] {
+            for ppp in [1.0, 1.25, 2.0] {
+                let original = (0..1000)
+                    .map(|i| {
+                        format!(
+                            "{{\"row\":{i},\"中文🙂\":\"{}\"}}\n",
+                            "x".repeat(if large { 300 } else { 12 })
+                        )
+                    })
+                    .collect::<String>();
+                let mut h = Harness::new(&original);
+                crate::setup_fonts(&h.ctx);
+                h.ctx.set_pixels_per_point(ppp);
+                h.ctx.style_mut(|s| s.animation_time = 0.0);
+                for size in [13.5, 9.0, 32.0, 13.5] {
+                    h.state.font_size = size;
+                    for _ in 0..3 {
+                        h.run(vec![]);
+                    }
+                    let mut thumb_tops = Vec::new();
+                    for fraction in [0.0_f32, 0.5, 0.95] {
+                        h.ctx.data_mut(|d| {
+                            d.insert_temp(egui::Id::new("test_scroll_fraction"), fraction)
+                        });
+                        let output = h.run(vec![]);
+                        let document = output
+                            .shapes
+                            .iter()
+                            .find_map(|s| match &s.shape {
+                                egui::Shape::Text(t) if t.galley.text().contains("\"row\"") => {
+                                    Some(t)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        let base = document
+                            .galley
+                            .text()
+                            .split("\"row\":")
+                            .nth(1)
+                            .unwrap()
+                            .split(',')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        let mut checked = 0;
+                        for shape in &output.shapes {
+                            if let egui::Shape::Text(number) = &shape.shape
+                                && let Ok(line) = number.galley.text().parse::<usize>()
+                                && number.pos.y > 20.0
+                                && number.pos.y < 550.0
+                            {
+                                let row = &document.galley.rows[line - 1 - base];
+                                let expected = document.pos.y + row.rect.center().y;
+                                let actual = number.pos.y + number.galley.rows[0].rect.center().y;
+                                assert!(
+                                    (actual - expected).abs() < 1.1 / ppp,
+                                    "large={large}, ppp={ppp}, size={size}, line={line}: {actual} != {expected}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                        assert!(checked > 5);
+                        let thumb = output
+                            .shapes
+                            .iter()
+                            .find_map(|s| match &s.shape {
+                                egui::Shape::Rect(r)
+                                    if r.fill == crate::DARK.text_faint
+                                        && r.rect.width() <= 11.0
+                                        && r.rect.right() > 780.0
+                                        && r.rect.height() > 10.0 =>
+                                {
+                                    Some(r.rect)
+                                }
+                                _ => None,
+                            })
+                            .expect("Visible opaque vertical scrollbar thumb");
+                        thumb_tops.push(thumb.top());
+                        if large {
+                            assert!(h.state.large.laid_out_bytes < 64 * 1024);
+                        }
+                    }
+                    assert!(
+                        thumb_tops[0] < thumb_tops[1] && thumb_tops[1] < thumb_tops[2],
+                        "large={large} ppp={ppp} size={size}: {thumb_tops:?}"
+                    );
+                }
+                assert_eq!(h.text, original);
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_line_uses_logical_unicode_lines_in_both_editors() {
+        for large in [false, true] {
+            let text = format!(
+                "中文🙂\r\n{}\nlast{}",
+                "longword".repeat(200),
+                if large {
+                    "\npadding".repeat(40000)
+                } else {
+                    String::new()
+                }
+            );
+            let mut h = Harness::new(&text);
+            h.state.tools.wrap = true;
+            let at = text[..text.find("last").unwrap()].chars().count();
+            h.state.pending_selection = Some(at..at);
+            h.run(vec![]);
+            assert_eq!(h.state.cursor_line, 2);
+            assert_eq!(h.state.selected_characters, 0);
+            h.state.pending_selection = Some(at..at + 4);
+            h.run(vec![]);
+            assert_eq!(h.state.selected_characters, 4);
+            assert_eq!(h.text, text);
+        }
+    }
+
+    #[test]
+    fn deep_pending_cursor_reveals_the_requested_large_document_line() {
+        let text = (0..1000)
+            .map(|i| format!("row {i}: {}\n", "中文".repeat(100)))
+            .collect::<String>();
+        let mut h = Harness::new(&text);
+        let at = text[..text.find("row 990:").unwrap()].chars().count();
+        h.state.pending_selection = Some(at..at);
+        for _ in 0..30 {
+            h.run(vec![]);
+        }
+        let output = h.run(vec![]);
+        let row = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "991" => Some(t.pos.y),
+                _ => None,
+            })
+            .expect("Requested deep line number should be rendered");
+        assert!((0.0..580.0).contains(&row));
+        assert_eq!(h.state.cursor_line, 990);
+        assert!(h.state.large.laid_out_bytes < 64 * 1024);
+        assert_eq!(h.text, text);
+    }
 
     #[test]
     fn unicode_words_stop_at_ascii_and_chinese_punctuation() {
@@ -839,6 +1021,17 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ctx, |ui| {
+                            if let Some(fraction) = ctx.data_mut(|d| {
+                                d.remove_temp::<f32>(egui::Id::new("test_scroll_fraction"))
+                            }) {
+                                let id =
+                                    ui.make_persistent_id(egui::Id::new(("draft_scroll", 1u64)));
+                                let mut scroll =
+                                    egui::scroll_area::State::load(ctx, id).unwrap_or_default();
+                                scroll.offset.y =
+                                    row_height(ui, &self.state.font()) * 1000.0 * fraction;
+                                scroll.store(ctx, id);
+                            }
                             show(
                                 ui,
                                 &mut self.text,

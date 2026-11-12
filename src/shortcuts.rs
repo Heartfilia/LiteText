@@ -13,6 +13,8 @@ pub(crate) enum Action {
     NextTab,
     PreviousTab,
     Settings,
+    ZoomIn,
+    ZoomOut,
     Undo,
     Redo,
     Cut,
@@ -42,6 +44,8 @@ pub(crate) const ACTIONS: &[Action] = &[
     Action::NextTab,
     Action::PreviousTab,
     Action::Settings,
+    Action::ZoomIn,
+    Action::ZoomOut,
     Action::Undo,
     Action::Redo,
     Action::Cut,
@@ -79,6 +83,8 @@ impl Action {
             Save => (command, Key::S),
             Close => (command, Key::W),
             Settings => (command, Key::Comma),
+            ZoomIn => (command, Key::Plus),
+            ZoomOut => (command, Key::Minus),
             NextTab => (Modifiers::CTRL, Key::Tab),
             PreviousTab => (Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
             Undo => (command, Key::Z),
@@ -109,7 +115,7 @@ impl Action {
     fn group(self) -> usize {
         use Action::*;
         match self {
-            New | Open | Save | Close | NextTab | PreviousTab | Settings => 0,
+            New | Open | Save | Close | NextTab | PreviousTab | Settings | ZoomIn | ZoomOut => 0,
             Undo | Redo | Cut | Copy | Paste | SelectAll | DeleteLine | Comment => 1,
             Find | FocusReplace | NextMatch | PreviousMatch | Replace | ReplaceAll | Count => 2,
             HexCase | DimZeros | Ascii | Invisible => 3,
@@ -126,6 +132,20 @@ impl Action {
             Save => t.save,
             Close => t.close,
             Settings => t.settings,
+            ZoomIn => {
+                if zh {
+                    "放大工作区"
+                } else {
+                    "Zoom in workspace"
+                }
+            }
+            ZoomOut => {
+                if zh {
+                    "缩小工作区"
+                } else {
+                    "Zoom out workspace"
+                }
+            }
             Find => t.find_replace,
             Replace => t.replace,
             ReplaceAll => t.replace_all,
@@ -268,8 +288,12 @@ impl Keymap {
     }
 }
 
-// '?' may arrive as a logical question mark or as Shift+Slash, depending on layout.
+// Logical '+' / Shift+'=' and '?' / Shift+'/' vary with keyboard layout.
 fn normalized(mut binding: KeyboardShortcut) -> KeyboardShortcut {
+    if matches!(binding.logical_key, Key::Equals | Key::Plus) {
+        binding.logical_key = Key::Plus;
+        binding.modifiers.shift = false;
+    }
     if binding.logical_key == Key::Slash && binding.modifiers.shift {
         binding.logical_key = Key::Questionmark;
     }
@@ -339,6 +363,11 @@ pub(crate) fn take_binding(
 }
 
 impl LiteTextApp {
+    fn zoom_workspace(&mut self, delta: f32, ctx: &egui::Context) {
+        self.workspace_font_size = (self.workspace_font_size + delta).clamp(9.0, 32.0);
+        ctx.request_repaint();
+    }
+
     pub(crate) fn capture_shortcut(&mut self, ctx: &egui::Context) {
         let Some(action) = self.shortcut_recording else {
             return;
@@ -487,6 +516,8 @@ impl LiteTextApp {
             }
             use Action::*;
             match action {
+                ZoomIn => self.zoom_workspace(1.0, ctx),
+                ZoomOut => self.zoom_workspace(-1.0, ctx),
                 New => self.new_document(),
                 Open => self.open_dialog(),
                 Save => save = true,

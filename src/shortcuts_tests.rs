@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
+    let ctx = egui::Context::default();
+    let mut app = LiteTextApp::default();
+    for key in [Key::Plus, Key::Equals] {
+        for shift in [false, true] {
+            let before = app.workspace_font_size;
+            let mut modifiers = Modifiers::COMMAND;
+            modifiers.shift = shift;
+            let _ = ctx.run(
+                input(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }]),
+                |ctx| {
+                    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+                    app.handle_shortcuts(ctx);
+                },
+            );
+            assert_eq!(app.workspace_font_size, before + 1.0);
+        }
+    }
+    for _ in 0..100 {
+        app.zoom_workspace(1.0, &ctx);
+    }
+    assert_eq!(app.workspace_font_size, 32.0);
+    for _ in 0..100 {
+        app.zoom_workspace(-1.0, &ctx);
+    }
+    assert_eq!(app.workspace_font_size, 9.0);
+    assert_eq!(ctx.zoom_factor(), 1.0);
+    let restored: LiteTextApp =
+        serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
+    assert_eq!(restored.workspace_font_size, 9.0);
+    assert_eq!(
+        serde_json::from_str::<LiteTextApp>("{}")
+            .unwrap()
+            .workspace_font_size,
+        13.5
+    );
+    let custom = KeyboardShortcut::new(Modifiers::ALT, Key::F8);
+    app.shortcut_keys.set(Action::ZoomIn, custom).unwrap();
+    let _ = ctx.run(input(vec![key(Action::ZoomIn)]), |ctx| {
+        app.handle_shortcuts(ctx);
+    });
+    assert_eq!(app.workspace_font_size, 9.0);
+    let _ = ctx.run(
+        input(vec![egui::Event::Key {
+            key: Key::F8,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::ALT,
+        }]),
+        |ctx| {
+            app.handle_shortcuts(ctx);
+        },
+    );
+    assert_eq!(app.workspace_font_size, 10.0);
+}
+
+#[test]
 fn bindings_highlight_clear_to_clickable_blank_and_can_be_reassigned() {
     for delete in [Key::Delete, Key::Backspace] {
         let ctx = egui::Context::default();

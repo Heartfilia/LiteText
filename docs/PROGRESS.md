@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（150 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）。
+测试：`cargo test`（macOS 159 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明。
 
 ## 目录结构
 
@@ -39,6 +39,7 @@ src/
   line_commands.rs 可撤销的整行删除、行注释与可扩展注释风格
   whitespace.rs TAB 输入偏好、状态栏选择器与可撤销的空白处理
   terminal.rs 本机终端检测、持久化选择、安全启动计划与后台启动
+  file_open.rs 命令行文件参数与 macOS 冷启动/运行中的 Finder 打开事件
   json_plugin.rs Format JSON、失败提示与显示层 JSON 折叠
   workspace_theme.rs 工作区独立配色、Dark+/Light+ 预设、syntect 语法与视口解析缓存
   i18n.rs      界面文案翻译表（简体中文 / English）
@@ -162,6 +163,17 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-12（行号对齐、滚动进度、光标状态、工作区缩放与 Finder 打开）
+
+- 大文本虚拟行高与 epaint 逐行物理像素取整统一，修复深度滚动时行号/正文累计漂移；字号及显示比例变化会失效换行索引和视口缓存，保留大文本分段排版
+- 修复全局透明控件填充导致滚动条滑块不可见，普通/大文本与 HEX 使用固定宽度、常驻前景色滑块；正文剪裁不再覆盖右侧滚动条
+- 状态栏未选中文字时显示“当前在N行”，选中时显示“选中N字”；按逻辑行计数（非自动换行视觉行），大文本使用现有字符索引查行，光标变化请求重绘
+- 新增持久化工作区字号 9～32 pt（默认 13.5），Cmd/Ctrl 加减号可放大缩小，兼容 Plus/Equals/Shift+Equals；两个动作进入可配置快捷键列表，禁用 egui 默认全局键盘缩放，HEX 表头/正文/行高/Inspector 宽度同步
+- macOS 包增加常见文本、代码、配置以及 JSONL/NDJSON 类型声明，不抢占系统默认应用；新增跨平台命令行路径接收并排除更新器参数，macOS AppleEvent 处理器在 WillFinishLaunching 重新注册，以同时支持 Finder 冷启动和运行中打开，不替换 winit 生命周期代理
+- 新增 1000 行中英文/emoji JSONL 深度滚动对齐及滑块进度测试，覆盖普通/大文本、1/1.25/2 倍显示比例、9/13.5/32 字号；补充深度光标定位、逻辑行状态、缩放边界/持久化/自定义快捷键、换行缓存重建、HEX 字号、原生事件路径解码及 plist 声明测试
+- 使用独立临时测试 bundle 和生成文件，实际通过 Launch Services 冷启动打开中文带空格 JSONL、运行中再次打开 NDJSON；不启动用户正式应用、不修改原始文档或默认文件关联；Windows/Linux 实机 UI 与正式 Release 包仍需后续验证
+- Rust 1.99 全量 159 项常规测试、严格 Clippy、开发构建、Python 打包声明测试与 diff 检查通过，2 项手动性能测试跳过；发布仍仅由用户手动推送 tag 触发，不创建或移动 tag
 
 ### 2026-11-12（中英文双击选词边界修复）
 

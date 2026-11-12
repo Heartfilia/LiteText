@@ -20,6 +20,7 @@ mod workspace_theme;
 mod whitespace;
 mod terminal;
 mod updater;
+mod file_open;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
@@ -35,6 +36,9 @@ static OPEN_REQUEST: AtomicBool = AtomicBool::new(false);
 
 fn main() -> eframe::Result {
     if updater::run_helper_if_requested() { return Ok(()); }
+    let paths = file_open::argument_paths(std::env::args_os().skip(1));
+    #[cfg(target_os = "macos")]
+    let _file_open_handler = file_open::macos::install();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LiteText")
         .with_icon(app_icon())
@@ -51,13 +55,17 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LiteText",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            #[cfg(target_os = "macos")]
+            file_open::macos::bind(&cc.egui_ctx);
             setup_fonts(&cc.egui_ctx);
             let mut app: LiteTextApp = cc
                 .storage
                 .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
                 .unwrap_or_default();
             app.restore_session();
+            app.open_paths(paths);
             Ok(Box::new(app))
         }),
     )
@@ -337,6 +345,7 @@ struct LiteTextApp {
     #[serde(rename = "theme", skip_serializing)]
     legacy_theme: Option<Theme>,
     workspace_theme: workspace_theme::WorkspaceTheme,
+    workspace_font_size: f32,
     tab_mode: whitespace::TabMode,
     terminal: terminal::Settings,
     updates: updater::Settings,
@@ -450,6 +459,7 @@ impl Default for LiteTextApp {
             lang: Lang::default(),
             legacy_theme: None,
             workspace_theme: Default::default(),
+            workspace_font_size: 13.5,
             tab_mode: Default::default(),
             terminal: Default::default(),
             updates: Default::default(),
@@ -1398,6 +1408,10 @@ impl eframe::App for LiteTextApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        self.workspace_font_size = if self.workspace_font_size.is_finite() {
+            self.workspace_font_size.clamp(9.0, 32.0)
+        } else { 13.5 };
         self.poll_terminal();
         self.poll_updates();
         // 跟踪窗口几何（外框），供退出时持久化
@@ -1407,6 +1421,14 @@ impl eframe::App for LiteTextApp {
         }
 
         let cmd_s = self.handle_shortcuts(ctx);
+        #[cfg(target_os = "macos")]
+        {
+            let paths = file_open::macos::take();
+            if !paths.is_empty() {
+                self.open_paths(paths);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if OPEN_REQUEST.swap(false, Ordering::Relaxed) {
             self.open_dialog();
@@ -1447,6 +1469,7 @@ impl eframe::App for LiteTextApp {
         let active_id = self.active_id;
         let shortcuts_blocked = self.shortcuts_blocked();
         if let Some(file) = self.files.iter_mut().find(|f| Some(f.id) == active_id) {
+            file.editor_state.font_size = self.workspace_font_size;
             workspace_theme::configure(file, &self.workspace_theme, pal.dark);
         }
 
@@ -1484,6 +1507,7 @@ impl eframe::App for LiteTextApp {
                             &mut self.selection,
                             &mut self.drag_anchor,
                             &HexViewOpts {
+                                font_size: self.workspace_font_size,
                                 upper: self.hex_upper,
                                 dim_zero: self.dim_zeros,
                                 show_ascii: self.show_ascii,
@@ -2098,7 +2122,11 @@ impl LiteTextApp {
                         ui.add(egui::Label::new(RichText::new(t.encoding_binary).color(pal.text_faint).size(12.0)).selectable(false));
                     }
                     ui.separator();
-                    ui.add(egui::Label::new(RichText::new(t.selected_characters.replace("{n}", &file.editor_state.selected_characters.to_string())).color(pal.text_faint).size(12.0)).selectable(false));
+                    ui.add(egui::Label::new(RichText::new(if file.editor_state.selected_characters == 0 {
+                        t.cursor_line.replace("{n}", &(file.editor_state.cursor_line + 1).to_string())
+                    } else {
+                        t.selected_characters.replace("{n}", &file.editor_state.selected_characters.to_string())
+                    }).color(pal.text_faint).size(12.0)).selectable(false));
                     ui.separator();
                     tab_change = whitespace::picker(ui, self.tab_mode, self.lang, pal, language_enabled);
 
@@ -2451,7 +2479,7 @@ impl LiteTextApp {
         // 拖拽调宽上限：面板左缘最多到达 ASCII 列完整显示内容的右缘 + 20px
         // （字符列：10 地址 + 49 十六进制 + 1 中缝 + 16 ASCII = 76）
         let probe = ctx.fonts(|f| {
-            f.layout_no_wrap("0000000000".to_owned(), FontId::monospace(13.0), Color32::WHITE)
+            f.layout_no_wrap("0000000000".to_owned(), FontId::monospace(self.workspace_font_size - 0.5), Color32::WHITE)
         });
         let char_w = probe
             .rows
@@ -3013,7 +3041,7 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
         file.saved_large_revision = (!file.is_modified()).then_some(0);
     }
     file.editor_state.large.set_encoding(file.draft_text.as_ref().expect("text buffer"), file.encoding);
-    let before_selection = file.editor_state.selected_characters;
+    let before_selection = (file.editor_state.selected_characters, file.editor_state.cursor_line);
     if editor::show(
         ui,
         file.draft_text.as_mut().expect("草稿编辑器需要文本缓冲区"),
@@ -3033,7 +3061,7 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
             file.lines = Vec::new();
         } else { file.sync_draft(); }
     }
-    if before_selection != file.editor_state.selected_characters { ui.ctx().request_repaint(); }
+    if before_selection != (file.editor_state.selected_characters, file.editor_state.cursor_line) { ui.ctx().request_repaint(); }
 }
 
 fn text_view(ui: &mut egui::Ui, file: &LoadedFile, pal: &Palette) {
@@ -3063,6 +3091,7 @@ fn text_view(ui: &mut egui::Ui, file: &LoadedFile, pal: &Palette) {
 /// HEX 视图选项（由顶部工具栏控制）。
 #[derive(Clone, Copy)]
 struct HexViewOpts {
+    font_size: f32,
     upper: bool,
     dim_zero: bool,
     show_ascii: bool,
@@ -3104,7 +3133,10 @@ fn hex_view(
         return;
     }
 
-    let mono = FontId::monospace(13.0);
+    let font_size = opts.font_size - 0.5;
+    let mono = FontId::monospace(font_size);
+    let row_height = editor::row_height(ui, &mono) + 3.0;
+    editor::scroll_style(ui, pal);
     // 字符间距必须取自真实排版的字形位置差（egui 逐字形做物理像素取整），
     // 用单字符 galley 的宽度测量会得到未取整值，导致高亮与字形错位。
     let probe = ui.painter().layout_no_wrap("0000000000".to_owned(), mono.clone(), pal.text_main);
@@ -3138,7 +3170,7 @@ fn hex_view(
         .fill(pal.bg_panel)
         .inner_margin(egui::Margin::symmetric(14, 4))
         .show(ui, |ui| {
-            ui.monospace(RichText::new(header).size(13.0).color(pal.text_faint));
+            ui.monospace(RichText::new(header).size(font_size).color(pal.text_faint));
         });
     let span = ui.min_rect().x_range();
     let line_y = ui.min_rect().bottom();
@@ -3158,8 +3190,9 @@ fn hex_view(
         })
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .auto_shrink([false, false])
-                .show_rows(ui, 17.0, total_rows, |ui, range| {
+                .show_rows(ui, row_height, total_rows, |ui, range| {
                     egui::Frame::new()
                         .inner_margin(egui::Margin {
                             left: 14,
@@ -3176,7 +3209,7 @@ fn hex_view(
                         let sel_cols = overlap_cols(*selection, row, chunk.len());
 
                         let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 17.0),
+                            egui::vec2(ui.available_width(), row_height),
                             egui::Sense::click_and_drag(),
                         );
                         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3266,7 +3299,7 @@ fn hex_view(
                             }
                         }
                         let galley = ui.painter().layout_job(job);
-                        let y_off = (17.0 - galley.size().y) * 0.5;
+                        let y_off = (row_height - galley.size().y) * 0.5;
                         p.galley(egui::pos2(rect.left(), rect.top() + y_off), galley, pal.text_main);
 
                         // 交互：点击选择，拖拽扩展区间
@@ -3687,6 +3720,64 @@ mod tests {
         }
         assert_eq!(app.active().unwrap().encoding, recovery::Encoding::Utf8);
         assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("中文"));
+    }
+
+    #[test]
+    fn status_switches_between_logical_cursor_line_and_selected_characters() {
+        for lang in [Lang::ZhCn, Lang::En] {
+            let ctx = egui::Context::default();
+            setup_fonts(&ctx);
+            let mut app = LiteTextApp { lang, ..Default::default() };
+            app.new_document();
+            for (line, count) in [(0, 0), (999, 0), (999, 22), (7, 0)] {
+                let state = &mut app.active_mut().unwrap().editor_state;
+                state.cursor_line = line;
+                state.selected_characters = count;
+                let expected = if count == 0 { tr(lang).cursor_line.replace("{n}", &(line + 1).to_string()) }
+                    else { tr(lang).selected_characters.replace("{n}", &count.to_string()) };
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))),
+                    ..Default::default()
+                }, |ctx| app.status_bar(ctx, &DARK));
+                assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == expected)));
+            }
+        }
+    }
+
+    #[test]
+    fn hex_zoom_updates_header_and_body_fonts_without_changing_bytes_or_selection() {
+        let ctx = egui::Context::default();
+        let mut app = LiteTextApp::default();
+        app.new_document();
+        let file = app.active_mut().unwrap();
+        file.draft_text = Some("abcdef0123456789".repeat(100));
+        file.sync_draft();
+        let bytes = file.bytes.clone();
+        let mut selection = Some((2, 4));
+        let mut anchor = None;
+        for size in [9.0, 13.5, 32.0] {
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))),
+                ..Default::default()
+            }, |ctx| { egui::CentralPanel::default().show(ctx, |ui| {
+                hex_view(ui, file, &DARK, &mut selection, &mut anchor, &HexViewOpts {
+                    font_size: size, upper: true, dim_zero: false, show_ascii: true, show_invisible: false,
+                });
+            }); });
+            let mut header = false;
+            let mut body = false;
+            for shape in output.shapes {
+                if let egui::Shape::Text(t) = shape.shape
+                    && (t.galley.text().starts_with("Address") || t.galley.text().starts_with("00000000")) {
+                        assert_eq!(t.galley.job.sections[0].format.font_id.size, size - 0.5);
+                        header |= t.galley.text().starts_with("Address");
+                        body |= t.galley.text().starts_with("00000000");
+                }
+            }
+            assert!(header && body);
+            assert_eq!(selection, Some((2, 4)));
+            assert_eq!(file.bytes, bytes);
+        }
     }
 
     #[test]
