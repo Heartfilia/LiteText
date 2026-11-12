@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（143 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）。
+测试：`cargo test`（145 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）。
 
 ## 目录结构
 
@@ -162,6 +162,12 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-12（Windows 更新事件枚举大小修复）
+
+- 更新线程的 Ready 事件改为 Box<Prepared>，接收时解包转入原有状态；避免 Windows 的路径与文件句柄尺寸使整个事件枚举膨胀并触发 large_enum_variant，保留严格 Clippy，不改变安装锁或临时目录所有权
+- 新增事件大小上限、跨线程就绪资源交接及取消自动清理测试；后续版本仍由维护者手动创建tag，不移动已有tag
+- 本机Rust 1.99严格Clippy和145项常规测试通过，2项手动性能测试跳过；Windows实际构建由下一轮tag工作流确认
 
 ### 2026-11-12（首轮线上 CI 兼容性修复）
 

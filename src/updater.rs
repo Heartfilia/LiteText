@@ -45,7 +45,7 @@ struct Release {
 enum Event {
     Checked(Release),
     Progress(String),
-    Ready(Prepared),
+    Ready(Box<Prepared>),
     Failed(String),
 }
 #[derive(Default)]
@@ -518,7 +518,7 @@ impl LiteTextApp {
                             let _ = tx.send(Event::Progress(message));
                             ctx.request_repaint();
                         })
-                        .map(Event::Ready)
+                        .map(|prepared| Event::Ready(Box::new(prepared)))
                     })
             } else {
                 check(&settings).map(Event::Checked)
@@ -553,7 +553,7 @@ impl LiteTextApp {
                     self.updater.receiver = None;
                 }
                 Some(Ok(Event::Ready(prepared))) => {
-                    self.updater.prepared = Some(prepared);
+                    self.updater.prepared = Some(*prepared);
                     self.updater.message =
                         "更新已就绪，重启前将备份工作区 / Ready to restart".into();
                     self.updater.receiver = None;
@@ -786,6 +786,45 @@ fn github_icon(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn update_events_stay_small_across_platforms() {
+        // Prepared owns multiple platform-dependent paths and file handles.
+        // Keep it indirect so Windows does not enlarge every channel message.
+        assert!(std::mem::size_of::<Event>() <= 128);
+    }
+
+    #[test]
+    fn boxed_ready_event_transfers_resources_and_cancel_cleans_them() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_owned();
+        let stage_path = stage.path().to_owned();
+        let plan = plan_for_test(root.path());
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&plan.lock)
+            .unwrap();
+        let prepared = Prepared {
+            root,
+            stage,
+            plan,
+            lock,
+        };
+        let (tx, rx) = mpsc::channel();
+        assert!(tx.send(Event::Ready(Box::new(prepared))).is_ok());
+        drop(tx);
+        let mut app = LiteTextApp::default();
+        app.updater.status_loaded = true;
+        app.updater.receiver = Some(rx);
+        app.poll_updates();
+        assert!(app.updater.receiver.is_none());
+        assert!(app.updater.prepared.is_some());
+        assert!(root_path.exists() && stage_path.exists());
+        app.updater.prepared = None;
+        assert!(!root_path.exists() && !stage_path.exists());
+    }
 
     #[test]
     fn versions_compare_semantically_and_dev_never_installs() {
