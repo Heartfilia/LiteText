@@ -32,7 +32,7 @@ git push origin v0.1.1
 
 - 只接受该仓库 HTTPS release 下载 URL，TLS 使用正常证书验证；压缩包拒绝路径穿越、符号链接、非预期根目录、重复文件，限制下载与解压大小。
 - SHA256SUMS 用于完整性检查，**不是独立的发布者签名**；GitHub 账户、Release 和配置代理的信任仍是前提。不要安装不可信来源的更新。
-- macOS 当前仅 ad-hoc 签名，**没有 Apple Developer ID 签名或 notarization**。不去除 quarantine、不绕过 Gatekeeper。面向公开分发前建议配置 Developer ID、公证与签名验证。
+- macOS 当前仅 ad-hoc 签名，**没有 Apple Developer ID 签名或 notarization**。应用及更新助手不会自动去除 quarantine 或绕过 Gatekeeper；可信安装包的手动首次打开方法及风险说明见 [README](../README.md#macosapple-silicon)。面向公开分发前建议配置 Developer ID、公证与签名验证。
 - 安装后的旧版本保留在安装目录内 `.litetext-stage-*` 的 `previous`；临时更新目录为 `litetext-update-*`，保留助手和诊断。未进入安装的下载/解压失败与取消会自动清理；安装交接后的目录故意保留供回退，不自动递归清理历史安装。
 - 安装结果写入应用数据目录 `update-result.txt`，应用读取后显示在设置页。新进程无法启动时，助手临时目录还保留 `install-error.txt`。
 - 不支持包管理器托管的安装升级（例如 Homebrew/apt）；应使用相应包管理器。Windows/Linux 首版是解压型应用，非 MSI/deb/rpm 安装器。
