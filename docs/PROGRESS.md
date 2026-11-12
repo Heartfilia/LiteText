@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（macOS 159 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明。
+测试：`cargo test`（macOS 160 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明。
 
 ## 目录结构
 
@@ -163,6 +163,11 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-12（滚动条淡色调整）
+
+- 普通/大文本及 HEX 共用滚动条改为主题淡色中性灰：静止 45%、悬停 65%、拖动 85% 强度，不再使用正文高亮色或强调色；保留常驻显示与原有滚动交互
+- 深浅主题样式及深度滚动滑块回归通过，编辑器相关 28 项测试和严格 Clippy 通过，1 项手动性能测试跳过
 
 ### 2026-11-12（行号对齐、滚动进度、光标状态、工作区缩放与 Finder 打开）
 

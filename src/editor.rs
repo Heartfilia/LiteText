@@ -181,9 +181,9 @@ pub(crate) fn scroll_style(ui: &mut egui::Ui, pal: &Palette) {
     style.bar_width = 10.0;
     ui.style_mut().spacing.scroll = style;
     let v = ui.visuals_mut();
-    v.widgets.inactive.fg_stroke.color = pal.text_faint;
-    v.widgets.hovered.fg_stroke.color = pal.text_main;
-    v.widgets.active.fg_stroke.color = pal.accent;
+    v.widgets.inactive.fg_stroke.color = pal.text_faint.gamma_multiply(0.45);
+    v.widgets.hovered.fg_stroke.color = pal.text_faint.gamma_multiply(0.65);
+    v.widgets.active.fg_stroke.color = pal.text_faint.gamma_multiply(0.85);
 }
 
 /// Byte ranges exclude line terminators; even a blank document has one line.
@@ -603,6 +603,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scrollbars_stay_muted_and_neutral_in_both_themes() {
+        for pal in [&crate::DARK, &crate::LIGHT] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scroll_style(ui, pal);
+                    let v = ui.visuals();
+                    assert_eq!(
+                        v.widgets.inactive.fg_stroke.color,
+                        pal.text_faint.gamma_multiply(0.45)
+                    );
+                    assert_eq!(
+                        v.widgets.hovered.fg_stroke.color,
+                        pal.text_faint.gamma_multiply(0.65)
+                    );
+                    assert_eq!(
+                        v.widgets.active.fg_stroke.color,
+                        pal.text_faint.gamma_multiply(0.85)
+                    );
+                    assert!(!ui.spacing().scroll.floating);
+                });
+            });
+        }
+    }
+
+    #[test]
     fn deep_jsonl_rows_align_and_scrollbar_thumb_tracks_progress_at_all_scales() {
         for large in [false, true] {
             for ppp in [1.0, 1.25, 2.0] {
@@ -673,7 +699,7 @@ mod tests {
                             .iter()
                             .find_map(|s| match &s.shape {
                                 egui::Shape::Rect(r)
-                                    if r.fill == crate::DARK.text_faint
+                                    if r.fill == crate::DARK.text_faint.gamma_multiply(0.45)
                                         && r.rect.width() <= 11.0
                                         && r.rect.right() > 780.0
                                         && r.rect.height() > 10.0 =>
@@ -682,7 +708,7 @@ mod tests {
                                 }
                                 _ => None,
                             })
-                            .expect("Visible opaque vertical scrollbar thumb");
+                            .expect("Visible muted vertical scrollbar thumb");
                         thumb_tops.push(thumb.top());
                         if large {
                             assert!(h.state.large.laid_out_bytes < 64 * 1024);
