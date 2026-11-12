@@ -690,7 +690,7 @@ impl Render {
                             let left = row.x_offset(start);
                             let right = row.x_offset(end);
                             let range = row.visuals.glyph_vertex_range.clone();
-                            for quad in row.visuals.mesh.vertices[range].chunks_exact_mut(4) {
+                            for quad in row.visuals.mesh.vertices[range].as_chunks_mut::<4>().0 {
                                 let center = quad.iter().map(|v| v.pos.x).sum::<f32>() / 4.0;
                                 if left <= center && center < right {
                                     for vertex in quad {

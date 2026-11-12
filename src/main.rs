@@ -141,26 +141,26 @@ fn apply_style(ctx: &egui::Context, pal: &Palette) {
     v.faint_bg_color = pal.bg_elevated;
     v.override_text_color = Some(pal.text_main);
     v.selection.bg_fill = pal.accent.gamma_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, pal.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, pal.accent);
     v.widgets.noninteractive.bg_stroke = Stroke::NONE;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text_main);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.text_main);
     // 幽灵按钮：常态无底色无边框，悬停淡显，沉浸感
     v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
     v.widgets.inactive.weak_bg_fill = pal.bg_elevated;
     v.widgets.inactive.bg_stroke = Stroke::NONE;
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text_main);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text_main);
     v.widgets.hovered.bg_fill = pal.bg_elevated;
     v.widgets.hovered.weak_bg_fill = pal.bg_elevated;
     v.widgets.hovered.bg_stroke = Stroke::NONE;
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, if pal.dark { Color32::WHITE } else { pal.text_main });
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, if pal.dark { Color32::WHITE } else { pal.text_main });
     v.widgets.active.bg_fill = pal.accent.gamma_multiply(0.35);
     v.widgets.active.weak_bg_fill = pal.accent.gamma_multiply(0.35);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, if pal.dark { Color32::WHITE } else { pal.text_main });
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, if pal.dark { Color32::WHITE } else { pal.text_main });
     // 下拉框展开态与弹层描边（两套主题都取调色板）
     v.widgets.open.weak_bg_fill = pal.bg_elevated;
     v.widgets.open.bg_fill = pal.bg_elevated;
-    v.widgets.open.fg_stroke = Stroke::new(1.0, pal.text_main);
-    v.window_stroke = Stroke::new(1.0, pal.bg_elevated);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, pal.text_main);
+    v.window_stroke = Stroke::new(1.0_f32, pal.bg_elevated);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(12.0, 5.0);
     ctx.set_style(style);
@@ -1182,7 +1182,9 @@ fn detect_binary(bytes: &[u8]) -> bool {
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if little_endian {
                 u16::from_le_bytes([pair[0], pair[1]])
@@ -1346,7 +1348,7 @@ fn path_copy_label(ui: &mut egui::Ui, path: &str, pal: &Palette, hint: &str) -> 
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .fixed_pos(rect.right_top() - egui::vec2(0.0, 10.0 + (age as f32 * 10.0)))
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::new().fill(pal.bg_elevated).stroke(Stroke::new(1.0, pal.accent))
+                    egui::Frame::new().fill(pal.bg_elevated).stroke(Stroke::new(1.0_f32, pal.accent))
                         .corner_radius(7.0).inner_margin(egui::Margin::symmetric(12, 7))
                         .show(ui, |ui| { ui.label(RichText::new(text).color(pal.text_main).size(13.0)); });
                 });
@@ -1537,7 +1539,7 @@ impl LiteTextApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
-                    .stroke(Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)))
+                    .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
@@ -1590,7 +1592,7 @@ impl LiteTextApp {
                 .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, whitespace_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
-                        .stroke(Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)))
+                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
                         .corner_radius(8.0).inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
                             let labels: Vec<_> = whitespace::ACTIONS.iter().map(|action| action.label(self.lang == Lang::ZhCn)).collect();
@@ -1621,7 +1623,7 @@ impl LiteTextApp {
                 .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, plugins_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
-                        .stroke(Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)))
+                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
                         .corner_radius(8.0).inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
                             ui.set_width(app_menu_width(ui, &["Format JSON"], pal));
@@ -1647,7 +1649,7 @@ impl LiteTextApp {
                 .show(ctx, |ui| {
                     egui::Frame::new()
                         .fill(pal.bg_panel)
-                        .stroke(Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)))
+                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
                         .corner_radius(8.0)
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
@@ -1849,7 +1851,7 @@ impl LiteTextApp {
                                     p.rect_stroke(
                                         rect,
                                         6.0,
-                                        Stroke::new(1.0, pal.text_faint.gamma_multiply(0.25)),
+                                        Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.25)),
                                         egui::StrokeKind::Inside,
                                     );
                                 }
@@ -1939,7 +1941,7 @@ impl LiteTextApp {
                                 p2.rect_stroke(
                                     float_rect,
                                     egui::CornerRadius { nw: 6, ne: 6, sw: 6, se: 6 },
-                                    Stroke::new(1.2, pal.accent),
+                                    Stroke::new(1.2_f32, pal.accent),
                                     egui::StrokeKind::Inside,
                                 );
                                 if self.files.iter().any(|f| f.id == drag_id && f.has_unsaved_changes()) {
@@ -2009,7 +2011,7 @@ impl LiteTextApp {
                                     rect,
                                     6.0,
                                     Stroke::new(
-                                        if hovered { 1.6 } else { 1.2 },
+                                        if hovered { 1.6_f32 } else { 1.2_f32 },
                                         if hovered { pal.accent_hover } else { pal.accent },
                                     ),
                                     egui::StrokeKind::Inside,
@@ -2151,7 +2153,7 @@ impl LiteTextApp {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
                     .corner_radius(10.0)
-                    .stroke(Stroke::new(1.0, pal.bg_elevated))
+                    .stroke(Stroke::new(1.0_f32, pal.bg_elevated))
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
@@ -2263,7 +2265,7 @@ fn new_file_icon_button(ui: &mut egui::Ui, tooltip: &str, pal: &Palette) -> egui
     }
     let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 18.0));
     let fold = 4.0;
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(1.4_f32, color);
     p.add(egui::Shape::closed_line(vec![
         icon.left_top(),
         icon.right_top() - egui::vec2(fold, 0.0),
@@ -2283,7 +2285,7 @@ fn app_menu_separator(ui: &mut egui::Ui, pal: &Palette) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().line_segment(
         [egui::pos2(rect.left() + 4.0, rect.center().y), egui::pos2(rect.right() - 4.0, rect.center().y)],
-        Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)),
     );
 }
 
@@ -2333,7 +2335,7 @@ fn settings_icon_button(ui: &mut egui::Ui, open: &mut bool, tooltip: &str, pal: 
     } else {
         pal.text_faint
     };
-    let stroke = Stroke::new(1.6, color);
+    let stroke = Stroke::new(1.6_f32, color);
     let p = ui.painter();
 
     // 三条横线 + 错落的圆点，模拟设置滑杆
@@ -2407,7 +2409,7 @@ impl LiteTextApp {
                         p.text(r.center(), egui::Align2::CENTER_CENTER, "A", FontId::proportional(12.0), c);
                         p.line_segment(
                             [egui::pos2(r.left() + 6.0, r.bottom() - 6.0), egui::pos2(r.right() - 6.0, r.top() + 6.0)],
-                            Stroke::new(1.4, c),
+                            Stroke::new(1.4_f32, c),
                         );
                     })
                     .clicked()
@@ -2426,7 +2428,7 @@ impl LiteTextApp {
                             if filled {
                                 p.circle_filled(center, 2.0, dim);
                             } else {
-                                p.circle_stroke(center, 3.0, Stroke::new(1.4, c));
+                                p.circle_stroke(center, 3.0, Stroke::new(1.4_f32, c));
                             }
                         }
                     })
@@ -2543,7 +2545,7 @@ impl LiteTextApp {
                             egui::pos2(content_left, strip.top()),
                             egui::pos2(content_left, strip.bottom()),
                         ],
-                        Stroke::new(1.5, pal.accent),
+                        Stroke::new(1.5_f32, pal.accent),
                     );
                 }
                 if divider.dragged() {
@@ -2595,7 +2597,7 @@ impl LiteTextApp {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
                     .corner_radius(10.0)
-                    .stroke(Stroke::new(1.0, pal.bg_elevated))
+                    .stroke(Stroke::new(1.0_f32, pal.bg_elevated))
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
@@ -2733,7 +2735,7 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                 egui::Frame::new()
                     .fill(pal.bg_panel)
                     .corner_radius(8.0)
-                    .stroke(Stroke::new(1.0, pal.bg_elevated))
+                    .stroke(Stroke::new(1.0_f32, pal.bg_elevated))
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
                         ui.set_min_width(width - 8.0);
@@ -2892,7 +2894,7 @@ fn welcome_screen(ui: &mut egui::Ui, app: &mut LiteTextApp, pal: &Palette) {
                     ui.painter().rect_stroke(
                         rect,
                         10.0,
-                        Stroke::new(1.2, pal.text_faint.gamma_multiply(0.6)),
+                        Stroke::new(1.2_f32, pal.text_faint.gamma_multiply(0.6)),
                         egui::StrokeKind::Inside,
                     );
                     ui.painter().text(
@@ -3142,7 +3144,7 @@ fn hex_view(
     let line_y = ui.min_rect().bottom();
     ui.painter().line_segment(
         [egui::pos2(span.min, line_y), egui::pos2(span.max, line_y)],
-        Stroke::new(1.0, pal.bg_inset),
+        Stroke::new(1.0_f32, pal.bg_inset),
     );
 
     let total_rows = file.bytes.len().div_ceil(HEX_BYTES_PER_ROW);
@@ -3705,7 +3707,12 @@ mod tests {
         let mut app = LiteTextApp::default();
         app.new_document();
         let file = app.active_mut().unwrap();
-        file.path = PathBuf::from("/example/directory/document.txt");
+        file.path = PathBuf::from(if cfg!(windows) {
+            r"C:\example\directory\document.txt"
+        } else {
+            "/example/directory/document.txt"
+        });
+        let displayed_path = std::path::absolute(&file.path).unwrap().display().to_string();
         file.name = "document.txt".to_owned();
         file.draft_text = Some("中文hello".to_owned());
         file.sync_draft();
@@ -3713,7 +3720,7 @@ mod tests {
         let mut copied = false;
         for frame in 0..4 {
             let events = if frame >= 2 {
-                let pos = click.unwrap();
+                let pos = click.expect("文件路径应已在状态栏渲染");
                 vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
                     pos, button: egui::PointerButton::Primary, pressed: frame == 2,
                     modifiers: egui::Modifiers::default(),
@@ -3731,15 +3738,15 @@ mod tests {
             for shape in output.shapes {
                 if let egui::Shape::Text(text) = shape.shape {
                     assert_ne!(text.galley.text(), "document.txt");
-                    if text.galley.text() == "/example/directory/document.txt" {
+                    if text.galley.text() == displayed_path {
                         click = Some(text.pos + text.galley.size() * 0.5);
                     }
                 }
             }
-            copied |= output.platform_output.commands.iter().any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(text) if text == "/example/directory/document.txt"));
+            copied |= output.platform_output.commands.iter().any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(text) if text == &displayed_path));
         }
         assert!(copied);
-        let start = ctx.data(|d| d.get_temp::<f64>(egui::Id::new(("copied_path_toast", "/example/directory/document.txt")))).unwrap();
+        let start = ctx.data(|d| d.get_temp::<f64>(egui::Id::new(("copied_path_toast", displayed_path.as_str())))).unwrap();
         for (age, visible) in [(0.3, true), (1.2, false)] {
             let mut last = None;
             for _ in 0..2 {
@@ -3935,7 +3942,7 @@ mod tests {
             }
         }
         assert!(!app.show_menu);
-        assert_eq!(app.active().unwrap().path, path);
+        assert_eq!(app.active().unwrap().path, path.canonicalize().unwrap());
     }
 
     #[test]

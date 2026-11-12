@@ -290,7 +290,7 @@ fn marker_icon_button(
         ui.painter().rect_stroke(
             rect,
             4.0,
-            egui::Stroke::new(1.0, color.gamma_multiply(if selected { 0.8 } else { 0.4 })),
+            egui::Stroke::new(1.0_f32, color.gamma_multiply(if selected { 0.8 } else { 0.4 })),
             egui::StrokeKind::Inside,
         );
     }
@@ -332,7 +332,7 @@ fn search_option(
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             3.0,
-            egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.5)),
+            egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.5)),
             egui::StrokeKind::Inside,
         );
     } else if response.hovered() {
@@ -392,7 +392,7 @@ fn input_with_actions(
 ) -> (egui::Response, [egui::Response; 2], egui::Rect) {
     let output = egui::Frame::new()
         .fill(pal.bg_inset)
-        .stroke(egui::Stroke::new(1.0, pal.text_faint.gamma_multiply(0.3)))
+        .stroke(egui::Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.3)))
         .corner_radius(5.0)
         .inner_margin(egui::Margin::symmetric(5, 3))
         .show(ui, |ui| {
@@ -419,7 +419,7 @@ fn input_with_actions(
                         ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
                     ui.painter().line_segment(
                         [divider.center_top(), divider.center_bottom()],
-                        egui::Stroke::new(1.0, pal.text_faint.gamma_multiply(0.25)),
+                        egui::Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.25)),
                     );
                     ui.add_space(5.0);
                     for (label, hint, selected) in options {
@@ -551,7 +551,7 @@ pub(crate) fn find_bar(
             ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
-                    .stroke(egui::Stroke::new(1.0, pal.text_faint.gamma_multiply(0.2)))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.2)))
                     .corner_radius(6.0)
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {

@@ -4,16 +4,16 @@
 
 - `cargo run`、普通 `cargo build --release` 均显示 **dev**，不读取 Cargo 包版本或任意本地 Git tag。
 - 发布通过 `LITETEXT_VERSION` 注入 tag（例如 `v1.2.3`），构建时验证 SemVer。
-- 推送 `v*` tag 触发 `.github/workflows/release.yml`。每个平台先测试、Clippy，再构建；全部成功才发布 GitHub Release。
-- 产物：macOS arm64/x64 的 `.dmg`（首次安装）与 `.zip`（自动更新）、Windows x64 ZIP、Linux x64 ZIP，以及统一 `SHA256SUMS`。
+- 版本 tag 由维护者手动创建和推送，助手不代建、不移动既有 tag。推送 `v*` tag 触发 `.github/workflows/release.yml`；普通 main 推送不发布。每个平台先测试、Clippy，再构建；全部成功才发布 GitHub Release。
+- 产物：macOS arm64（Apple Silicon）的 `.dmg`（首次安装）与 `.zip`（自动更新）、Windows x64 ZIP、Linux x64 ZIP，以及统一 `SHA256SUMS`。不再编译或上传 macOS x64（Intel）。
 - `-rc.1` 等带连字符的 tag 发布为 prerelease；应用内目前仅查询 GitHub `/releases/latest` 的稳定版本。
-- 配置目标仓库：**Heartfilia/LiteText**。发布前必须把 Cargo.lock、源码、assets、scripts 和 workflow 一并提交。当前尚未推送、打 tag 或发布。
+- 配置目标仓库：**Heartfilia/LiteText**。发布前必须把 Cargo.lock、源码、assets、scripts 和 workflow 一并提交。失败任务的重跑仍使用原 tag 的旧提交，不会自动带入 main 上的修复；请在包含修复的提交上手动创建新版本 tag。
 
 示例（自行确认代码和版本后执行）：
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## 用户更新流程
@@ -40,4 +40,4 @@ git push origin v0.1.0
 
 ## 发布验收建议
 
-在测试目录安装 `v0.1.0`，编辑未保存文档，再发布 `v0.1.1`，验证直连和代理检查、下载与重启后恢复、原文件 hash 不变、版本号一致。另模拟哈希不匹配、断网、只读目录、启动失败，确认不替换或可以回退。应分别在 macOS arm64/x64、Windows x64、Linux x64 实机执行。
+在测试目录安装一个已成功发布的稳定版本，编辑未保存文档，再发布更高版本，验证直连和代理检查、下载与重启后恢复、原文件 hash 不变、版本号一致。另模拟哈希不匹配、断网、只读目录、启动失败，确认不替换或可以回退。应分别在 macOS arm64、Windows x64、Linux x64 实机执行。

@@ -339,7 +339,7 @@ pub(crate) fn show(
                     painter.rect_filled(row_rect, 0.0, pal.accent.gamma_multiply(0.10));
                     painter.line_segment(
                         [row_rect.left_top(), row_rect.left_bottom()],
-                        Stroke::new(2.0, pal.accent),
+                        Stroke::new(2.0_f32, pal.accent),
                     );
                 }
                 // Painted numbers are never part of a selectable text widget.
@@ -448,7 +448,7 @@ pub(crate) fn show(
     }
     ui.painter().line_segment(
         [gutter.right_top(), gutter.right_bottom()],
-        Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)),
     );
     changed
 }

@@ -427,7 +427,7 @@ pub(crate) fn button(ui: &mut egui::Ui, pal: &Palette, lang: Lang) -> egui::Resp
         pal,
         |p, rect, color| {
             let bounds = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 14.0));
-            let stroke = egui::Stroke::new(1.3, color);
+            let stroke = egui::Stroke::new(1.3_f32, color);
             p.rect_stroke(bounds, 3.0, stroke, egui::StrokeKind::Inside);
             let c = bounds.center();
             p.line_segment(

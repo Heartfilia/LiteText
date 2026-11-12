@@ -728,7 +728,7 @@ impl LiteTextApp {
                             }
                             let card = egui::Frame::new()
                                 .fill(pal.bg_window)
-                                .stroke(egui::Stroke::new(1.0, pal.bg_elevated))
+                                .stroke(egui::Stroke::new(1.0_f32, pal.bg_elevated))
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::same(12))
                                 .show(ui, |ui| {
@@ -893,7 +893,7 @@ fn shortcut_row(
             binding_rect.expand(2.0),
             5.0,
             egui::Stroke::new(
-                if selected { 1.5 } else { 1.0 },
+                if selected { 1.5_f32 } else { 1.0_f32 },
                 if selected {
                     pal.accent
                 } else {
@@ -920,7 +920,7 @@ fn shortcut_row(
         ui.painter().rect_stroke(
             rect,
             4.0,
-            egui::Stroke::new(1.0, pal.text_faint.gamma_multiply(0.25)),
+            egui::Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.25)),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(

@@ -789,7 +789,7 @@ pub(crate) fn show(
                     painter.rect_filled(rect, 0.0, pal.accent.gamma_multiply(0.10));
                     painter.line_segment(
                         [rect.left_top(), rect.left_bottom()],
-                        Stroke::new(2.0, pal.accent),
+                        Stroke::new(2.0_f32, pal.accent),
                     );
                 }
                 painter.text(
@@ -879,7 +879,7 @@ pub(crate) fn show(
     }
     ui.painter().line_segment(
         [gutter.right_top(), gutter.right_bottom()],
-        Stroke::new(1.0, pal.text_faint.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)),
     );
     state.selected_characters = if let Some((a, b)) = state.selection {
         let a = a.min(state.large.ranges.len() - 1);

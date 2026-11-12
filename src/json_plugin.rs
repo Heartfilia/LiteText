@@ -376,7 +376,7 @@ pub(crate) fn fold_button(
     p.rect_stroke(
         rect,
         1.0,
-        egui::Stroke::new(1.0, color),
+        egui::Stroke::new(1.0_f32, color),
         egui::StrokeKind::Inside,
     );
     p.line_segment(
@@ -384,7 +384,7 @@ pub(crate) fn fold_button(
             rect.center() - egui::vec2(3.0, 0.0),
             rect.center() + egui::vec2(3.0, 0.0),
         ],
-        egui::Stroke::new(1.0, color),
+        egui::Stroke::new(1.0_f32, color),
     );
     if collapsed {
         p.line_segment(
@@ -392,7 +392,7 @@ pub(crate) fn fold_button(
                 rect.center() - egui::vec2(0.0, 3.0),
                 rect.center() + egui::vec2(0.0, 3.0),
             ],
-            egui::Stroke::new(1.0, color),
+            egui::Stroke::new(1.0_f32, color),
         );
     }
     ui.ctx()
