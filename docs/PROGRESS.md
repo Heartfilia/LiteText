@@ -163,6 +163,11 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 
 ## 变更记录
 
+### 2026-11-12（macOS ARM runner 调度修复）
+
+- 发布矩阵将不再受支持的 macos-14 改为 GitHub 当前支持的 macos-15（Apple Silicon），保留 aarch64-apple-darwin 编译目标，不恢复 Intel 产物；此问题发生在runner调度阶段，尚未进入编译
+- 依据 GitHub-hosted runners 官方列表核对标签；实际云端调度需维护者在包含修复的提交上手动推送新tag验证，重跑旧tag不会采用新配置
+
 ### 2026-11-12（Windows 更新事件枚举大小修复）
 
 - 更新线程的 Ready 事件改为 Box<Prepared>，接收时解包转入原有状态；避免 Windows 的路径与文件句柄尺寸使整个事件枚举膨胀并触发 large_enum_variant，保留严格 Clippy，不改变安装锁或临时目录所有权

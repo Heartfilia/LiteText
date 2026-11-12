@@ -14,7 +14,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          # GitHub's supported Apple Silicon image; macOS 14 is retired.
+          - runner: macos-15
             os: macos
             arch: arm64
             target: aarch64-apple-darwin
