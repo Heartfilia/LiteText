@@ -405,15 +405,18 @@ impl LiteTextApp {
                     self.terminal_installed = None;
                 }
             });
-        } else if ui
-            .small_button(if zh {
-                "重新检测本机终端"
-            } else {
-                "Refresh installed terminals"
-            })
-            .clicked()
-        {
-            self.terminal_installed = None;
+        } else {
+            // Keep this secondary action content-sized even inside a justified
+            // settings card; a direct button inherits the full card width.
+            ui.horizontal(|ui| {
+                let refresh = ui.button(egui::RichText::new(if zh {
+                    "重新检测本机终端"
+                } else {
+                    "Refresh installed terminals"
+                }).size(12.0));
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("terminal_refresh_rect"), refresh.rect));
+                if refresh.clicked() { self.terminal_installed = None; }
+            });
         }
         ui.label(
             egui::RichText::new(if zh {

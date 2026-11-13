@@ -28,6 +28,7 @@ mod web_tools;
 mod curl_plugin;
 mod windows;
 mod new_window;
+mod preferences;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
@@ -82,6 +83,10 @@ fn main() -> eframe::Result {
                 .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
                 .or_else(new_window::seed)
                 .unwrap_or_default();
+            app.migrate_legacy_theme();
+            if let Err(error) = app.load_preferences() {
+                app.io_error = Some(format!("Unable to load preferences: {error}"));
+            }
             app.restore_session();
             app.open_paths(paths);
             Ok(Box::new(app))
@@ -370,6 +375,8 @@ struct LiteTextApp {
     #[serde(skip)]
     updater: updater::State,
     #[serde(skip)]
+    preferences: preferences::State,
+    #[serde(skip)]
     terminal_installed: Option<Vec<terminal::Installed>>,
     #[serde(skip)]
     terminal_pending: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -495,6 +502,7 @@ impl Default for LiteTextApp {
             terminal: Default::default(),
             updates: Default::default(),
             updater: Default::default(),
+            preferences: Default::default(),
             terminal_installed: None,
             terminal_pending: None,
             workspace_theme_page: false,
@@ -898,7 +906,6 @@ impl LiteTextApp {
     fn file_dialogs(&mut self, ctx: &egui::Context) {
         let t = tr(self.lang);
         if let Some(index) = self.files.iter().position(|f| f.disk.pending.is_some()) {
-            let id = self.files[index].id;
             let file = &self.files[index];
             let mut choice = 0;
             egui::Window::new(t.external_title).id(egui::Id::new("external_change"))
@@ -917,12 +924,9 @@ impl LiteTextApp {
                     });
                 });
             if choice == 1 {
-                // Preserve the current working version before any destructive replacement.
-                let archive = self.recovery_path().map(|p| p.with_file_name(format!("before-reload-{}-{}.json", id,
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())));
-                let result = archive.ok_or_else(|| std::io::Error::other("Recovery storage unavailable"))
-                    .and_then(|path| recovery::archive_buffers(&path, std::slice::from_ref(&self.files[index]), Some(id)))
-                    .and_then(|_| linkage::reload(&mut self.files[index]));
+                // Reload is explicitly confirmed above. Read/decode first so a
+                // failure retains the current buffer, without historical copies.
+                let result = linkage::reload(&mut self.files[index]);
                 match result {
                     Ok(()) => { self.selection = None; self.drag_anchor = None; self.inspector_popup = None; self.backup_or_report(); }
                     Err(error) => self.io_error = Some(format!("{}: {error}", t.reload_failed)),
@@ -989,10 +993,18 @@ impl LiteTextApp {
     fn new_document(&mut self) {
         let id = self.next_file_id;
         self.next_file_id += 1;
+        // Display numbers describe only currently open scratch tabs, not the
+        // monotonic widget identity (which must not be reused after closing).
+        let used: std::collections::HashSet<u64> = self.files.iter()
+            .filter(|f| f.path.as_os_str().is_empty() && f.source_path.is_none())
+            .filter_map(|f| [tr(Lang::ZhCn).untitled, tr(Lang::En).untitled].into_iter()
+                .find_map(|prefix| f.name.strip_prefix(&format!("{prefix} "))?.parse().ok()))
+            .collect();
+        let number = (1..).find(|n| !used.contains(n)).unwrap();
         let mut file = LoadedFile {
             id,
             path: PathBuf::new(),
-            name: format!("{} {}", tr(self.lang).untitled, id + 1),
+            name: format!("{} {}", tr(self.lang).untitled, number),
             bytes: Vec::new(),
             is_binary: false,
             lines: Vec::new(),
@@ -1436,6 +1448,7 @@ fn format_size(size: u64) -> String {
 impl eframe::App for LiteTextApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.backup_or_report();
+        if let Err(error) = self.save_preferences(true) { self.io_error = Some(format!("Unable to save preferences: {error}")); }
         eframe::set_value(storage, eframe::APP_KEY, self);
         #[cfg(not(test))]
         if let Some(root) = eframe::storage_dir("LiteText")
@@ -1463,7 +1476,7 @@ impl eframe::App for LiteTextApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         self.workspace_font_size = if self.workspace_font_size.is_finite() {
-            self.workspace_font_size.clamp(9.0, 32.0)
+            self.workspace_font_size.clamp(10.0, 32.0)
         } else { 13.5 };
         self.poll_terminal();
         self.poll_updates();
@@ -1589,6 +1602,8 @@ impl eframe::App for LiteTextApp {
         self.file_dialogs(ctx);
         updater::acknowledge_startup();
         self.finish_update_restart(ctx, frame);
+        if let Err(error) = self.save_preferences(false) { self.io_error = Some(format!("Unable to save preferences: {error}")); }
+        if let Some(delay) = self.preferences_repaint_after() { ctx.request_repaint_after(delay); }
     }
 }
 
@@ -2307,7 +2322,7 @@ impl LiteTextApp {
                 )
             } else if self.workspace_theme_page {
                 egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 1120.0), (ctx.screen_rect().height() - 100.0).clamp(260.0, 620.0))
-            } else { egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 460.0), (ctx.screen_rect().height() - 100.0).clamp(180.0, 560.0)) })
+            } else { egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 460.0), (ctx.screen_rect().height() - 80.0).clamp(180.0, 620.0)) })
             .frame(
                 egui::Frame::new()
                     .fill(pal.bg_panel)
@@ -2317,53 +2332,63 @@ impl LiteTextApp {
             )
             .show(ctx, |ui| {
                 ui.memory_mut(|memory| memory.set_modal_layer(ui.layer_id()));
+                settings_control_style(ui, pal);
                 if self.shortcuts_page {
                     self.shortcuts_ui(ui, pal);
                 } else if self.workspace_theme_page {
                     self.workspace_theme_ui(ui, pal);
                 } else {
-                    egui::ScrollArea::vertical().id_salt("settings_home_scroll")
-                        .max_height((ctx.screen_rect().height() - 110.0).max(180.0))
+                    let scroll = egui::ScrollArea::vertical().id_salt("settings_home_scroll")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                    section_header(ui, pal, t.general);
-                    ui.add_space(4.0);
-
-                    // 标签与控件两端对齐，明暗主题共用自研下拉组件。
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(RichText::new(t.language).size(13.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let options = Lang::ALL.iter()
-                                .map(|l| (l.native_name().to_owned(), *l)).collect();
-                            if let Some(lang) = dropdown(
-                                ui, pal, egui::Id::new("settings_lang"),
-                                self.lang.native_name().to_owned(), options, 160.0,
-                            ) {
-                                self.lang = lang;
-                            }
+                            ui.set_width(ui.available_width());
+                            settings_card(ui, pal, |ui| {
+                                section_header(ui, pal, t.general);
+                                ui.add_space(4.0);
+                                // 标签与控件两端对齐，明暗主题共用自研下拉组件。
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.label(RichText::new(t.language).size(13.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let options = Lang::ALL.iter()
+                                            .map(|l| (l.native_name().to_owned(), *l)).collect();
+                                        if let Some(lang) = dropdown(
+                                            ui, pal, egui::Id::new("settings_lang"),
+                                            self.lang.native_name().to_owned(), options, 160.0,
+                                        ) {
+                                            self.lang = lang;
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(t.language_desc).size(11.0).color(pal.text_faint));
+                            });
+                            ui.add_space(8.0);
+                            settings_card(ui, pal, |ui| {
+                                section_header(ui, pal, if self.lang == Lang::ZhCn { "终端" } else { "Terminal" });
+                                self.terminal_settings_ui(ui, pal);
+                            });
+                            ui.add_space(8.0);
+                            settings_card(ui, pal, |ui| {
+                                let workspace = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(format!("{}    ›", t.workspace_theme)));
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_workspace_theme_rect"), workspace.rect));
+                                if workspace.clicked() { self.workspace_theme_page = true; }
+                                ui.add_space(4.0);
+                                let shortcuts = ui.add_sized(
+                                    [ui.available_width(), 30.0],
+                                    egui::Button::new(format!("{}    ›", t.shortcuts)),
+                                );
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_shortcuts_rect"), shortcuts.rect));
+                                if shortcuts.clicked() { self.shortcuts_page = true; }
+                            });
+                            ui.add_space(8.0);
+                            settings_card(ui, pal, |ui| {
+                                section_header(ui, pal, if self.lang == Lang::ZhCn { "应用更新" } else { "App updates" });
+                                self.update_settings_ui(ui, pal);
+                            });
                         });
-                    });
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(t.language_desc).size(11.0).color(pal.text_faint));
-                    ui.add_space(8.0);
-                    self.terminal_settings_ui(ui, pal);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    let workspace = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(format!("{}    ›", t.workspace_theme)));
-                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_workspace_theme_rect"), workspace.rect));
-                    if workspace.clicked() { self.workspace_theme_page = true; }
-                    ui.add_space(10.0);
-                    ui.separator();
-                    let shortcuts = ui.add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::Button::new(format!("{}    ›", t.shortcuts)),
-                    );
-                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_shortcuts_rect"), shortcuts.rect));
-                    if shortcuts.clicked() { self.shortcuts_page = true; }
-                    ui.add_space(10.0);
-                    ui.separator();
-                    self.update_settings_ui(ui, pal);
-                    });
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_home_scroll_rect"), scroll.inner_rect));
                 }
             });
         if !recording && shortcuts::take_binding(ctx, self.shortcut_keys.binding(shortcuts::Action::Settings)) { done_clicked = true; }
@@ -2373,6 +2398,9 @@ impl LiteTextApp {
             else { done_clicked = true; }
         }
         self.show_settings = open && !done_clicked;
+        if !self.show_settings
+            && let Err(error) = self.save_preferences(true)
+        { self.io_error = Some(format!("Unable to save preferences: {error}")); }
         if !self.show_settings { self.shortcut_recording = None; self.shortcut_error = None; }
         if self.applied.as_ref() != Some(&self.workspace_theme.palette(ctx.system_theme())) { ctx.request_repaint(); }
     }
@@ -2381,6 +2409,39 @@ impl LiteTextApp {
 // ---------------------------------------------------------------------------
 // 通用组件
 // ---------------------------------------------------------------------------
+
+/// Settings need visible form controls, unlike the transparent editor toolbar.
+fn settings_control_style(ui: &mut egui::Ui, pal: &Palette) {
+    let style = ui.style_mut();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.interact_size.y = 26.0;
+    style.spacing.icon_width = 14.0;
+    style.spacing.icon_width_inner = 9.0;
+    style.spacing.icon_spacing = 6.0;
+    style.visuals.override_text_color = Some(pal.text_main);
+    style.visuals.extreme_bg_color = pal.bg_inset;
+    for widget in [&mut style.visuals.widgets.inactive, &mut style.visuals.widgets.noninteractive] {
+        widget.bg_fill = pal.bg_inset;
+        widget.weak_bg_fill = pal.bg_elevated;
+        widget.bg_stroke = Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.7));
+        widget.fg_stroke = Stroke::new(1.5_f32, pal.text_main);
+    }
+    for widget in [&mut style.visuals.widgets.hovered, &mut style.visuals.widgets.active, &mut style.visuals.widgets.open] {
+        widget.bg_fill = pal.bg_elevated;
+        widget.weak_bg_fill = pal.bg_elevated;
+        widget.bg_stroke = Stroke::new(1.2_f32, pal.accent);
+        widget.fg_stroke = Stroke::new(1.8_f32, pal.text_main);
+    }
+}
+
+fn settings_card(ui: &mut egui::Ui, pal: &Palette, content: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new().fill(pal.bg_window).corner_radius(8.0)
+        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.18)))
+        .inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            content(ui);
+        });
+}
 
 /// 设置分组标题。
 fn section_header(ui: &mut egui::Ui, pal: &Palette, title: &str) {
@@ -3927,7 +3988,7 @@ mod tests {
         let bytes = file.bytes.clone();
         let mut selection = Some((2, 4));
         let mut anchor = None;
-        for size in [9.0, 13.5, 32.0] {
+        for size in [10.0, 13.5, 32.0] {
             let output = ctx.run(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))),
                 ..Default::default()
@@ -4149,6 +4210,33 @@ mod tests {
         assert_eq!(scroll_distance(egui::pos2(100.0, 200.0), egui::vec2(0.0, -120.0), 20), 0.0);
         assert_eq!(scroll_distance(egui::pos2(1050.0, 20.0), egui::vec2(0.0, -120.0), 20), 0.0);
         assert_eq!(scroll_distance(hover, egui::vec2(0.0, -120.0), 2), 0.0);
+    }
+
+    #[test]
+    fn untitled_numbers_reuse_open_slots_without_reusing_widget_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("saved.txt");
+        std::fs::write(&path, "saved").unwrap();
+        let mut app = LiteTextApp::default();
+        app.open_paths(vec![path]);
+        app.new_document();
+        let first = app.active_id.unwrap();
+        assert_eq!(app.active().unwrap().name, "未命名 1");
+        app.new_document();
+        assert_eq!(app.active().unwrap().name, "未命名 2");
+        app.close_tab(first);
+        app.lang = Lang::En;
+        app.new_document();
+        assert_eq!(app.active().unwrap().name, "Untitled 1");
+        assert!(app.active_id.unwrap() > first);
+        let second = app.files.iter().find(|f| f.name == "未命名 2").unwrap().id;
+        app.close_tab(second);
+        app.new_document();
+        assert_eq!(app.active().unwrap().name, "Untitled 2");
+        let saved = app.files.iter().find(|f| !f.path.as_os_str().is_empty()).unwrap().id;
+        app.close_others(saved);
+        app.new_document();
+        assert_eq!(app.active().unwrap().name, "Untitled 1");
     }
 
     #[test]

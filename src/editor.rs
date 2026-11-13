@@ -162,6 +162,12 @@ pub(crate) struct EditorState {
 }
 
 impl EditorState {
+    pub(crate) fn gutter_font(&self) -> FontId {
+        let mut font = self.font();
+        font.size -= 1.0;
+        font
+    }
+
     pub(crate) fn font(&self) -> FontId {
         FontId::monospace(if self.font_size > 0.0 {
             self.font_size
@@ -180,6 +186,22 @@ impl EditorState {
 pub(crate) fn row_height(ui: &egui::Ui, font: &FontId) -> f32 {
     let ppp = ui.ctx().pixels_per_point();
     (ui.fonts(|f| f.row_height(font)) * ppp).round() / ppp
+}
+
+/// Compact line actions, independent of document zoom and editor row spacing.
+pub(crate) fn line_menu_style(ui: &mut egui::Ui, copy: &str, clear: &str) {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
+    ui.spacing_mut().interact_size.y = 24.0;
+    let font = egui::FontId::proportional(13.0);
+    let width = [copy, clear].into_iter().map(|label|
+        ui.painter().layout_no_wrap(label.to_owned(), font.clone(), ui.visuals().text_color()).size().x
+    ).fold(0.0_f32, f32::max) + 16.0;
+    ui.set_min_width(width);
+}
+
+pub(crate) fn line_menu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(egui::RichText::new(label).size(13.0)).wrap_mode(egui::TextWrapMode::Extend))
 }
 
 pub(crate) fn scroll_style(ui: &mut egui::Ui, pal: &Palette) {
@@ -236,6 +258,13 @@ pub(crate) fn gutter_columns(line_count: usize) -> usize {
     digits.div_ceil(2) * 2
 }
 
+/// Leave at least as much space before the widest number as between the
+/// number and the document, including the optional fold controls.
+pub(crate) fn gutter_number_width(line_count: usize, digit_width: f32, fold_width: f32) -> f32 {
+    let left_padding = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING + fold_width;
+    left_padding + gutter_columns(line_count) as f32 * digit_width + GUTTER_NUMBER_GAP
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
     ui: &mut egui::Ui,
@@ -258,6 +287,7 @@ pub(crate) fn show(
     let fold_w = folds.width();
     scroll_style(ui, pal);
     let font = state.font();
+    let gutter_font = state.gutter_font();
     let tools = state.tools.clone();
     if let Some(render) = &tools.workspace {
         render.apply_style(ui);
@@ -269,7 +299,7 @@ pub(crate) fn show(
     // Use the rounded glyph advance from a multi-digit galley, not a single glyph's width.
     let probe = ui.painter().layout_no_wrap(
         "0000000000".to_owned(),
-        font.clone(),
+        gutter_font.clone(),
         colors.map_or(pal.text_faint, |c| c.gutter),
     );
     let digit_w = probe
@@ -277,7 +307,7 @@ pub(crate) fn show(
         .first()
         .and_then(|row| (row.glyphs.len() >= 2).then(|| row.glyphs[1].pos.x - row.glyphs[0].pos.x))
         .unwrap_or(8.0);
-    let number_w = gutter_columns(line_count) as f32 * digit_w + GUTTER_NUMBER_GAP;
+    let number_w = gutter_number_width(line_count, digit_w, fold_w);
     let gutter_w = number_w + fold_w;
     let gutter = egui::Rect::from_min_max(
         bounds.min,
@@ -504,7 +534,7 @@ pub(crate) fn show(
                         ),
                         egui::Align2::RIGHT_CENTER,
                         (line + 1).to_string(),
-                        font.clone(),
+                        gutter_font.clone(),
                         if selected || modified {
                             pal.accent
                         } else {
@@ -567,12 +597,12 @@ pub(crate) fn show(
                 } else {
                     t.copy_lines
                 };
-                if menu.button(label).clicked() {
+                line_menu_style(menu, label, t.clear_content);
+                if line_menu_button(menu, label).clicked() {
                     menu.ctx().copy_text(copy_lines(text, selection));
                     menu.close_menu();
                 }
-                menu.separator();
-                if menu.button(t.clear_content).clicked() {
+                if line_menu_button(menu, t.clear_content).clicked() {
                     let before = text.clone();
                     let cursor = output.state.cursor.char_range().unwrap_or_default();
                     let mut undoer = output.state.undoer();
@@ -652,7 +682,7 @@ mod tests {
                 crate::setup_fonts(&h.ctx);
                 h.ctx.set_pixels_per_point(ppp);
                 h.ctx.style_mut(|s| s.animation_time = 0.0);
-                for size in [13.5, 9.0, 32.0, 13.5] {
+                for size in [13.5, 10.0, 32.0, 13.5] {
                     h.state.font_size = size;
                     for _ in 0..3 {
                         h.run(vec![]);
@@ -694,6 +724,11 @@ mod tests {
                                 let row = &document.galley.rows[line - 1 - base];
                                 let expected = document.pos.y + row.rect.center().y;
                                 let actual = number.pos.y + number.galley.rows[0].rect.center().y;
+                                assert_eq!(number.galley.job.sections[0].format.font_id.size, size - 1.0);
+                                assert_eq!(document.galley.job.sections[0].format.font_id.size, size);
+                                let right_gap = document.pos.x - (number.pos.x + number.galley.size().x);
+                                assert!(number.pos.x + 1.0 / ppp >= right_gap,
+                                    "left padding must balance document gap: large={large}, size={size}, line={line}, left={}, right={right_gap}", number.pos.x);
                                 assert!(
                                     (actual - expected).abs() < 1.1 / ppp,
                                     "large={large}, ppp={ppp}, size={size}, line={line}: {actual} != {expected}"
@@ -966,13 +1001,28 @@ mod tests {
         let ten = harness.row_pos(0).x;
         harness.text = "\n".repeat(99);
         let hundred = harness.row_pos(0).x;
-        assert!(first < 20.0, "空白页不再保留 54px 的宽行号栏");
+        assert!(first < 32.0, "增加左留白后仍保持紧凑行号栏");
         assert_eq!(ten, first);
         assert!(hundred > ten);
         harness.text = "\n".repeat(999);
         assert_eq!(harness.row_pos(0).x, hundred);
         harness.text.clear();
         assert_eq!(harness.row_pos(0).x, first);
+    }
+
+    #[test]
+    fn gutter_left_padding_balances_right_gap_including_fold_lane() {
+        for count in [1usize, 10, 100, 1000, 10000] {
+            for digit_width in [5.0, 8.0, 19.0] {
+                for folds in [0.0, 16.0] {
+                    let width = gutter_number_width(count, digit_width, folds);
+                    let reserved_digits = gutter_columns(count) as f32 * digit_width;
+                    let left = width - GUTTER_NUMBER_GAP - reserved_digits;
+                    let right = GUTTER_NUMBER_GAP + folds + EDITOR_LEFT_PADDING;
+                    assert!((left - right).abs() < 0.01);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1024,6 +1074,7 @@ mod tests {
         text: String,
         state: EditorState,
         frame: usize,
+        lang: crate::Lang,
     }
 
     impl Harness {
@@ -1033,6 +1084,7 @@ mod tests {
                 text: text.to_owned(),
                 state: EditorState::default(),
                 frame: 0,
+                lang: crate::Lang::En,
             };
             harness.run(vec![]);
             harness.run(vec![]);
@@ -1073,7 +1125,7 @@ mod tests {
                                 1,
                                 &crate::DARK,
                                 false,
-                                crate::tr(crate::Lang::En),
+                                crate::tr(self.lang),
                             );
                         });
                 },
@@ -1138,6 +1190,36 @@ mod tests {
     }
 
     #[test]
+    fn line_menus_are_compact_single_line_and_copy_selected_content() {
+        for large in [false, true] {
+            for lang in [crate::Lang::ZhCn, crate::Lang::En] {
+                let source = if large { "alpha\nbeta\n".repeat(30000) } else { "alpha\nbeta\ngamma".into() };
+                let mut harness = Harness::new(&source);
+                crate::setup_fonts(&harness.ctx);
+                harness.lang = lang;
+                harness.state.font_size = 32.0; // menu must not inherit document zoom
+                harness.select_rows(0, 1);
+                let output = harness.open_menu(0);
+                let t = crate::tr(lang);
+                let text = |label| output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                    _ => None,
+                }).unwrap();
+                let copy = text(t.copy_lines);
+                let clear = text(t.clear_content);
+                assert_eq!(copy.galley.rows.len(), 1);
+                assert_eq!(clear.galley.rows.len(), 1);
+                let gap = clear.pos.y - (copy.pos.y + copy.galley.size().y);
+                assert!((0.0..=14.0).contains(&gap), "{lang:?}, large={large}: menu gap={gap}");
+                assert_eq!(copy.galley.job.sections[0].format.font_id.size, 13.0);
+                let result = harness.click_menu(output, t.copy_lines);
+                assert!(result.platform_output.commands.iter().any(|cmd|
+                    matches!(cmd, egui::OutputCommand::CopyText(text) if text == "alpha\nbeta")));
+            }
+        }
+    }
+
+    #[test]
     fn blank_editor_has_first_line_and_right_click_copies_only_line_contents() {
         let mut blank = Harness::new("");
         assert!(blank.row_pos(0).x < 54.0);
@@ -1160,7 +1242,7 @@ mod tests {
         harness.select_rows(1, 2);
         assert_eq!(harness.state.selection, Some((1, 2)));
         let menu = harness.open_menu(1);
-        let result = harness.click_menu(menu, "Copy Line Contents");
+        let result = harness.click_menu(menu, "Copy Contents");
         assert!(result.platform_output.commands.iter().any(
             |cmd| matches!(cmd, egui::OutputCommand::CopyText(text) if text == "beta\ngamma")
         ));

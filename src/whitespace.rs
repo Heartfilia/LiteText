@@ -239,7 +239,8 @@ pub(crate) fn picker(
                             + 2.0 * ui.spacing().button_padding.x;
                         ui.set_width(width);
                         for choice in [TabMode::Default, TabMode::Spaces2, TabMode::Spaces4] {
-                            let row = ui.selectable_label(mode == choice, choice.label(zh));
+                            let row = ui.add_sized([width, 26.0], egui::Button::new(choice.label(zh))
+                                .selected(mode == choice).frame(mode == choice));
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(id.with(choice.label(false)), row.rect)
                             });
@@ -461,10 +462,20 @@ mod tests {
                 run_status(&mut app, button(rect, pressed));
             }
             run_status(&mut app, vec![]);
-            run_status(&mut app, vec![]);
+            let output = run_status(&mut app, vec![]);
             let popup = ctx
                 .data(|d| d.get_temp::<egui::Rect>(id.with("popup_rect")))
                 .unwrap();
+            for mode in [TabMode::Default, TabMode::Spaces2, TabMode::Spaces4] {
+                let row = ctx.data(|d| d.get_temp::<egui::Rect>(id.with(mode.label(false)))).unwrap();
+                let text = output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == mode.label(lang == Lang::ZhCn) =>
+                        Some(egui::Rect::from_min_size(t.pos, t.galley.size())),
+                    _ => None,
+                }).unwrap();
+                assert!((text.center().x - row.center().x).abs() < 1.0, "{row:?}: {text:?}");
+                assert!((row.center().x - popup.center().x).abs() < 1.0);
+            }
             let longest = [TabMode::Default, TabMode::Spaces2, TabMode::Spaces4]
                 .into_iter()
                 .map(|mode| {

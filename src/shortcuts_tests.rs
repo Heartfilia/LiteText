@@ -32,11 +32,11 @@ fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
     for _ in 0..100 {
         app.zoom_workspace(-1.0, &ctx);
     }
-    assert_eq!(app.workspace_font_size, 9.0);
+    assert_eq!(app.workspace_font_size, 10.0);
     assert_eq!(ctx.zoom_factor(), 1.0);
     let restored: LiteTextApp =
         serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
-    assert_eq!(restored.workspace_font_size, 9.0);
+    assert_eq!(restored.workspace_font_size, 10.0);
     assert_eq!(
         serde_json::from_str::<LiteTextApp>("{}")
             .unwrap()
@@ -48,7 +48,7 @@ fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
     let _ = ctx.run(input(vec![key(Action::ZoomIn)]), |ctx| {
         app.handle_shortcuts(ctx);
     });
-    assert_eq!(app.workspace_font_size, 9.0);
+    assert_eq!(app.workspace_font_size, 10.0);
     let _ = ctx.run(
         input(vec![egui::Event::Key {
             key: Key::F8,
@@ -61,7 +61,7 @@ fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
             app.handle_shortcuts(ctx);
         },
     );
-    assert_eq!(app.workspace_font_size, 10.0);
+    assert_eq!(app.workspace_font_size, 11.0);
 }
 
 #[test]
@@ -557,7 +557,7 @@ fn shortcuts_page_fits_all_groups_and_separates_labels_and_keycaps() {
                     content.y <= viewport.height() + 1.0,
                     "lang={lang:?}, size={size:?}, content={content:?}, viewport={viewport:?}"
                 );
-                for group in 0..4usize {
+                for group in 0..3usize {
                     let card = ctx
                         .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("shortcut_card", group))))
                         .unwrap();
@@ -569,7 +569,11 @@ fn shortcuts_page_fits_all_groups_and_separates_labels_and_keycaps() {
             } else {
                 assert!(content.y > viewport.height());
             }
-            for &action in ACTIONS {
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("shortcut_card", 3usize)))).is_none());
+            for action in ACTIONS.iter().filter(|action| action.group() == 3) {
+                assert!(ctx.data(|d| d.get_temp::<(egui::Rect, egui::Rect, f32)>(egui::Id::new(("shortcut_row", *action as usize)))).is_none());
+            }
+            for &action in ACTIONS.iter().filter(|action| action.group() < 3) {
                 let (row, label, keys) = ctx
                     .data(|d| {
                         d.get_temp::<(egui::Rect, egui::Rect, f32)>(egui::Id::new((

@@ -383,6 +383,7 @@ pub(crate) fn store_buffers(
     store_buffers_inner(path, files, active_id, validate, false)
 }
 
+#[cfg(test)]
 pub(crate) fn archive_buffers(
     path: &Path,
     files: &[LoadedFile],
@@ -447,7 +448,32 @@ fn store_buffers_inner(
     };
     atomic_write_with(path, |writer| {
         serde_json::to_writer(writer, &snapshot).map_err(io::Error::other)
-    })
+    })?;
+    prune_reload_archives(path)
+}
+
+/// Only the app's old, well-formed reload backup names in this snapshot's
+/// directory are eligible. Never recurse or touch arbitrary user files.
+pub(crate) fn prune_reload_archives(session: &Path) -> io::Result<()> {
+    let Some(parent) = session.parent() else { return Ok(()); };
+    if std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_symlink()) { return Ok(()); }
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.path() == session { continue; }
+        let name = entry.file_name();
+        let Some((id, stamp)) = name.to_str().and_then(|s| s.strip_prefix("before-reload-"))
+            .and_then(|s| s.strip_suffix(".json")).and_then(|s| s.split_once('-')) else { continue; };
+        if id.parse::<u64>().is_err() || stamp.parse::<u128>().is_err() || !entry.file_type()?.is_file() { continue; }
+        if load(&entry.path()).is_ok_and(|session| session.is_some()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load(path: &Path) -> io::Result<Option<Session>> {
@@ -555,6 +581,57 @@ pub(crate) fn save_document_checked(
 mod tests {
     use super::*;
     use crate::LiteTextApp;
+
+    #[test]
+    fn closing_tabs_replaces_snapshot_with_only_open_tabs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.txt");
+        std::fs::write(&path, "original").unwrap();
+        let snapshot = temp.path().join("recovery/session.json");
+        let mut app = LiteTextApp { recovery_path_override: Some(snapshot.clone()), ..Default::default() };
+        app.open_paths(vec![path.clone()]);
+        let linked = app.active_id.unwrap();
+        app.new_document();
+        let closed = app.active_id.unwrap();
+        app.active_mut().unwrap().draft_text = Some("closed private draft".into());
+        app.active_mut().unwrap().sync_draft();
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("keep open but unselected".into());
+        app.active_mut().unwrap().sync_draft();
+        let kept = app.active_id.unwrap();
+        app.active_id = Some(linked);
+        assert!(app.backup_or_report());
+        assert!(std::fs::read_to_string(&snapshot).unwrap().contains("closed private draft"));
+        app.apply_tab_action(crate::TabAction::Close(closed));
+        let bytes = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(!bytes.contains("closed private draft"));
+        let restored = load(&snapshot).unwrap().unwrap().restore();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().any(|f| f.id == kept && f.draft_text.as_deref() == Some("keep open but unselected")));
+        app.apply_tab_action(crate::TabAction::Close(kept));
+        app.apply_tab_action(crate::TabAction::Close(linked));
+        assert!(!load(&snapshot).unwrap().unwrap().has_files());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn cleanup_removes_only_recognized_reload_archives_after_successful_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("session.json");
+        let archive = temp.path().join("before-reload-12-1700000000000000.json");
+        let mut app = LiteTextApp::default();
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("obsolete reload copy".into());
+        archive_buffers(&archive, &app.files, app.active_id).unwrap();
+        let unknown = temp.path().join("before-reload-custom.json");
+        std::fs::copy(&archive, &unknown).unwrap();
+        let malformed = temp.path().join("before-reload-1-2.json");
+        std::fs::write(&malformed, "unknown user data").unwrap();
+        store_buffers(&session, &[], None, true).unwrap();
+        assert!(!archive.exists());
+        assert!(unknown.exists());
+        assert_eq!(std::fs::read_to_string(malformed).unwrap(), "unknown user data");
+    }
 
     #[test]
     fn common_encodings_round_trip_and_refuse_unrepresentable_characters() {

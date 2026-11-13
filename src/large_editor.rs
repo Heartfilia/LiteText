@@ -420,6 +420,7 @@ pub(crate) fn show(
     let fold_w = folds.width();
     editor::scroll_style(ui, pal);
     let font = state.font();
+    let gutter_font = state.gutter_font();
     let mut tools = state.tools.clone();
     if let Some(render) = &tools.workspace {
         render.apply_style(ui);
@@ -431,13 +432,16 @@ pub(crate) fn show(
         .painter()
         .layout_no_wrap("0000000000".to_owned(), font.clone(), pal.text_main);
     let digit_w = probe.rows[0].glyphs[1].pos.x - probe.rows[0].glyphs[0].pos.x;
+    let number_probe = ui.painter().layout_no_wrap("0000000000".to_owned(), gutter_font.clone(), pal.text_faint);
+    let number_digit_w = number_probe.rows[0].glyphs[1].pos.x - number_probe.rows[0].glyphs[0].pos.x;
     state.large.index(text);
     state
         .changes
         .update(&state.large.fingerprints, state.large.revision);
     let count = state.large.ranges.len();
+    let number_w = editor::gutter_number_width(count, number_digit_w, fold_w);
     let wrap_width =
-        (bounds.width() - editor::gutter_columns(count) as f32 * digit_w - fold_w - 40.0).max(24.0);
+        (bounds.width() - number_w - fold_w - 38.0).max(24.0);
     state
         .large
         .visual_index(ui, text, &font, pal, wrap_width, tools.wrap);
@@ -445,7 +449,6 @@ pub(crate) fn show(
     if let Some((start, end)) = state.selection {
         state.selection = Some((start.min(count - 1), end.min(count - 1)));
     }
-    let number_w = editor::gutter_columns(count) as f32 * digit_w + 2.0;
     let gutter_w = number_w + fold_w;
     let gutter = egui::Rect::from_min_max(
         bounds.min,
@@ -820,7 +823,7 @@ pub(crate) fn show(
                     egui::pos2(number_gutter.right() - 2.0, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     (line + 1).to_string(),
-                    font.clone(),
+                    gutter_font.clone(),
                     if selected || modified {
                         pal.accent
                     } else {
@@ -871,14 +874,13 @@ pub(crate) fn show(
             }
             response.context_menu(|ui| {
                 let selection = state.selection.unwrap_or((0, 0));
-                if ui
-                    .button(if selection.0 == selection.1 {
+                let label = if selection.0 == selection.1 {
                         t.copy_line
                     } else {
                         t.copy_lines
-                    })
-                    .clicked()
-                {
+                    };
+                editor::line_menu_style(ui, label, t.clear_content);
+                if editor::line_menu_button(ui, label).clicked() {
                     let copied = state.large.ranges[selection.0..=selection.1]
                         .iter()
                         .map(|r| &text[r.clone()])
@@ -887,8 +889,7 @@ pub(crate) fn show(
                     ui.ctx().copy_text(copied);
                     ui.close_menu();
                 }
-                ui.separator();
-                if ui.button(t.clear_content).clicked() {
+                if editor::line_menu_button(ui, t.clear_content).clicked() {
                     line_action = Some(selection);
                     ui.close_menu();
                 }
@@ -950,7 +951,7 @@ mod tests {
         state.index(&text);
         let ctx = egui::Context::default();
         let mut row_counts = Vec::new();
-        for size in [9.0, 32.0, 9.0] {
+        for size in [10.0, 32.0, 10.0] {
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     state.visual_index(

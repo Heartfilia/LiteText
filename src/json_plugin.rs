@@ -686,10 +686,17 @@ mod tests {
                     .unwrap()
                 };
                 run(&mut app, vec![]);
-                run(&mut app, vec![]);
+                let layout = run(&mut app, vec![]);
                 let rect = fold_rect();
                 // Number, fold control and body occupy separate, non-overlapping columns.
-                assert!(rect.left() > 20.0 && rect.right() < 60.0);
+                let text_rect = |matches: fn(&str) -> bool| layout.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if matches(text.galley.text()) =>
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size())),
+                    _ => None,
+                }).unwrap();
+                let number = text_rect(|s| s == "1");
+                let body = text_rect(|s| s.starts_with('{'));
+                assert!(number.right() < rect.left() && rect.right() < body.left());
                 for pressed in [true, false] {
                     run(&mut app, button(rect.center(), pressed));
                 }

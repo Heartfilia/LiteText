@@ -40,6 +40,26 @@ fn live_windows(root: &std::path::Path) -> std::io::Result<Vec<String>> {
     Ok(live)
 }
 
+/// Retire only recognized snapshots of non-running windows. Keep settings,
+/// unknown files and malformed recovery data untouched; never follow symlinks.
+fn retire_inactive_snapshots(root: &std::path::Path, keep: &[String]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root.join("windows"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().filter(|id| valid_id(id)) else { continue; };
+        if keep.iter().any(|keep| keep == id) || !entry.file_type()?.is_dir() { continue; }
+        let recovery = entry.path().join("recovery");
+        if std::fs::symlink_metadata(&recovery).is_ok_and(|m| m.file_type().is_symlink()) { continue; }
+        let path = recovery.join("session.json");
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+            && crate::recovery::load(&path).is_ok_and(|s| s.is_some_and(|s| s.has_files())) {
+            crate::recovery::store_buffers(&path, &[], None, false)?;
+        }
+        crate::recovery::prune_reload_archives(&path)?;
+    }
+    Ok(())
+}
+
 impl Runtime {
     fn start(root: PathBuf, requested: Option<&str>) -> std::io::Result<Self> {
         use fs2::FileExt;
@@ -99,19 +119,35 @@ impl Runtime {
             }
             source => source,
         };
+        // A successful private claim becomes the only startup copy. Otherwise
+        // a closed tab could survive in an older shared/crashed snapshot.
+        let claimed = restore.as_ref().is_some_and(|path|
+            crate::recovery::load(path).is_ok_and(|session| session.is_some()));
+        if live.is_empty() && claimed {
+            retire_inactive_snapshots(&root, std::slice::from_ref(&id))?;
+        }
+        let published = root.join("recovery/session.json");
+        if (claimed || !live.is_empty())
+            && std::fs::symlink_metadata(&published).is_ok_and(|m| m.is_file())
+            && crate::recovery::load(&published).is_ok_and(|s| s.is_some()) {
+            std::fs::remove_file(&published)?;
+        }
+        crate::recovery::prune_reload_archives(&published)?;
         Ok(Self { root, id, lock: Some(lock), restore, finished: false })
     }
 
     fn finish(&mut self, files: &[crate::LoadedFile], active: Option<u64>) -> std::io::Result<()> {
         if self.finished { return Ok(()); }
         let _registry = registry_lock(&self.root)?;
-        let others = live_windows(&self.root)?.into_iter().any(|id| id != self.id);
+        let live = live_windows(&self.root)?;
+        let others = live.iter().any(|id| id != &self.id);
         // Publish the final snapshot before releasing membership. Concurrent
         // closes are serialized, so exactly the last window wins.
         if !others {
             crate::recovery::store_buffers(&self.root.join("recovery/session.json"), files, active, true)?;
         }
         crate::recovery::store_buffers(&self.root.join("windows").join(&self.id).join("recovery/session.json"), &[], None, true)?;
+        retire_inactive_snapshots(&self.root, &live)?;
         self.finished = true;
         self.lock.take();
         Ok(())
@@ -314,6 +350,63 @@ impl crate::LiteTextApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_consumes_old_snapshots_without_touching_running_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut app = crate::LiteTextApp::default();
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("recover once".into());
+        app.active_mut().unwrap().sync_draft();
+        let published = root.join("recovery/session.json");
+        let stale = root.join("windows/old/recovery/session.json");
+        crate::recovery::store_buffers(&published, &app.files, app.active_id, true).unwrap();
+        crate::recovery::store_buffers(&stale, &app.files, app.active_id, true).unwrap();
+        let mut first = Runtime::start(root.to_owned(), None).unwrap();
+        assert!(!published.exists());
+        assert!(!crate::recovery::load(&stale).unwrap().unwrap().has_files());
+        let own = first.restore.as_ref().unwrap().clone();
+        assert!(crate::recovery::load(&own).unwrap().unwrap().has_files());
+        let mut second = Runtime::start(root.to_owned(), Some("second")).unwrap();
+        assert!(crate::recovery::load(&own).unwrap().unwrap().has_files());
+        let second_session = root.join("windows/second/recovery/session.json");
+        crate::recovery::store_buffers(&second_session, &app.files, app.active_id, true).unwrap();
+        first.finish(&[], None).unwrap();
+        assert!(!crate::recovery::load(&own).unwrap().unwrap().has_files());
+        assert!(crate::recovery::load(&second_session).unwrap().unwrap().has_files());
+        second.finish(&[], None).unwrap();
+        let cold = Runtime::start(root.to_owned(), None).unwrap();
+        assert!(!crate::recovery::load(cold.restore.as_ref().unwrap()).unwrap().unwrap().has_files());
+    }
+
+    #[test]
+    fn retiring_snapshots_preserves_unknown_files_and_symlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let recovery = root.join("windows/old/recovery");
+        std::fs::create_dir_all(&recovery).unwrap();
+        let session = recovery.join("session.json");
+        std::fs::write(&session, "unrecognized recovery data").unwrap();
+        let notes = recovery.join("notes.txt");
+        std::fs::write(&notes, "user notes").unwrap();
+        retire_inactive_snapshots(root, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&session).unwrap(), "unrecognized recovery data");
+        assert_eq!(std::fs::read_to_string(notes).unwrap(), "user notes");
+        #[cfg(unix)]
+        {
+            let target = root.join("outside.json");
+            crate::recovery::store_buffers(&target, &[], None, false).unwrap();
+            let bytes = std::fs::read(&target).unwrap();
+            let linked = root.join("windows/linked/recovery");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(&target, linked.join("session.json")).unwrap();
+            std::os::unix::fs::symlink(&target, recovery.join("before-reload-1-2.json")).unwrap();
+            retire_inactive_snapshots(root, &[]).unwrap();
+            assert_eq!(std::fs::read(target).unwrap(), bytes);
+            assert!(recovery.join("before-reload-1-2.json").exists());
+        }
+    }
+
     #[test]
     fn simultaneous_closes_publish_one_complete_last_session() {
         let temp = tempfile::tempdir().unwrap();

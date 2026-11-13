@@ -576,35 +576,69 @@ impl LiteTextApp {
             .resizable(false)
             .open(&mut open)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
-            .frame(egui::Frame::window(&ctx.style()).fill(pal.bg_panel))
+            .fixed_size(egui::vec2((ctx.screen_rect().width() - 64.0).clamp(280.0, 500.0),
+                (ctx.screen_rect().height() - 150.0).clamp(140.0, 430.0)))
+            .frame(egui::Frame::new().fill(pal.bg_panel).corner_radius(10.0)
+                .stroke(egui::Stroke::new(1.0_f32, pal.bg_elevated)).inner_margin(egui::Margin::same(16)))
             .show(ctx, |ui| {
-                ui.label(if zh {
-                    "选择目标语言（仅当前激活工作区）"
+                crate::settings_control_style(ui, pal);
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                let scroll = egui::ScrollArea::vertical().max_height(ui.available_height()).auto_shrink([false, false]).show(ui, |ui| {
+                ui.label(egui::RichText::new(if zh { "将 cURL 转换为代码" } else { "Turn cURL into code" })
+                    .size(18.0).strong().color(pal.text_main));
+                ui.add(egui::Label::new(egui::RichText::new(if zh {
+                    "选择目标语言，将替换当前工作区内容，可撤销。"
                 } else {
-                    "Choose a target (active workspace only)"
-                });
-                ui.separator();
+                    "Choose a target to replace the active workspace. Undo is supported."
+                }).size(12.0).color(pal.text_faint)).wrap());
+                ui.add_space(2.0);
                 let enabled = self.active().is_some_and(|f| {
                     !f.is_binary && f.view == ViewMode::Text && f.draft_text.is_some()
                 });
                 ui.add_enabled_ui(enabled, |ui| {
-                    for target in TARGETS {
-                        let label = format!(
-                            "{} {}",
-                            if zh { "转成" } else { "Convert to" },
-                            target.name()
-                        );
-                        if crate::app_menu_row(ui, &label, false, pal).clicked() {
-                            picked = Some(target);
-                        }
+                    let columns = if ui.available_width() >= 400.0 { 2 } else { 1 };
+                    for targets in TARGETS.chunks(columns) {
+                        ui.columns(columns, |uis| {
+                            for (target, ui) in targets.iter().zip(uis) {
+                                let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::click());
+                                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), target.name()));
+                                let hovered = response.hovered() && ui.is_enabled();
+                                let stroke = if hovered { pal.accent } else { pal.text_faint.gamma_multiply(0.25) };
+                                ui.painter().rect(rect, 8.0, if hovered { pal.bg_elevated } else { pal.bg_window },
+                                    egui::Stroke::new(1.0_f32, stroke), egui::StrokeKind::Inside);
+                                let label = format!("{} {}", if zh { "转成" } else { "Convert to" }, target.name());
+                                ui.painter().text(rect.left_top() + egui::vec2(12.0, 18.0), egui::Align2::LEFT_CENTER,
+                                    label, egui::FontId::proportional(13.0), if hovered { pal.accent } else { pal.text_main });
+                                let detail = match target {
+                                    Target::Python => "requests · Python 3",
+                                    Target::JavaScript => "Fetch API · Browser",
+                                    Target::Node => "Native fetch · Node.js 18+",
+                                    Target::Go => "Standard library · net/http",
+                                    Target::Rust => "Blocking client · reqwest",
+                                    Target::Php => "cURL extension · PHP",
+                                    Target::Http => "Raw request · HTTP/1.1",
+                                };
+                                ui.painter().text(rect.left_top() + egui::vec2(12.0, 43.0), egui::Align2::LEFT_CENTER,
+                                    detail, egui::FontId::proportional(11.0), pal.text_faint);
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("curl_target", target.name())), rect));
+                                if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { picked = Some(*target); }
+                            }
+                        });
                     }
                 });
-                ui.separator();
-                ui.small(if zh {
-                    "本地转换，不执行命令。暂不支持文件、multipart、shell 表达式。"
+                ui.add_space(2.0);
+                egui::Frame::new().fill(pal.bg_inset).corner_radius(7.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(if zh {
+                    "离线转换 · 不执行命令，不发送请求\n暂不支持文件、multipart 和 shell 表达式。"
                 } else {
-                    "Offline; never executes commands. No files, multipart or shell expressions."
+                    "Offline · No commands or network requests\nFiles, multipart and shell expressions are not supported."
+                }).size(11.0).color(pal.text_faint)).wrap());
                 });
+                if !enabled {
+                    ui.label(egui::RichText::new(if zh { "请先打开一个文本工作区。" } else { "Open a text workspace first." }).color(pal.accent));
+                }
+                });
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("curl_scroll_rect"), scroll.inner_rect));
             });
         if !open || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.show_curl_menu = false;
@@ -738,6 +772,50 @@ mod tests {
                 ),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => panic!("{program}: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn target_cards_fit_themes_languages_and_small_windows() {
+        for pal in [&crate::DARK, &crate::LIGHT] {
+            for lang in [Lang::ZhCn, Lang::En] {
+                for size in [egui::vec2(640.0, 420.0), egui::vec2(1080.0, 720.0), egui::vec2(400.0, 500.0)] {
+                    let ctx = egui::Context::default();
+                    crate::setup_fonts(&ctx);
+                    crate::apply_style(&ctx, pal);
+                    let mut app = LiteTextApp { lang, show_curl_menu: true, ..Default::default() };
+                    app.new_document();
+                    app.active_mut().unwrap().draft_text = Some("curl https://example.com/".into());
+                    let raw = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+                    let mut output = None;
+                    for _ in 0..5 { output = Some(ctx.run(raw(), |ctx| app.curl_target_menu(ctx, pal))); }
+                    let view = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("curl_scroll_rect"))).unwrap();
+                    assert!(view.left() >= 0.0 && view.right() <= size.x);
+                    assert!(view.top() >= 0.0 && view.bottom() <= size.y);
+                    for target in TARGETS {
+                        let card = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("curl_target", target.name())))).unwrap();
+                        assert!(card.left() >= view.left() - 1.0 && card.right() <= view.right() + 1.0);
+                        let label = format!("{} {}", if lang == Lang::ZhCn { "转成" } else { "Convert to" }, target.name());
+                        // Fully visible labels must fit their own cards.
+                        if view.contains_rect(card) {
+                            let text = output.as_ref().unwrap().shapes.iter().find_map(|s| match &s.shape {
+                                egui::Shape::Text(t) if t.galley.text() == label => Some(egui::Rect::from_min_size(t.pos, t.galley.size())),
+                                _ => None,
+                            }).unwrap();
+                            assert!(card.contains_rect(text), "{label}: {text:?} outside {card:?}");
+                        }
+                    }
+                    for _ in 0..12 {
+                        let mut input = raw();
+                        input.events = vec![egui::Event::PointerMoved(view.center()), egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -1000.0), modifiers: Default::default(),
+                        }];
+                        let _ = ctx.run(input, |ctx| app.curl_target_menu(ctx, pal));
+                    }
+                    let http = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("curl_target", Target::Http.name())))).unwrap();
+                    assert!(view.contains_rect(http), "last target must be reachable: {http:?}, {view:?}");
+                }
             }
         }
     }

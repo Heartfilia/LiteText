@@ -364,7 +364,7 @@ pub(crate) fn take_binding(
 
 impl LiteTextApp {
     fn zoom_workspace(&mut self, delta: f32, ctx: &egui::Context) {
-        self.workspace_font_size = (self.workspace_font_size + delta).clamp(9.0, 32.0);
+        self.workspace_font_size = (self.workspace_font_size + delta).clamp(10.0, 32.0);
         ctx.request_repaint();
     }
 
@@ -734,9 +734,9 @@ impl LiteTextApp {
             ui.label(egui::RichText::new(error).color(pal.danger));
         }
         let groups = if zh {
-            ["文件与标签页", "基础编辑", "查找替换", "HEX 工具"]
+            ["文件与标签页", "基础编辑", "查找替换"]
         } else {
-            ["Files & tabs", "Editing", "Find & replace", "HEX tools"]
+            ["Files & tabs", "Editing", "Find & replace"]
         };
         let columns = if ui.available_width() >= 940.0 {
             3
