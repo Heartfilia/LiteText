@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（macOS 200 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。Windows 另有 EXE 图标资源检查，需在 Windows CI 验证。
+测试：`cargo test`（macOS 201 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。Windows 另有 EXE 图标资源检查，需在 Windows CI 验证。
 
 ## 目录结构
 
@@ -178,6 +178,12 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-13（Windows 图标检查与 Linux 恢复 CI 修复）
+
+- Windows EXE 图标资源测试改用 `as_chunks::<14>()`，兼容 Rust 1.100 的 `chunks_exact_to_as_chunks` 严格检查，不关闭 lint。
+- 冷启动选择恢复记录时，修改时间相同优先采用最后正常关闭发布的共享记录（包括空会话）；私有记录再按路径稳定排序，不再依赖目录遍历顺序。严格更新的崩溃记录仍优先恢复。
+- 恢复测试主动设置相同／较新文件时间戳，覆盖 CI 文件系统时间精度差异，不通过延时掩盖竞态；Windows/Linux 原生构建需云端重验。
 
 ### 2026-11-13（Windows CI Clippy 修复）
 

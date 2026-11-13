@@ -76,10 +76,16 @@ impl Runtime {
                 if path.is_file() { candidates.push(path); }
             }
             // A crash keeps its private recovery snapshot; normal closes clear
-            // theirs. Restore at most one latest nonempty crash session.
+            // theirs. Restore at most one latest nonempty crash session. On
+            // coarse-resolution filesystems several writes can share an mtime:
+            // the published clean close must win ties, even when it is empty.
             candidates.into_iter().filter(|path| {
                 path == &published || crate::recovery::load(path).ok().flatten().is_some_and(|s| s.has_files())
-            }).max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok()).or(Some(published))
+            }).max_by_key(|path| (
+                std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                path == &published,
+                path.clone(),
+            )).or(Some(published))
         } else { None };
         // Claim the selected snapshot while membership is serialized. Another
         // process may become the last window and replace the shared session
@@ -386,8 +392,35 @@ mod tests {
         let stale = root.join("windows/stale/recovery/session.json");
         crate::recovery::store_buffers(&stale, &app.files, app.active_id, true).unwrap();
         cold.finish(&[], None).unwrap();
+        // Reproduce Linux/CI timestamp ties deterministically, without sleeps.
+        let same_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for path in [&published, &stale] {
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(same_time).unwrap();
+        }
         let next = Runtime::start(root, None).unwrap();
         assert!(!crate::recovery::load(next.restore.as_ref().unwrap()).unwrap().unwrap().has_files());
+    }
+
+    #[test]
+    fn strictly_newer_crash_snapshot_beats_published_clean_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let published = root.join("recovery/session.json");
+        crate::recovery::store_buffers(&published, &[], None, true).unwrap();
+        let mut app = crate::LiteTextApp::default();
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("newer unsaved crash content".into());
+        app.active_mut().unwrap().sync_draft();
+        let crashed = root.join("windows/crashed/recovery/session.json");
+        crate::recovery::store_buffers(&crashed, &app.files, app.active_id, true).unwrap();
+        let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for (path, modified) in [(&published, time), (&crashed, time + std::time::Duration::from_secs(2))] {
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        }
+        let next = Runtime::start(root, None).unwrap();
+        let files = crate::recovery::load(next.restore.as_ref().unwrap()).unwrap().unwrap().restore();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].draft_text.as_deref(), Some("newer unsaved crash content"));
     }
 
     #[test]

@@ -3598,7 +3598,7 @@ mod tests {
             let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
             assert!(count >= 7, "keep the multi-resolution ICO images");
             assert!(size >= 6 + count * 14);
-            for entry in bytes[6..6 + count * 14].chunks_exact(14) {
+            for entry in bytes[6..6 + count * 14].as_chunks::<14>().0 {
                 let id = u16::from_le_bytes([entry[12], entry[13]]) as usize;
                 let image = FindResourceW(module, std::ptr::without_provenance(id), std::ptr::without_provenance(3));
                 assert!(!image.is_null(), "each icon image must be embedded");
