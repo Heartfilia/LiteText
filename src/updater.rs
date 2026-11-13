@@ -883,6 +883,7 @@ impl LiteTextApp {
         let _ = prepared.root.keep();
         let _ = prepared.stage.keep();
         self.updater.exit_lock = Some(prepared.lock);
+        self.update_restarting = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     pub(crate) fn update_settings_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {

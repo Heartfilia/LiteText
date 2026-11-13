@@ -190,7 +190,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn is_empty(&self) -> bool { self.files.is_empty() }
+    pub(crate) fn has_files(&self) -> bool { !self.files.is_empty() }
     #[cfg(test)]
     pub(crate) fn capture(files: &[LoadedFile], active_id: Option<u64>) -> Self {
         Self {

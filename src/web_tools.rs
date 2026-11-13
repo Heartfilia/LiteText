@@ -235,31 +235,116 @@ pub(crate) fn convert(input: &str, action: Action) -> Result<String, String> {
         Action::Header => headers(input),
         Action::Cookie => cookies(input),
         Action::Html => {
-            if input.len() > 4 * 1024 * 1024 {
-                return Err("HTML formatting limit is 4 MiB".into());
+            if input.len() > 32 * 1024 * 1024 {
+                return Err("HTML formatting limit is 32 MiB".into());
             }
             // Bound recursive parser depth for pasted/untrusted markup.
-            if input.bytes().filter(|b| *b == b'<').count() > 4096 {
-                return Err("HTML formatting limit is 4096 tags".into());
+            if input.bytes().filter(|b| *b == b'<').count() > 100_000 {
+                return Err("HTML formatting limit is 100000 tags".into());
             }
-            check_html_depth(input)?;
+            let (masked, attributes) = mask_braced_attributes(input)?;
+            check_html_depth(&masked)?;
             if !input.contains('<') {
                 return Err("No HTML markup found".into());
             }
             let mut options = markup_fmt::config::FormatOptions::default();
             options.layout.indent_width = 2;
-            let result =
-                markup_fmt::format_text(input, markup_fmt::Language::Html, &options, |code, _| {
+            let mut result =
+                markup_fmt::format_text(&masked, markup_fmt::Language::Html, &options, |code, _| {
                     Ok(code.into())
                 })
                 .map_err(|e| e.to_string())?;
-            Ok(if input.contains("\r\n") {
-                result.replace("\r\n", "\n").replace('\n', "\r\n")
-            } else {
-                result
-            })
+            if input.contains("\r\n") {
+                result = result.replace("\r\n", "\n").replace('\n', "\r\n");
+            }
+            if let Some((first, _)) = attributes.first() {
+                let prefix = first.trim_end_matches(|c: char| c.is_ascii_digit());
+                let pattern = regex::Regex::new(&format!(r#"["']?{}\d+["']?"#, regex::escape(prefix))).map_err(|e| e.to_string())?;
+                let values: std::collections::HashMap<_,_> = attributes.iter().map(|(k,v)| (k.as_str(), v.as_str())).collect();
+                let mut restored = 0;
+                result = pattern.replace_all(&result, |captures: &regex::Captures<'_>| {
+                    let marker = captures[0].trim_matches(['\'', '"']);
+                    if let Some(original) = values.get(marker) { restored += 1; (*original).to_owned() }
+                    else { captures[0].to_owned() }
+                }).into_owned();
+                if restored != attributes.len() { return Err("Unable to preserve a braced attribute; original unchanged".into()); }
+            }
+            Ok(result)
         }
     }
+}
+
+/// Real-world HTML often contains unquoted JSON/JSX-like attribute values.
+/// Shield only balanced `={...}` in opening tags, then restore exact bytes.
+/// Comments, text, script/style bodies and already quoted attributes are opaque.
+fn mask_braced_attributes(input: &str) -> Result<(String, Vec<(String, String)>), String> {
+    let bytes = input.as_bytes();
+    let mut prefix = "litetext_braced_attribute_".to_owned();
+    while input.contains(&prefix) { prefix.push('x'); }
+    let mut replacements = Vec::new();
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    let mut raw: Option<String> = None;
+    while at < bytes.len() {
+        if let Some(name) = raw.take() {
+            let close = format!("</{name}");
+            let Some(next) = bytes[at..].windows(close.len()).position(|w| w.eq_ignore_ascii_case(close.as_bytes())) else { break; };
+            at += next;
+        }
+        if bytes[at] != b'<' { at += 1; continue; }
+        if input[at..].starts_with("<!--") {
+            at = input[at + 4..].find("-->").map_or(input.len(), |n| at + 4 + n + 3);
+            continue;
+        }
+        let name_start = at + 1;
+        if !bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) { at += 1; continue; }
+        let mut name_end = name_start;
+        while bytes.get(name_end).is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-')) { name_end += 1; }
+        let name = input[name_start..name_end].to_ascii_lowercase();
+        at = name_end;
+        while at < bytes.len() && bytes[at] != b'>' {
+            if matches!(bytes[at], b'\'' | b'"') {
+                let quote = bytes[at]; at += 1;
+                while at < bytes.len() && bytes[at] != quote { at += 1; }
+                at = (at + 1).min(bytes.len());
+                continue;
+            }
+            if bytes[at] == b'=' {
+                at += 1;
+                while bytes.get(at).is_some_and(u8::is_ascii_whitespace) { at += 1; }
+                if bytes.get(at) != Some(&b'{') { continue; }
+                let start = at;
+                let mut depth = 0usize;
+                let mut quote = None;
+                let mut escaped = false;
+                while at < bytes.len() {
+                    let b = bytes[at];
+                    at += 1;
+                    if escaped { escaped = false; continue; }
+                    if let Some(q) = quote {
+                        if b == b'\\' { escaped = true; } else if b == q { quote = None; }
+                    } else if matches!(b, b'\'' | b'"' | b'`') { quote = Some(b); }
+                    else if b == b'{' { depth += 1; }
+                    else if b == b'}' { depth -= 1; if depth == 0 { break; } }
+                }
+                if depth != 0 || quote.is_some() { return Err("Unbalanced braced HTML attribute".into()); }
+                let marker = format!("{prefix}{}", replacements.len());
+                ranges.push((start..at, format!("\"{marker}\"")));
+                replacements.push((marker, input[start..at].to_owned()));
+            } else { at += 1; }
+        }
+        at = (at + 1).min(bytes.len());
+        if matches!(name.as_str(), "script" | "style" | "textarea" | "pre") { raw = Some(name); }
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut last = 0;
+    for (range, marker) in ranges {
+        output.push_str(&input[last..range.start]);
+        output.push_str(&marker);
+        last = range.end;
+    }
+    output.push_str(&input[last..]);
+    Ok((output, replacements))
 }
 
 fn check_html_depth(input: &str) -> Result<(), String> {
@@ -445,6 +530,41 @@ mod tests {
         assert_eq!(convert(&out, Action::Html).unwrap(), out);
         assert!(convert("<div title=\"oops>", Action::Html).is_err());
         assert!(convert(&"<div>".repeat(130), Action::Html).is_err());
+    }
+
+    #[test]
+    fn html_accepts_unquoted_braced_attributes_and_switches_workspace_language() {
+        let attr = r#"data-cost={"renderCost":"0.4","dataCost":1}"#;
+        let source = format!(r#"<div {attr} data-extra={{"nested":{{"a":"中文 > b"}}}}><p>text</p></div>"#);
+        let output = convert(&source, Action::Html).unwrap();
+        assert!(output.contains(attr), "{output}");
+        assert!(output.contains(r#"data-extra={"nested":{"a":"中文 > b"}}"#));
+        assert_eq!(convert(&output, Action::Html).unwrap(), output);
+        let opaque = r#"<script>const a = 'data-cost={"a":1}';</script><!-- data-cost={bad --><pre>data-cost={"a":1}</pre>"#;
+        let (masked, attrs) = mask_braced_attributes(opaque).unwrap();
+        assert!(attrs.is_empty());
+        assert_eq!(masked, opaque);
+        let multiline = "<div data-cost={\"a\":1,\n\"b\":2}>\r\ntext</div>\r\n";
+        assert!(convert(multiline, Action::Html).unwrap().contains("{\"a\":1,\n\"b\":2}"), "attribute bytes must survive document newline conversion");
+        let ctx = eframe::egui::Context::default();
+        for (action, input, language) in [(Action::Html, source.as_str(), "HTML"), (Action::Header, "A: 1", "JSON"), (Action::Cookie, "a=1", "JSON")] {
+            let mut app = crate::LiteTextApp::default();
+            app.new_document();
+            app.active_mut().unwrap().language_override = Some("Python".into());
+            app.active_mut().unwrap().draft_text = Some(input.into());
+            app.apply_web_tool(&ctx, action);
+            assert!(app.plugin_error.is_none(), "{:?}", app.plugin_error);
+            assert_eq!(crate::workspace_theme::effective_language(app.active().unwrap()), language);
+            let output = ctx.run(eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1080.0, 720.0))),
+                ..Default::default()
+            }, |ctx| app.status_bar(ctx, &crate::DARK));
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                eframe::egui::Shape::Text(text) if text.galley.text() == format!("{language}  ▴")
+            )), "status bar must show {language}");
+        }
+        let many = format!("<html><body>{}</body></html>", "<div><span>x</span></div>".repeat(2200));
+        assert!(convert(&many, Action::Html).is_ok());
     }
 
     #[test]

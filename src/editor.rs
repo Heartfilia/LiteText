@@ -149,6 +149,7 @@ pub(crate) struct EditorState {
     pub(crate) cursor_line: usize,
     pub(crate) font_size: f32,
     pub(crate) pending_selection: Option<Range<usize>>,
+    pub(crate) focus_requested: bool,
     pub(crate) changes: crate::changes::Changes,
     pub(crate) folds: crate::json_plugin::Folds,
     pub(crate) syntax_cache: std::sync::Arc<std::sync::Mutex<crate::workspace_theme::SyntaxCache>>,

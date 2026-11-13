@@ -482,6 +482,7 @@ impl LiteTextApp {
         self.show_settings
             || self.plugin_error.is_some()
             || self.pending_close.is_some()
+            || self.pending_window_close
             || self.pending_save.is_some()
             || self.files.iter().any(|file| file.disk.pending.is_some())
             || self.inspector_popup.is_some()

@@ -93,6 +93,10 @@ pub(crate) fn difference(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
 }
 
 impl State {
+    pub(crate) fn line_start(&mut self, text: &str, line: usize) -> Option<usize> {
+        self.index(text);
+        self.char_starts.get(line).copied()
+    }
     pub(crate) fn take_tool_edits(&mut self) -> Vec<(Range<usize>, usize)> {
         std::mem::take(&mut self.tool_edits)
     }
@@ -620,8 +624,11 @@ pub(crate) fn show(
             );
             let before_layout = (!tools.marks.is_empty() || tools.current.is_some())
                 .then(|| state.large.window.clone());
-            if let Some(render) = &tools.workspace {
-                render.prepare_prefix(text, bytes.start);
+            if let Some(render) = &mut tools.workspace
+                && !render.prepare_prefix(text, bytes.start)
+            {
+                render.syntax = false;
+                ui.ctx().request_repaint();
             }
             let mut layouter = |ui: &egui::Ui, text: &str, _: f32| {
                 let mut current_tools = tools.clone();

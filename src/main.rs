@@ -48,10 +48,10 @@ fn main() -> eframe::Result {
         Ok(lock) => lock,
         Err(error) => { eprintln!("Unable to initialize runtime lock: {error}"); return Ok(()); }
     };
-    let _window_lock = match new_window::lock_current() {
-        Ok(lock) => lock,
+    match new_window::start_runtime() {
+        Ok(()) => {},
         Err(error) => { eprintln!("Unable to lock window session: {error}"); return Ok(()); }
-    };
+    }
     let paths = file_open::argument_paths(std::env::args_os().skip(1));
     #[cfg(target_os = "macos")]
     let _file_open_handler = file_open::macos::install();
@@ -466,6 +466,12 @@ struct LiteTextApp {
     #[serde(skip)]
     pending_close: Option<TabAction>,
     #[serde(skip)]
+    pending_window_close: bool,
+    #[serde(skip)]
+    window_close_ready: bool,
+    #[serde(skip)]
+    update_restarting: bool,
+    #[serde(skip)]
     pending_save: Option<linkage::PendingSave>,
     #[serde(skip)]
     last_disk_check: Option<std::time::Instant>,
@@ -533,6 +539,9 @@ impl Default for LiteTextApp {
             recovery_versions: Default::default(),
             io_error: None,
             pending_close: None,
+            pending_window_close: false,
+            window_close_ready: false,
+            update_restarting: false,
             pending_save: None,
             last_disk_check: None,
             last_checked_tab: None,
@@ -755,6 +764,7 @@ impl LiteTextApp {
     }
 
     fn write_recovery(&mut self) -> std::io::Result<()> {
+        if new_window::finished() { return Ok(()); }
         let path = self.recovery_path().ok_or_else(|| std::io::Error::other("Application storage directory unavailable"))?;
         let key = (self.active_id, self.files.iter().map(|f| (f.id, f.path.clone(), f.name.clone(), f.view,
             f.content_revision, f.editor_state.large.revision, f.language_override.clone())).collect());
@@ -973,6 +983,7 @@ impl LiteTextApp {
                     if ui.button(t.done).clicked() { self.io_error = None; }
                 });
         }
+        self.window_close_dialog(ctx);
     }
 
     fn new_document(&mut self) {
@@ -1068,7 +1079,10 @@ impl LiteTextApp {
 
     /// 启动时恢复上次会话：从磁盘重读文件内容，磁盘上已不存在的标签丢弃。
     fn restore_session(&mut self) {
-        if let Some(path) = self.recovery_path() {
+        let source = new_window::restore_path();
+        #[cfg(test)]
+        let source = self.recovery_path_override.clone().or(source);
+        if let Some(path) = source {
             match recovery::load(&path) {
                 Ok(Some(session)) => {
                     self.files = session.restore();
@@ -1423,6 +1437,10 @@ impl eframe::App for LiteTextApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.backup_or_report();
         eframe::set_value(storage, eframe::APP_KEY, self);
+        #[cfg(not(test))]
+        if let Some(root) = eframe::storage_dir("LiteText")
+            && let Ok(bytes) = serde_json::to_vec(self)
+        { let _ = recovery::atomic_write(&root.join("last-settings.json"), &bytes); }
         // 退出/自动保存时记录窗口几何
         if let (Some(size), Some(pos)) = (self.window_size, self.window_pos) {
             save_window_state(&WindowState { size, pos });
@@ -1437,6 +1455,9 @@ impl eframe::App for LiteTextApp {
         if let Err(error) = self.write_recovery() {
             eprintln!("Recovery save on exit failed: {error}");
         }
+        if !self.update_restarting
+            && let Err(error) = new_window::finish(&self.files, self.active_id)
+        { eprintln!("Unable to finalize window session: {error}"); }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1564,12 +1585,9 @@ impl eframe::App for LiteTextApp {
             ctx.request_repaint();
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
-        if ctx.input(|i| i.viewport().close_requested()) && !self.backup_or_report() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
+        if ctx.input(|i| i.viewport().close_requested()) { self.request_window_close(ctx); }
         self.file_dialogs(ctx);
         updater::acknowledge_startup();
-        new_window::restore_closed_windows();
         self.finish_update_restart(ctx, frame);
     }
 }
@@ -3127,6 +3145,9 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
     }
     file.prepare_changes();
     text_tools::find_bar(ui, file, pal, tr(lang));
+    if ui.is_enabled() { text_tools::bulk_paste(file, ui.ctx(), focus); }
+    let requested_focus = std::mem::take(&mut file.editor_state.focus_requested);
+    let focus = focus || requested_focus;
     file.editor_state.folds.sync(file.draft_text.as_deref().expect("text buffer"), (file.content_revision, file.editor_state.large.revision));
     if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|t| t.len() >= large_editor::THRESHOLD)
         && file.saved_large_revision.is_none()

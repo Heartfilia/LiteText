@@ -470,6 +470,9 @@ pub(crate) fn replace_range_with_cursor(
         if !file.editor_state.large.active {
             file.saved_large_revision = (file.bytes == file.saved_bytes).then_some(0);
             file.editor_state.large.active = true;
+            if let Some(cursor) = file.editor_state.cursor {
+                file.editor_state.large.set_tool_cursor(cursor);
+            }
         }
         file.editor_state.large.set_encoding(text, file.encoding);
         file.editor_state
@@ -537,6 +540,7 @@ pub(crate) fn find_bar(
         .tools
         .invalidate_search_if_changed((file.content_revision, file.editor_state.large.revision));
     let mut action = file.editor_state.tools.pending_action.take().unwrap_or(0);
+    let mut jump = false;
     let bounds = ui.available_rect_before_wrap();
     let width = (bounds.width() - 16.0).min(500.0);
     let overlay = egui::Area::new(egui::Id::new(("find_overlay", file.id)))
@@ -720,6 +724,18 @@ pub(crate) fn find_bar(
                                         )
                                     });
                                 }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let button = ui.button(t.go_to_line);
+                                    let input = ui.add(egui::TextEdit::singleline(&mut tools.jump_line)
+                                        .id(egui::Id::new(("jump_line", file.id)))
+                                        .desired_width(72.0).char_limit(20).hint_text("1"));
+                                    tools.jump_line.retain(|c| c.is_ascii_digit());
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(egui::Id::new(("jump_line_input_rect", file.id)), input.rect);
+                                        d.insert_temp(egui::Id::new(("jump_line_button_rect", file.id)), button.rect);
+                                    });
+                                    if button.clicked() || ((input.has_focus() || input.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter))) { jump = true; }
+                                });
                             },
                         );
                         let tools = &mut file.editor_state.tools;
@@ -749,6 +765,55 @@ pub(crate) fn find_bar(
         }
         ui.ctx().request_repaint();
     }
+    if jump { jump_to_line(file, ui.ctx()); }
+}
+
+fn jump_to_line(file: &mut crate::LoadedFile, ctx: &egui::Context) {
+    let Ok(line) = file.editor_state.tools.jump_line.parse::<usize>() else { return; };
+    if line == 0 { return; }
+    let Some(text) = file.draft_text.as_deref() else { return; };
+    let start = if text.len() >= crate::large_editor::THRESHOLD || file.editor_state.large.active {
+        file.editor_state.large.line_start(text, line - 1)
+    } else if line == 1 { Some(0) } else {
+        text.char_indices().filter(|(_, ch)| *ch == '\n').nth(line - 2).map(|(at, _)| text[..at + 1].chars().count())
+    };
+    let Some(start) = start else { return; };
+    // A fold toggle may leave an internal selection marker for this frame;
+    // explicit navigation must reveal its target regardless of that marker.
+    file.editor_state.folds.expand_all();
+    file.editor_state.selection = None;
+    file.editor_state.anchor = None;
+    file.editor_state.tools.current = None;
+    file.editor_state.pending_selection = Some(start..start);
+    file.editor_state.focus_requested = true;
+    ctx.request_repaint();
+}
+
+/// Intercept bulk paste before TextEdit can lay out the entire inserted payload
+/// in a small editor (or a viewport window). One delta undo; original files stay
+/// untouched, and the cursor is revealed through the normal large editor path.
+pub(crate) fn bulk_paste(file: &mut crate::LoadedFile, ctx: &egui::Context, focus: bool) -> bool {
+    let id = egui::Id::new(if file.editor_state.large.active { "large_editor" } else { "draft_editor" }).with(file.id);
+    if !focus && !ctx.memory(|m| m.has_focus(id)) { return false; }
+    let Some(text) = file.draft_text.as_deref() else { return false; };
+    let Some((event, payload)) = ctx.input(|i| i.events.iter().enumerate().find_map(|(index, event)| {
+        if let egui::Event::Paste(payload) = event
+            && payload.len() >= 64 * 1024
+            && text.len().saturating_add(payload.len()) >= crate::large_editor::THRESHOLD
+        { Some((index, payload.clone())) } else { None }
+    })) else { return false; };
+    let selection = file.editor_state.pending_selection.clone().unwrap_or_else(|| {
+        let cursor = file.editor_state.cursor.unwrap_or_default();
+        cursor.primary.index.min(cursor.secondary.index)..cursor.primary.index.max(cursor.secondary.index)
+    });
+    let range = byte_at(text, selection.start)..byte_at(text, selection.end);
+    let end = selection.start + payload.chars().count();
+    ctx.input_mut(|i| { i.events.remove(event); });
+    replace_range_with_cursor(file, ctx, range, payload, Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+    file.editor_state.pending_selection = Some(end..end);
+    file.editor_state.focus_requested = true;
+    ctx.request_repaint();
+    true
 }
 
 fn search_action(file: &mut crate::LoadedFile, ctx: &egui::Context, action: usize) {
@@ -828,6 +893,7 @@ pub(crate) struct Tools {
     pub find_open: bool,
     pub query: String,
     pub replacement: String,
+    pub jump_line: String,
     pub current: Option<Range<usize>>,
     pub not_found: bool,
     search_key: Option<(String, bool, bool, u64, u64)>,
@@ -1325,6 +1391,128 @@ pub(crate) fn paint_whitespace(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn jump_line_expands_folds_and_handles_trailing_empty_line() {
+        for large in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = crate::LiteTextApp::default();
+            app.new_document();
+            let text = format!("{{\n{}  \"tail\": true\n}}\n", "  \"key\": 123,\n".repeat(if large { 25_000 } else { 3 }));
+            let file = app.active_mut().unwrap();
+            file.draft_text = Some(text.clone());
+            file.sync_draft();
+            file.editor_state.folds.enabled = true;
+            let draw = |app: &mut crate::LiteTextApp| {
+                let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))), ..Default::default() }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, crate::Lang::En));
+                });
+            };
+            draw(&mut app);
+            app.active_mut().unwrap().editor_state.folds.toggle(0);
+            assert!(app.active().unwrap().editor_state.folds.hidden(1));
+            app.active_mut().unwrap().editor_state.tools.jump_line = "2".into();
+            jump_to_line(app.active_mut().unwrap(), &ctx);
+            draw(&mut app);
+            assert!(!app.active().unwrap().editor_state.folds.hidden(1));
+            assert_eq!(app.active().unwrap().editor_state.cursor.unwrap().primary.index, 2);
+            app.active_mut().unwrap().editor_state.tools.jump_line = (text.bytes().filter(|&b| b == b'\n').count() + 1).to_string();
+            jump_to_line(app.active_mut().unwrap(), &ctx);
+            draw(&mut app);
+            assert_eq!(app.active().unwrap().editor_state.cursor.unwrap().primary.index, text.chars().count());
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
+    fn bulk_html_paste_uses_viewport_editor_and_one_undo_without_saving() {
+        use super::*;
+        for (existing_large, replace) in [(false, false), (false, true), (true, false), (true, true)] {
+            let ctx = egui::Context::default();
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("original.txt");
+            let original = if existing_large { "old text\n".repeat(40_000) } else { "old text".into() };
+            std::fs::write(&path, &original).unwrap();
+            let mut app = crate::LiteTextApp::default();
+            app.open_paths(vec![path.clone()]);
+            app.active_mut().unwrap().language_override = Some("Python".into());
+            let payload = "<div data-cost={\"renderCost\":\"0.4\",\"dataCost\":1}>中文</div>\n".repeat(12_000);
+            let draw = |app: &mut crate::LiteTextApp, events| {
+                crate::workspace_theme::configure(app.active_mut().unwrap(), &crate::workspace_theme::WorkspaceTheme::default(), true);
+                let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0,720.0))), events, ..Default::default() }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, true, crate::Lang::En));
+                });
+            };
+            draw(&mut app, vec![]);
+            draw(&mut app, vec![]);
+            let len = original.chars().count();
+            app.active_mut().unwrap().editor_state.pending_selection = Some(if replace { 0..len } else { len..len });
+            let started = std::time::Instant::now();
+            draw(&mut app, vec![egui::Event::Paste(payload.clone())]);
+            eprintln!("bulk HTML paste {} bytes: {:?}", payload.len(), started.elapsed());
+            let file = app.active().unwrap();
+            assert_eq!(file.draft_text.as_deref(), Some(if replace { payload.clone() } else { format!("{original}{payload}") }.as_str()));
+            assert!(file.editor_state.large.active);
+            assert!(file.editor_state.large.laid_out_bytes < 16 * 1024, "paste must not lay out the whole payload");
+            draw(&mut app, vec![]);
+            draw(&mut app, vec![egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }]);
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(original.as_str()));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn jump_line_controls_filter_digits_align_right_and_reveal_logical_line_start() {
+        use super::*;
+        for large in [false, true] {
+            for lang in [crate::Lang::ZhCn, crate::Lang::En] {
+                let ctx = egui::Context::default();
+                crate::setup_fonts(&ctx);
+                let mut app = crate::LiteTextApp::default();
+                app.new_document();
+                let text = "中文🙂\r\nsecond line\r\n\r\n".repeat(if large { 15000 } else { 4 });
+                app.active_mut().unwrap().draft_text = Some(text.clone());
+                app.active_mut().unwrap().sync_draft();
+                app.active_mut().unwrap().editor_state.tools.find_open = true;
+                let draw = |app: &mut crate::LiteTextApp, events| {
+                    ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0,480.0))), events, ..Default::default() }, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, lang));
+                    })
+                };
+                for _ in 0..3 { draw(&mut app, vec![]); }
+                let id = app.active_id.unwrap();
+                let rect = |key: &str| ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new((key,id)))).unwrap();
+                let input = rect("jump_line_input_rect");
+                let button = rect("jump_line_button_rect");
+                assert!(input.left() > rect("find_count_rect").right());
+                assert!(button.left() > input.right());
+                assert!(rect("find_overlay_rect").contains_rect(button));
+                assert!((button.center().y - rect("find_count_rect").center().y).abs() < 3.0);
+                for pressed in [true, false] { draw(&mut app, vec![egui::Event::PointerMoved(input.center()), egui::Event::PointerButton { pos: input.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]); }
+                let line = if large { 30002 } else { 2 };
+                draw(&mut app, vec![egui::Event::Text(format!("a{line}x"))]);
+                assert_eq!(app.active().unwrap().editor_state.tools.jump_line, line.to_string());
+                draw(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+                draw(&mut app, vec![]);
+                let expected = text.char_indices().filter(|(_,c)| *c == '\n').nth(line - 2).map(|(at,_)| text[..at + 1].chars().count()).unwrap();
+                let file = app.active().unwrap();
+                let cursor = file.editor_state.cursor.unwrap();
+                assert_eq!(cursor.primary.index, expected);
+                assert_eq!(cursor.secondary.index, expected);
+                assert_eq!(file.editor_state.cursor_line, line - 1);
+                assert_eq!(file.draft_text.as_deref(), Some(text.as_str()));
+                for invalid in ["0", "99999999999999999999", "999999"] {
+                    app.active_mut().unwrap().editor_state.tools.jump_line = invalid.into();
+                    jump_to_line(app.active_mut().unwrap(), &ctx);
+                    assert!(app.active().unwrap().editor_state.pending_selection.is_none());
+                }
+                app.active_mut().unwrap().editor_state.tools.jump_line = "1".into();
+                let button = rect("jump_line_button_rect");
+                for pressed in [true, false] { draw(&mut app, vec![egui::Event::PointerMoved(button.center()), egui::Event::PointerButton { pos: button.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]); }
+                draw(&mut app, vec![]);
+                assert_eq!(app.active().unwrap().editor_state.cursor.unwrap().primary.index, 0);
+            }
+        }
+    }
     use super::*;
 
     fn cursor(start: usize, end: usize) -> Option<egui::text::CCursorRange> {

@@ -590,16 +590,16 @@ impl Render {
 
     /// Parse the viewport with the real prefix state, so multiline strings and
     /// comments retain their color when scrolling. Cache parser checkpoints.
-    pub(crate) fn prepare_prefix(&self, full: &str, offset: usize) {
+    pub(crate) fn prepare_prefix(&self, full: &str, offset: usize) -> bool {
         if !self.syntax
             || self.fast_json
             || matches!(self.language.as_str(), "Plain Text" | "text" | "Log")
         {
-            return;
+            return true;
         }
         let mut cache = self.cache.lock().unwrap();
         if cache.checkpoints.contains_key(&offset) {
-            return;
+            return true;
         }
         let syntax = syntax_for(&self.language);
         let (mut position, mut state) = cache
@@ -614,9 +614,10 @@ impl Render {
                     scopes: ScopeStack::new(),
                 },
             ));
+        let started = std::time::Instant::now();
         for (line_number, line) in full[position..offset].split_inclusive('\n').enumerate() {
             // No token output is needed for offscreen prefix lines.
-            if let Ok(ops) = state.parser.parse_line(line, syntaxes()) {
+            if line.len() <= 16 * 1024 && let Ok(ops) = state.parser.parse_line(line, syntaxes()) {
                 for (_, op) in ops {
                     let _ = state.scopes.apply(&op);
                 }
@@ -625,8 +626,13 @@ impl Render {
             if line_number % 128 == 127 {
                 cache.checkpoints.insert(position, state.clone());
             }
+            if (started.elapsed() >= std::time::Duration::from_millis(6) || line_number >= 511) && position < offset {
+                cache.checkpoints.insert(position, state);
+                return false;
+            }
         }
         cache.checkpoints.insert(offset, state);
+        true
     }
 
     fn tokens(&self, text: &str, offset: usize) -> Arc<Vec<Token>> {
@@ -657,7 +663,9 @@ impl Render {
         let mut tokens = Vec::new();
         let mut position = 0;
         for line in text.split_inclusive('\n') {
-            parse_line(&mut state, line, syntaxes(), &mut tokens, position);
+            if line.len() > 16 * 1024 {
+                push_token(&mut tokens, position..position + line.len(), Kind::Text);
+            } else { parse_line(&mut state, line, syntaxes(), &mut tokens, position); }
             position += line.len();
         }
         let tokens = Arc::new(tokens);
@@ -1666,7 +1674,7 @@ mod tests {
             "# prefix\n".repeat(300)
         );
         let offset = full.find("inside").unwrap();
-        render.prepare_prefix(&full, offset);
+        while !render.prepare_prefix(&full, offset) {}
         let job = render.layout(
             &full[offset..],
             egui::FontId::monospace(13.5),
@@ -1688,6 +1696,23 @@ mod tests {
             0,
         );
         assert_eq!(color_at(&job, "42"), updated.colors.number);
+    }
+
+    #[test]
+    fn prefix_preparation_yields_and_long_lines_use_plain_tokens() {
+        let cache: Arc<Mutex<SyntaxCache>> = Default::default();
+        let render = Render::prepare(&WorkspaceTheme::default(), true, "Python".into(), (1, 0), cache.clone());
+        let full = "# prefix\n".repeat(2000);
+        assert!(!render.prepare_prefix(&full, full.len()));
+        let first = *cache.lock().unwrap().checkpoints.keys().next_back().unwrap();
+        assert!(first > 0 && first <= "# prefix\n".len() * 512);
+        let mut frames = 1;
+        while !render.prepare_prefix(&full, full.len()) { frames += 1; assert!(frames < 2000); }
+        let long = "x".repeat(20 * 1024);
+        let tokens = render.tokens(&long, 0);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].range, 0..long.len());
+        assert!(matches!(tokens[0].kind, Kind::Text));
     }
 
     #[test]
