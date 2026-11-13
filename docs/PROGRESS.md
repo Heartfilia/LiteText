@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（macOS 184 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。
+测试：`cargo test`（macOS 185 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。
 
 ## 目录结构
 
@@ -170,6 +170,12 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-13（Windows CI Clippy 修复）
+
+- 修复终端可执行文件检测在 Windows 条件编译后触发 `clippy::needless_bool` 的问题：非 Unix 直接返回 `metadata.is_file()`，Unix 仍同时检查普通文件与执行权限；不关闭 lint，不改发布矩阵或 tag
+- 增加跨平台回归测试，覆盖目录、缺失文件、普通文件以及 Unix 执行权限
+- macOS Rust 1.99 全量 185 项测试和严格 Clippy 通过，2 项手动性能测试未运行；Windows Rust 1.100 构建结果待云端 CI 验证
 
 ### 2026-11-13（Log 高亮与离线 Web 工具）
 

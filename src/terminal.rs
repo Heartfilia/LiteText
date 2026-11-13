@@ -55,17 +55,14 @@ fn executable(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        metadata.is_file()
     }
 }
 
@@ -449,6 +446,23 @@ pub(crate) fn button(ui: &mut egui::Ui, pal: &Palette, lang: Lang) -> egui::Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_requires_a_regular_file_and_unix_execute_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!executable(dir.path()));
+        assert!(!executable(&dir.path().join("missing")));
+        let path = dir.path().join("terminal.exe");
+        std::fs::write(&path, "test executable candidate").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!executable(&path));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(executable(&path));
+    }
 
     #[test]
     fn terminal_directory_uses_saved_parent_or_home_and_settings_persist() {
