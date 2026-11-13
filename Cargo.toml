@@ -39,6 +39,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 
 [build-dependencies]
 semver = "1"
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

@@ -425,6 +425,7 @@ pub(crate) fn show(
         render.apply_style(ui);
     }
     let colors = tools.workspace.as_ref().map(|r| r.colors);
+    let gutter_bg = editor::gutter_background(colors.map_or(pal.bg_window, |c| c.background));
     let row_height = editor::row_height(ui, &font);
     let probe = ui
         .painter()
@@ -451,7 +452,7 @@ pub(crate) fn show(
         egui::pos2(bounds.left() + gutter_w, bounds.bottom()),
     );
     ui.painter()
-        .rect_filled(gutter, 0.0, colors.map_or(pal.bg_panel, |c| c.background));
+        .rect_filled(gutter, 0.0, gutter_bg);
     let id = egui::Id::new("large_editor").with(file_id);
     let mut changed = false;
     // Document-level undo remains valid even after the visible text window moves.
@@ -833,7 +834,7 @@ pub(crate) fn show(
                     gutter.max,
                 );
                 ui.painter()
-                    .rect_filled(lane, 0.0, colors.map_or(pal.bg_panel, |c| c.background));
+                    .rect_filled(lane, 0.0, gutter_bg);
                 for block in &folds.blocks {
                     if folds.hidden(block.start)
                         || block.start < first

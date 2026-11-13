@@ -1117,6 +1117,7 @@ mod tests {
                 .success()
         );
         std::os::unix::fs::symlink("/Applications", source.join("Applications")).unwrap();
+        fs::write(source.join("安装后打开失败查看.txt"), "首次安装打开说明").unwrap();
         let package = temp.path().join("package.dmg");
         assert!(
             Command::new("/usr/bin/hdiutil")
@@ -1132,6 +1133,7 @@ mod tests {
         let staged = stage_package(&package, "LiteText-macos-arm64.dmg", &stage).unwrap();
         assert!(binary_in(&staged).is_file());
         assert!(!stage.join("Applications").exists());
+        assert!(!stage.join("安装后打开失败查看.txt").exists());
     }
 
     #[test]

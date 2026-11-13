@@ -6,6 +6,12 @@ use std::ops::Range;
 const GUTTER_NUMBER_GAP: f32 = 2.0;
 const EDITOR_LEFT_PADDING: f32 = 4.0;
 
+/// Keep the number/fold lane distinct without changing the workspace hue.
+pub(crate) fn gutter_background(background: egui::Color32) -> egui::Color32 {
+    let darker = |channel: u8| channel.saturating_sub((channel / 16).max(8));
+    egui::Color32::from_rgb(darker(background.r()), darker(background.g()), darker(background.b()))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WordClass {
     Han,
@@ -257,6 +263,7 @@ pub(crate) fn show(
         render.apply_style(ui);
     }
     let colors = tools.workspace.as_ref().map(|r| r.colors);
+    let gutter_bg = gutter_background(colors.map_or(pal.bg_window, |c| c.background));
     let before_layout = (!tools.marks.is_empty() || tools.current.is_some()).then(|| text.clone());
     let line_count = text.bytes().filter(|&b| b == b'\n').count() + 1;
     // Use the rounded glyph advance from a multi-digit galley, not a single glyph's width.
@@ -277,7 +284,7 @@ pub(crate) fn show(
         egui::pos2(bounds.left() + gutter_w, bounds.bottom()),
     );
     ui.painter()
-        .rect_filled(gutter, 0.0, colors.map_or(pal.bg_panel, |c| c.background));
+        .rect_filled(gutter, 0.0, gutter_bg);
     let mut changed = false;
     egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
@@ -513,7 +520,7 @@ pub(crate) fn show(
                     gutter.max,
                 );
                 ui.painter()
-                    .rect_filled(lane, 0.0, colors.map_or(pal.bg_panel, |c| c.background));
+                    .rect_filled(lane, 0.0, gutter_bg);
                 for block in &folds.blocks {
                     if folds.hidden(block.start) {
                         continue;

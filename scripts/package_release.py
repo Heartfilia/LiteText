@@ -53,6 +53,20 @@ else:
             if path.is_file():
                 zipped.write(path, path.relative_to(staging))
 if args.os == "macos":
+    (staging / "安装后打开失败查看.txt").write_text(
+        "LiteText 首次安装打开说明\n\n"
+        "请先将 LiteText.app 拖入 Applications（应用程序）文件夹，再从应用程序中打开。\n\n"
+        "首次安装可能会因 macOS 安全检查而打不开（如提示无法验证开发者或应用已损坏）。\n"
+        "仅在确认安装包来自本项目可信 Release、并核对 SHA256SUMS 后，"
+        "请使用下面的命令在终端执行一次：\n\n"
+        "xattr -dr com.apple.quarantine /Applications/LiteText.app\n\n"
+        "执行后重新打开 LiteText。后续可在 App 内部检测更新，下载后点击“安装并重启”即可。\n\n"
+        "注意：该命令会递归移除 LiteText 的下载隔离标记，削弱 macOS 对该应用的首次打开检查；"
+        "它不等于开发者签名或公证，也不能修复真正损坏的文件。"
+        "不要对未知应用、整个 Applications 文件夹或系统范围执行。\n"
+        "如安装在其他位置，请将命令中的路径替换为实际路径；权限不足时不要盲目添加 sudo。\n",
+        encoding="utf-8",
+    )
     os.symlink("/Applications", staging / "Applications")
     subprocess.run(["hdiutil", "create", "-volname", "LiteText", "-srcfolder", str(staging),
                     "-format", "UDZO", str(out / f"LiteText-macos-{args.arch}.dmg")], check=True)

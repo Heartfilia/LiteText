@@ -6,6 +6,7 @@
 - 发布通过 `LITETEXT_VERSION` 注入 tag（例如 `v1.2.3`），构建时验证 SemVer。
 - 版本 tag 由维护者手动创建和推送，助手不代建、不移动既有 tag。推送 `v*` tag 触发 `.github/workflows/release.yml`；普通 main 推送不发布。每个平台先测试、Clippy，再构建；全部成功才发布 GitHub Release。
 - 产物：macOS arm64（Apple Silicon）仅 `.dmg`、Windows x64 仅 `.exe`、Linux x64 ZIP，以及统一 `SHA256SUMS`。安装和自动更新共用平台产物，不再编译或上传 macOS x64（Intel）。
+- Windows 构建由 `build.rs` 使用 winresource 将 `assets/app-icon.ico` 的多尺寸图像嵌入 EXE（资源管理器图标），不是仅设置运行时窗口图标；Windows 测试检查图标组与图像资源。macOS DMG 根目录附 `安装后打开失败查看.txt`，不自动执行隔离标记移除命令。
 - `-rc.1` 等带连字符的 tag 发布为 prerelease；应用内查询 GitHub Releases 列表并按 SemVer 选择当前平台的最高完整版本。稳定安装版只接受稳定版，beta／rc 安装版与 dev 同时接受稳定版和预发布版本；不会因发布时间顺序或 beta.9/beta.10 的字典序选错版本。
 - 配置目标仓库：**Heartfilia/LiteText**。发布前必须把 Cargo.lock、源码、assets、scripts 和 workflow 一并提交。失败任务的重跑仍使用原 tag 的旧提交，不会自动带入 main 上的修复；请在包含修复的提交上手动创建新版本 tag。
 
@@ -37,6 +38,7 @@ git push origin v0.1.1
 - 只接受该仓库 HTTPS release 下载 URL，TLS 使用正常证书验证；压缩包拒绝路径穿越、符号链接、非预期根目录、重复文件，限制下载与解压大小。
 - SHA256SUMS 用于完整性检查，**不是独立的发布者签名**；GitHub 账户、Release 和配置代理的信任仍是前提。不要安装不可信来源的更新。
 - macOS 当前仅 ad-hoc 签名，**没有 Apple Developer ID 签名或 notarization**。应用及更新助手不会自动去除 quarantine 或绕过 Gatekeeper；可信安装包的手动首次打开方法及风险说明见 [README](../README.md#macosapple-silicon)。面向公开分发前建议配置 Developer ID、公证与签名验证。
+- ad-hoc 签名无法保证更新前后满足同一稳定的代码身份要求；Downloads 等目录的 TCC 隐私授权可能在替换程序后重新询问。移除 quarantine 不等于 TCC 授权；不要自动重置权限或要求用户开启完全磁盘访问。长期方案是稳定的 Developer ID 签名身份，并在真实升级中验证授权保留。
 - 安装后的旧版本保留在安装目录内 `.litetext-stage-*` 的 `previous`；临时更新目录为 `litetext-update-*`，保留助手和诊断。未进入安装的下载/解压失败与取消会自动清理；安装交接后的目录故意保留供回退，不自动递归清理历史安装。
 - 安装结果写入应用数据目录 `update-result.txt`，应用读取后显示在设置页。新进程无法启动时，助手临时目录还保留 `install-error.txt`。
 - 不支持包管理器托管的安装升级（例如 Homebrew/apt）；应使用相应包管理器。Windows 为单 EXE、Linux 为 ZIP，非 MSI/deb/rpm 安装器。

@@ -2124,6 +2124,45 @@ mod tests {
     }
 
     #[test]
+    fn gutter_background_is_darker_in_both_editors_and_themes() {
+        for preset in Preset::ALL {
+            for dark in [false, true] {
+                let background = preset.colors(dark).background;
+                let gutter = crate::editor::gutter_background(background);
+                assert!(gutter.r() <= background.r() && gutter.g() <= background.g() && gutter.b() <= background.b());
+                assert_ne!(gutter, background);
+            }
+        }
+        for large in [false, true] {
+            for dark in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = LiteTextApp::default();
+                app.new_document();
+                let original = format!("{{\n{}  \"tail\": true\n}}\n", "  \"key\": 123,\n".repeat(if large { 25_000 } else { 3 }));
+                let file = app.active_mut().unwrap();
+                file.draft_text = Some(original.clone());
+                file.sync_draft();
+                file.editor_state.folds.enabled = true;
+                let colors = Colors::preset(dark);
+                configure(file, &WorkspaceTheme { custom: Some(colors), ..Default::default() }, dark);
+                let output = ctx.run(raw(vec![], egui::vec2(1080.0, 720.0)), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::draft_editor(ui, app.active_mut().unwrap(), if dark { &crate::DARK } else { &crate::LIGHT }, false, Lang::En);
+                    });
+                });
+                let gutter_bg = crate::editor::gutter_background(colors.background);
+                let lanes: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == gutter_bg => Some(rect.rect),
+                    _ => None,
+                }).collect();
+                assert!(lanes.len() >= 2, "number and fold lanes must share the darker background");
+                assert!(lanes.iter().any(|rect| rect.height() > 500.0));
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(original.as_str()));
+            }
+        }
+    }
+
+    #[test]
     fn both_editors_use_workspace_colors_selection_and_preserve_files() {
         for large in [false, true] {
             let ctx = egui::Context::default();

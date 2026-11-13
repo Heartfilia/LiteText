@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
+    pub show_toolbar_button: bool,
     pub custom: bool,
     pub program: Option<PathBuf>,
     pub custom_path: String,
@@ -67,6 +68,7 @@ fn executable(path: &Path) -> bool {
 }
 
 pub(crate) fn discover() -> Vec<Installed> {
+    #[cfg(not(target_os = "macos"))]
     let mut found = Vec::new();
     #[cfg(target_os = "macos")]
     {
@@ -78,23 +80,7 @@ pub(crate) fn discover() -> Vec<Installed> {
         if let Ok(home) = home() {
             roots.push(home.join("Applications"));
         }
-        for (name, bundle) in [
-            ("Terminal", "Terminal.app"),
-            ("iTerm2", "iTerm.app"),
-            ("Ghostty", "Ghostty.app"),
-            ("WezTerm", "WezTerm.app"),
-            ("kitty", "kitty.app"),
-            ("Alacritty", "Alacritty.app"),
-            ("Warp", "Warp.app"),
-            ("Hyper", "Hyper.app"),
-        ] {
-            if let Some(path) = roots.iter().map(|r| r.join(bundle)).find(|p| p.is_dir()) {
-                found.push(Installed {
-                    name: name.to_owned(),
-                    path,
-                });
-            }
-        }
+        discover_macos(&roots)
     }
     #[cfg(windows)]
     let programs = [
@@ -118,8 +104,31 @@ pub(crate) fn discover() -> Vec<Installed> {
         ("xterm", "xterm"),
     ];
     #[cfg(not(target_os = "macos"))]
-    for (name, command) in programs {
-        if let Some(path) = in_path(command) {
+    {
+        for (name, command) in programs {
+            if let Some(path) = in_path(command) {
+                found.push(Installed { name: name.to_owned(), path });
+            }
+        }
+        found
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn discover_macos(roots: &[PathBuf]) -> Vec<Installed> {
+    let mut found = Vec::new();
+    for (name, bundle) in [
+        ("Terminal", "Terminal.app"),
+        ("iTerm2", "iTerm.app"),
+        ("Ghostty", "Ghostty.app"),
+        ("Otty", "Otty.app"),
+        ("WezTerm", "WezTerm.app"),
+        ("kitty", "kitty.app"),
+        ("Alacritty", "Alacritty.app"),
+        ("Warp", "Warp.app"),
+        ("Hyper", "Hyper.app"),
+    ] {
+        if let Some(path) = roots.iter().map(|r| r.join(bundle)).find(|p| p.is_dir()) {
             found.push(Installed {
                 name: name.to_owned(),
                 path,
@@ -315,6 +324,12 @@ impl LiteTextApp {
 
     pub(crate) fn terminal_settings_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let zh = self.lang == Lang::ZhCn;
+        let toggle = ui.checkbox(&mut self.terminal.show_toolbar_button, if zh {
+            "工具栏显示打开终端"
+        } else {
+            "Show Open terminal in toolbar"
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("show_terminal_toolbar_rect"), toggle.rect));
         let installed = self.terminal_installed.get_or_insert_with(discover);
         let label = if self.terminal.custom {
             if zh { "自定义" } else { "Custom" }.to_owned()
@@ -447,6 +462,30 @@ pub(crate) fn button(ui: &mut egui::Ui, pal: &Palette, lang: Lang) -> egui::Resp
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn otty_is_discovered_in_application_roots_and_opens_directory_as_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("Applications");
+        let user = temp.path().join("home/Applications");
+        for root in [&system, &user] {
+            let bundle = root.join("Otty.app");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let found = discover_macos(std::slice::from_ref(root));
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].name, "Otty");
+            assert_eq!(found[0].path, bundle);
+            let directory = temp.path().join("中文 path ' ; $(touch nope)");
+            let launch = plan(&Settings { program: Some(bundle.clone()), ..Default::default() }, directory.clone()).unwrap();
+            assert_eq!(launch.program, Path::new("/usr/bin/open"));
+            assert_eq!(launch.args, vec![OsString::from("-a"), bundle.into_os_string(), directory.clone().into_os_string()]);
+            assert_eq!(launch.directory, directory);
+        }
+        let found = discover_macos(&[system.clone(), user]);
+        assert_eq!(found.len(), 1, "duplicate installations should appear only once");
+        assert_eq!(found[0].path, system.join("Otty.app"));
+    }
+
     #[test]
     fn executable_requires_a_regular_file_and_unix_execute_permission() {
         let dir = tempfile::tempdir().unwrap();
@@ -486,6 +525,7 @@ mod tests {
         file.source_path = Some(std::mem::take(&mut file.path));
         assert_eq!(directory(app.active().unwrap()).unwrap(), home().unwrap());
         app.terminal = Settings {
+            show_toolbar_button: true,
             custom: true,
             custom_path: "/some path/My Terminal".to_owned(),
             program: None,
@@ -565,6 +605,10 @@ mod tests {
                     .is_none()
             );
             app.new_document();
+            let _ = ctx.run(raw(), |ctx| app.top_bar(ctx, &crate::DARK));
+            assert!(!app.terminal.show_toolbar_button);
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("terminal_button_rect"))).is_none());
+            app.terminal.show_toolbar_button = true;
             for _ in 0..3 {
                 let _ = ctx.run(raw(), |ctx| app.top_bar(ctx, &crate::DARK));
             }
@@ -605,6 +649,18 @@ mod tests {
                     _ => None,
                 });
             assert!(text.is_some());
+            let toggle = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("show_terminal_toolbar_rect"))).unwrap();
+            assert!(toggle.bottom() < text.unwrap().pos.y);
+            for pressed in [true, false] {
+                let mut input = raw();
+                input.events = vec![egui::Event::PointerMoved(toggle.center()), egui::Event::PointerButton {
+                    pos: toggle.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                }];
+                let _ = ctx.run(input, |ctx| app.settings_window(ctx, &crate::DARK));
+            }
+            assert!(!app.terminal.show_toolbar_button);
+            let _ = ctx.run(raw(), |ctx| app.top_bar(ctx, &crate::DARK));
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("terminal_button_rect"))).is_none());
             let entry = ctx
                 .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("settings_workspace_theme_rect")))
                 .unwrap();

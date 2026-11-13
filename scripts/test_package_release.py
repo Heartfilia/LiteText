@@ -23,6 +23,14 @@ class PackageReleaseTest(unittest.TestCase):
 
                     def command(args, **kwargs):
                         if args[0] == "hdiutil":
+                            staging = pathlib.Path(args[args.index("-srcfolder") + 1])
+                            notice = staging / "安装后打开失败查看.txt"
+                            text = notice.read_text(encoding="utf-8")
+                            self.assertIn("xattr -dr com.apple.quarantine /Applications/LiteText.app", text)
+                            self.assertIn("后续可在 App 内部检测更新", text)
+                            self.assertIn("可信 Release", text)
+                            self.assertIn("削弱 macOS", text)
+                            self.assertEqual(set(p.name for p in staging.iterdir()), {"LiteText.app", notice.name})
                             pathlib.Path(args[-1]).write_bytes(b"dmg")
 
                     with patch.dict(os.environ, {"LITETEXT_VERSION": "v1.2.3-beta.1"}), patch("sys.argv", [str(script), "--os", platform, "--arch", arch, "--target", "test-target"]), patch("subprocess.run", side_effect=command), patch("os.symlink"):

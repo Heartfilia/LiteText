@@ -728,7 +728,7 @@ pub(crate) fn find_bar(
                                     let button = ui.button(t.go_to_line);
                                     let input = ui.add(egui::TextEdit::singleline(&mut tools.jump_line)
                                         .id(egui::Id::new(("jump_line", file.id)))
-                                        .desired_width(72.0).char_limit(20).hint_text("1"));
+                                        .desired_width(72.0).char_limit(20));
                                     tools.jump_line.retain(|c| c.is_ascii_digit());
                                     ui.ctx().data_mut(|d| {
                                         d.insert_temp(egui::Id::new(("jump_line_input_rect", file.id)), input.rect);

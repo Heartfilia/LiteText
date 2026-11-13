@@ -1855,6 +1855,10 @@ impl LiteTextApp {
 
     fn top_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
         let t = tr(self.lang);
+        ctx.data_mut(|d| {
+            d.remove::<egui::Rect>(egui::Id::new("tab_blank_new_rect"));
+            d.remove::<egui::Rect>(egui::Id::new("terminal_button_rect"));
+        });
         egui::TopBottomPanel::top("top_bar")
             .exact_height(38.0)
             .frame(
@@ -2107,6 +2111,22 @@ impl LiteTextApp {
                             }
                             // 手动绘制也要声明内容宽度，标签超出视口时才能横向滚动。
                             let content_w = (ids.len() as f32 * tab_step - TAB_GAP).max(0.0);
+                            // Only trailing unused tab-strip space is interactive:
+                            // never tab gaps, overflow, toolbar or a drag target.
+                            let blank_left = origin_x + content_w + if ids.is_empty() { 0.0 } else { TAB_FILLET_RADIUS };
+                            let blank_right = (origin_x + tabs_width).min(ui.clip_rect().right());
+                            if blank_right - blank_left >= 24.0 && self.tab_drag_id.is_none() && !self.shortcuts_blocked() {
+                                let blank = egui::Rect::from_min_max(
+                                    egui::pos2(blank_left, content_top),
+                                    egui::pos2(blank_right, content_top + 38.0),
+                                ).intersect(ui.clip_rect());
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("tab_blank_new_rect"), blank));
+                                if ui.interact(blank, egui::Id::new("tab_blank_new"), egui::Sense::click())
+                                    .double_clicked_by(egui::PointerButton::Primary)
+                                {
+                                    self.new_document();
+                                }
+                            }
                             ui.allocate_space(egui::vec2(content_w, 38.0));
                         });
                     });
@@ -2185,7 +2205,7 @@ impl LiteTextApp {
                             }
                         }
 
-                        if self.active().is_some() && terminal::button(ui, pal, self.lang).clicked() {
+                        if self.terminal.show_toolbar_button && self.active().is_some() && terminal::button(ui, pal, self.lang).clicked() {
                             self.open_terminal(ui.ctx());
                         }
 
@@ -3549,6 +3569,44 @@ fn byte_at(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_executable_contains_icon_group_and_image_resources() {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+            fn FindResourceW(module: *mut c_void, name: *const u16, kind: *const u16) -> *mut c_void;
+            fn LoadResource(module: *mut c_void, resource: *mut c_void) -> *mut c_void;
+            fn LockResource(resource: *mut c_void) -> *mut c_void;
+            fn SizeofResource(module: *mut c_void, resource: *mut c_void) -> u32;
+        }
+        // Integer resource IDs use MAKEINTRESOURCE's pointer representation.
+        unsafe {
+            let module = GetModuleHandleW(std::ptr::null());
+            assert!(!module.is_null());
+            let group = FindResourceW(module, std::ptr::without_provenance(1), std::ptr::without_provenance(14));
+            assert!(!group.is_null(), "EXE must embed an RT_GROUP_ICON");
+            let size = SizeofResource(module, group) as usize;
+            let loaded = LoadResource(module, group);
+            assert!(!loaded.is_null());
+            let data = LockResource(loaded);
+            assert!(!data.is_null());
+            assert!(size >= 20);
+            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), size);
+            assert_eq!(&bytes[..4], &[0, 0, 1, 0]);
+            let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+            assert!(count >= 7, "keep the multi-resolution ICO images");
+            assert!(size >= 6 + count * 14);
+            for entry in bytes[6..6 + count * 14].chunks_exact(14) {
+                let id = u16::from_le_bytes([entry[12], entry[13]]) as usize;
+                let image = FindResourceW(module, std::ptr::without_provenance(id), std::ptr::without_provenance(3));
+                assert!(!image.is_null(), "each icon image must be embedded");
+                assert!(SizeofResource(module, image) > 0);
+            }
+        }
+    }
+
     #[test]
     fn app_icon_is_valid_and_has_a_bold_centered_t() {
         let icon = app_icon();
@@ -4004,6 +4062,46 @@ mod tests {
         }
         assert!(app.active().unwrap().draft_text.as_ref().unwrap().contains("benchmark edit"));
         assert_eq!(std::fs::read(path).unwrap(), original, "基准测试不允许修改用户日志");
+    }
+
+    #[test]
+    fn double_click_empty_tab_strip_creates_only_when_space_is_available() {
+        for count in [0, 1, 2, 20] {
+            let ctx = egui::Context::default();
+            let mut app = LiteTextApp::default();
+            for _ in 0..count { app.new_document(); }
+            let original_ids: Vec<_> = app.files.iter().map(|f| f.id).collect();
+            let mut frame = 0;
+            let mut draw = |app: &mut LiteTextApp, events| {
+                frame += 1;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))),
+                    time: Some(frame as f64 * 0.04), events, ..Default::default()
+                }, |ctx| app.top_bar(ctx, &DARK));
+            };
+            for _ in 0..3 { draw(&mut app, vec![]); }
+            let blank = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("tab_blank_new_rect")));
+            if count == 20 {
+                assert!(blank.is_none(), "overflow must not create a blank-area action");
+                continue;
+            }
+            let pos = blank.expect("sparse tabs should leave an interactive blank area").center();
+            for click in 0..2 {
+                for pressed in [true, false] {
+                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                    }]);
+                }
+                assert_eq!(app.files.len(), count + usize::from(click == 1));
+            }
+            assert_eq!(app.files[..count].iter().map(|f| f.id).collect::<Vec<_>>(), original_ids);
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(""));
+            assert_eq!(app.focus_editor, app.active_id);
+            // Reuse the remaining blank area with a modal active: no action.
+            app.show_settings = true;
+            draw(&mut app, vec![]);
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("tab_blank_new_rect"))).is_none());
+        }
     }
 
     #[test]
