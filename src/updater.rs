@@ -77,6 +77,25 @@ struct Plan {
     ack: PathBuf,
     version: String,
     status: PathBuf,
+    #[serde(default)]
+    runtime_lock: Option<PathBuf>,
+}
+
+fn runtime_lock_path() -> Option<PathBuf> {
+    eframe::storage_dir("LiteText").map(|p| p.join("running.lock"))
+}
+
+pub(crate) fn hold_runtime_lock() -> Result<File> {
+    let path = runtime_lock_path().ok_or("Application storage unavailable")?;
+    fs::create_dir_all(path.parent().ok_or("Missing storage parent")?)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    FileExt::lock_shared(&lock)?;
+    Ok(lock)
 }
 
 fn version(value: &str) -> Result<semver::Version> {
@@ -121,7 +140,35 @@ fn asset_name() -> Result<String> {
         "x86_64" => "x64",
         _ => return Err("Unsupported CPU".into()),
     };
-    Ok(format!("LiteText-{os}-{arch}.zip"))
+    Ok(package_name(os, arch))
+}
+
+fn package_name(os: &str, arch: &str) -> String {
+    let extension = match os {
+        "macos" => "dmg",
+        "windows" => "exe",
+        _ => "zip",
+    };
+    format!("LiteText-{os}-{arch}.{extension}")
+}
+
+fn legacy_asset_name() -> Result<String> {
+    Ok(Path::new(&asset_name()?)
+        .with_extension("zip")
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn release_package(release: &Release) -> Result<String> {
+    let preferred = asset_name()?;
+    if release.assets.iter().any(|a| a.name == preferred) {
+        return Ok(preferred);
+    }
+    let legacy = legacy_asset_name()?;
+    if release.assets.iter().any(|a| a.name == legacy) {
+        return Ok(legacy);
+    }
+    Err("Release asset missing for this platform".into())
 }
 fn validate_asset_url(asset: &Asset) -> Result<()> {
     let url = reqwest::Url::parse(&asset.browser_download_url)?;
@@ -150,7 +197,11 @@ fn includes_prereleases(current: &str) -> Result<bool> {
     Ok(current == "dev" || !version(current)?.pre.is_empty())
 }
 
-fn select_release(releases: Vec<Release>, current: &str, package: &str) -> Result<Option<Release>> {
+fn select_release(
+    releases: Vec<Release>,
+    current: &str,
+    packages: &[&str],
+) -> Result<Option<Release>> {
     let include_pre = includes_prereleases(current)?;
     Ok(releases
         .into_iter()
@@ -158,7 +209,10 @@ fn select_release(releases: Vec<Release>, current: &str, package: &str) -> Resul
             let parsed = version(&release.tag_name).ok()?;
             if release.draft
                 || (!include_pre && (release.prerelease || !parsed.pre.is_empty()))
-                || !release.assets.iter().any(|a| a.name == package)
+                || !release
+                    .assets
+                    .iter()
+                    .any(|a| packages.contains(&a.name.as_str()))
                 || !release.assets.iter().any(|a| a.name == "SHA256SUMS")
             {
                 return None;
@@ -191,7 +245,7 @@ fn check(settings: &Settings) -> Result<Option<Release>> {
             4 * 1024 * 1024,
         )?)?);
         if !has_next {
-            return select_release(releases, VERSION, &asset_name()?);
+            return select_release(releases, VERSION, &[&asset_name()?, &legacy_asset_name()?]);
         }
     }
     Err("Release list exceeds safety limit; cannot determine latest version".into())
@@ -301,6 +355,121 @@ fn extract(package: &Path, destination: &Path) -> Result<PathBuf> {
     }
     Ok(target)
 }
+
+fn stage_package(package: &Path, name: &str, destination: &Path) -> Result<PathBuf> {
+    if name.ends_with(".zip") {
+        return extract(package, destination);
+    }
+    #[cfg(windows)]
+    if name.ends_with(".exe") {
+        let staged = destination.join("litetext.exe");
+        fs::copy(package, &staged)?;
+        return Ok(staged);
+    }
+    #[cfg(target_os = "macos")]
+    if name.ends_with(".dmg") {
+        return stage_dmg(package, destination);
+    }
+    Err("Unsupported update package format".into())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_dmg(package: &Path, destination: &Path) -> Result<PathBuf> {
+    let mount = tempfile::Builder::new()
+        .prefix("litetext-mount-")
+        .tempdir()?;
+    let status = Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-noautoopen",
+            "-mountpoint",
+        ])
+        .arg(mount.path())
+        .arg(package)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("Unable to mount update DMG".into());
+    }
+    // Detach even when validation or copying fails. The original install is
+    // never touched here, and the image is always mounted read-only.
+    struct Mounted<'a>(&'a Path);
+    impl Drop for Mounted<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/hdiutil")
+                .arg("detach")
+                .arg(self.0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _mounted = Mounted(mount.path());
+    let source = mount.path().join("LiteText.app");
+    validate_bundle_tree(&source)?;
+    let staged = destination.join("LiteText.app");
+    let status = Command::new("/usr/bin/ditto")
+        .arg(&source)
+        .arg(&staged)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("Unable to stage application from DMG".into());
+    }
+    validate_bundle_tree(&staged)?;
+    if !binary_in(&staged).is_file() {
+        return Err("Update executable is missing".into());
+    }
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(&staged)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("Update application signature is invalid".into());
+    }
+    Ok(staged)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_bundle_tree(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_owned()];
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    while let Some(path) = pending.pop() {
+        entries += 1;
+        if entries > 4096 {
+            return Err("Too many application entries".into());
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                pending.push(entry?.path());
+            }
+        } else if metadata.is_file() {
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or("Application size overflow")?;
+            if bytes > MAX_PACKAGE {
+                return Err("Unpacked update too large".into());
+            }
+        } else {
+            return Err(
+                "Symbolic links and special files are not allowed in update application".into(),
+            );
+        }
+    }
+    Ok(())
+}
 fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) -> Result<Prepared> {
     let target = installed_target(&std::env::current_exe()?.canonicalize()?)?;
     let parent = target.parent().ok_or("No installation parent")?;
@@ -320,7 +489,7 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
     let root = tempfile::Builder::new()
         .prefix("litetext-update-")
         .tempdir()?;
-    let name = asset_name()?;
+    let name = release_package(release)?;
     let find = |name: &str| -> Result<&Asset> {
         let mut matches = release.assets.iter().filter(|a| a.name == name);
         let found = matches
@@ -350,7 +519,7 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
         .get(&asset.browser_download_url)
         .send()?
         .error_for_status()?;
-    let archive_path = root.path().join("package.zip");
+    let archive_path = root.path().join(&name);
     let mut output = File::create(&archive_path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -380,11 +549,15 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
         return Err("SHA-256 / size verification failed".into());
     }
     progress("校验通过，准备安装 / Verified, preparing installation".into());
-    let staged = extract(&archive_path, stage.path())?;
+    drop(output);
+    let staged = stage_package(&archive_path, &name, stage.path())?;
     // Version is checked before replacement, and again by the startup acknowledgement.
     let version_file = File::create(root.path().join("package-version"))?;
-    let mut process = Command::new(binary_in(&staged))
+    let mut command = Command::new(binary_in(&staged));
+    crate::windows::hide_console(&mut command);
+    let mut process = command
         .arg("--litetext-print-version")
+        .arg(root.path().join("package-version"))
         .stdin(Stdio::null())
         .stdout(version_file)
         .stderr(Stdio::null())
@@ -414,6 +587,7 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
         ack: root.path().join("startup-ack"),
         version: release.tag_name.clone(),
         status: status_path().ok_or("Application storage unavailable")?,
+        runtime_lock: runtime_lock_path(),
     };
     Ok(Prepared {
         root,
@@ -425,9 +599,11 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
 
 fn launch(target: &Path, ack: Option<&Path>) -> Result<Option<std::process::Child>> {
     let mut command = Command::new(binary_in(target));
+    crate::windows::hide_console(&mut command);
     if let Some(ack) = ack {
         command.arg("--litetext-update-ack").arg(ack);
     }
+    crate::new_window::append_arguments(&mut command);
     Ok(Some(
         command
             .stdin(Stdio::null())
@@ -453,15 +629,44 @@ fn install_with(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Every GUI process holds a shared lock, including independent new windows.
+    // Wait for all of them before replacing the bundle/EXE, not only the window
+    // that requested the update. Otherwise Windows may reject replacement.
+    let runtime_lock = plan
+        .runtime_lock
+        .as_ref()
+        .map(|path| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .transpose()?;
+    if let Some(runtime_lock) = &runtime_lock {
+        while runtime_lock.try_lock_exclusive().is_err() {
+            if Instant::now() > deadline {
+                return Err(
+                    "Other LiteText windows are still running; close them and retry update".into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
     if let Err(error) = fs::rename(&plan.target, &plan.backup) {
+        drop(runtime_lock);
         let _ = launch(&plan.target, None);
         return Err(error.into());
     }
     if let Err(error) = fs::rename(&plan.staged, &plan.target) {
         fs::rename(&plan.backup, &plan.target)?;
+        drop(runtime_lock);
         let _ = launch(&plan.target, None);
         return Err(error.into());
     }
+    // New GUI needs to acquire its shared runtime lock before acknowledging.
+    drop(runtime_lock);
     let mut result = launch(&plan.target, Some(&plan.ack));
     let deadline = Instant::now() + startup_timeout;
     if result.is_ok() {
@@ -490,7 +695,13 @@ fn install_with(
 pub(crate) fn run_helper_if_requested() -> bool {
     let args: Vec<_> = std::env::args_os().collect();
     if args.get(1).is_some_and(|s| s == "--litetext-print-version") {
-        println!("{VERSION}");
+        // A Windows GUI executable may not have stdout at all. An explicit
+        // file also works there; older packages still print to redirected stdout.
+        if let Some(path) = args.get(2) {
+            let _ = fs::write(path, VERSION);
+        } else {
+            println!("{VERSION}");
+        }
         return true;
     }
     if args.get(1).is_none_or(|s| s != "--litetext-install-update") {
@@ -654,6 +865,7 @@ impl LiteTextApp {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            crate::new_window::append_arguments(&mut command);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -753,6 +965,13 @@ impl LiteTextApp {
             {
                 self.updater.restart = true;
             }
+            if self.updater.prepared.is_some() {
+                ui.label(if zh {
+                    "安装前请先关闭其他 LiteText 窗口。"
+                } else {
+                    "Close other LiteText windows before installing."
+                });
+            }
             if self.updater.prepared.is_some()
                 && ui.button(if zh { "取消" } else { "Cancel" }).clicked()
             {
@@ -826,6 +1045,93 @@ fn github_icon(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn package_formats_match_release_artifacts_and_legacy_zips_are_accepted() {
+        assert_eq!(package_name("macos", "arm64"), "LiteText-macos-arm64.dmg");
+        assert_eq!(package_name("windows", "x64"), "LiteText-windows-x64.exe");
+        assert_eq!(package_name("linux", "x64"), "LiteText-linux-x64.zip");
+        let preferred = asset_name().unwrap();
+        let legacy = legacy_asset_name().unwrap();
+        let mut release = release_for_test("v1.0.0", false);
+        release.assets[0].name = legacy.clone();
+        assert_eq!(release_package(&release).unwrap(), legacy);
+        release.assets.push(Asset {
+            name: preferred.clone(),
+            browser_download_url: String::new(),
+            size: 1,
+        });
+        assert_eq!(release_package(&release).unwrap(), preferred);
+        assert!(
+            select_release(vec![release], "v0.1.0", &[&preferred, &legacy])
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bundle_validation_rejects_symlinks_and_special_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("app");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("binary"), "test").unwrap();
+        validate_bundle_tree(&root).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", root.join("escape")).unwrap();
+            assert!(validate_bundle_tree(&root).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_exe_is_staged_without_modifying_existing_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("package.exe");
+        fs::write(&package, "MZ-test").unwrap();
+        let stage = temp.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let target = stage_package(&package, "LiteText-windows-x64.exe", &stage).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"MZ-test");
+        assert_eq!(fs::read(package).unwrap(), b"MZ-test");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_stages_a_signed_bundle_and_detaches_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let app = source.join("LiteText.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::copy("/usr/bin/true", app.join("Contents/MacOS/litetext")).unwrap();
+        fs::write(app.join("Contents/Info.plist"), br#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>litetext</string><key>CFBundleIdentifier</key><string>com.heartfilia.litetext.test</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>"#).unwrap();
+        assert!(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--deep", "--sign", "-"])
+                .arg(&app)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink("/Applications", source.join("Applications")).unwrap();
+        let package = temp.path().join("package.dmg");
+        assert!(
+            Command::new("/usr/bin/hdiutil")
+                .args(["create", "-quiet", "-srcfolder"])
+                .arg(source)
+                .arg(&package)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let stage = temp.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage_package(&package, "LiteText-macos-arm64.dmg", &stage).unwrap();
+        assert!(binary_in(&staged).is_file());
+        assert!(!stage.join("Applications").exists());
+    }
 
     #[test]
     fn update_events_stay_small_across_platforms() {
@@ -902,7 +1208,7 @@ mod tests {
                 release_for_test("v0.1.1-beta.10", true),
                 release_for_test("v0.1.1-beta.9", true),
             ];
-            let latest = select_release(releases, current, "package.zip")
+            let latest = select_release(releases, current, &["package.zip"])
                 .unwrap()
                 .unwrap();
             assert_eq!(latest.tag_name, "v0.1.1-beta.10");
@@ -911,7 +1217,7 @@ mod tests {
             release_for_test("v0.1.1-beta.10", true),
             release_for_test("v0.1.1", false),
         ];
-        let latest = select_release(releases, "v0.1.1-beta.3", "package.zip")
+        let latest = select_release(releases, "v0.1.1-beta.3", &["package.zip"])
             .unwrap()
             .unwrap();
         assert_eq!(latest.tag_name, "v0.1.1");
@@ -932,7 +1238,7 @@ mod tests {
             release_for_test("not-semver", false),
             release_for_test("v0.1.1", false),
         ];
-        let latest = select_release(releases, "v0.1.0", "package.zip")
+        let latest = select_release(releases, "v0.1.0", &["package.zip"])
             .unwrap()
             .unwrap();
         assert_eq!(latest.tag_name, "v0.1.1");
@@ -940,13 +1246,13 @@ mod tests {
             select_release(
                 vec![release_for_test("v0.1.1-beta.3", true)],
                 "v0.1.0",
-                "package.zip"
+                &["package.zip"]
             )
             .unwrap()
             .is_none()
         );
         assert!(
-            select_release(vec![], "dev", "package.zip")
+            select_release(vec![], "dev", &["package.zip"])
                 .unwrap()
                 .is_none()
         );
@@ -954,7 +1260,7 @@ mod tests {
             select_release(
                 vec![release_for_test("v0.1.1", false)],
                 "dev",
-                "other-platform.zip"
+                &["other-platform.zip"]
             )
             .unwrap()
             .is_none()
@@ -1108,6 +1414,7 @@ mod tests {
             ack: temp.join("ack"),
             version: "v1.0.1".into(),
             status: temp.join("status"),
+            runtime_lock: None,
         };
         fs::write(&plan.target, "old").unwrap();
         fs::write(&plan.staged, "new").unwrap();
@@ -1143,6 +1450,41 @@ mod tests {
         let plan = thread.join().unwrap();
         assert_eq!(fs::read_to_string(plan.target).unwrap(), "new");
         assert_eq!(fs::read_to_string(plan.backup).unwrap(), "old");
+    }
+
+    #[test]
+    fn transaction_waits_for_other_windows_and_releases_runtime_lock_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = plan_for_test(temp.path());
+        let path = temp.path().join("running.lock");
+        let other = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock_shared(&other).unwrap();
+        plan.runtime_lock = Some(path.clone());
+        let target = plan.target.clone();
+        let thread = std::thread::spawn(move || {
+            install_with(
+                &plan,
+                |_, ack| {
+                    let gui = OpenOptions::new().read(true).write(true).open(&path)?;
+                    FileExt::try_lock_shared(&gui)?;
+                    fs::write(ack.unwrap(), &plan.version)?;
+                    Ok(None)
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        drop(other);
+        thread.join().unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "new");
     }
     #[test]
     fn transaction_rolls_back_failed_launch_missing_stage_and_missing_ack() {

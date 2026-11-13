@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use eframe::egui;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, RichText, Stroke};
@@ -21,6 +23,9 @@ mod whitespace;
 mod terminal;
 mod updater;
 mod file_open;
+mod text_conversion;
+mod windows;
+mod new_window;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
@@ -35,7 +40,16 @@ fn control_pictures_ok() -> bool {
 static OPEN_REQUEST: AtomicBool = AtomicBool::new(false);
 
 fn main() -> eframe::Result {
+    new_window::initialize();
     if updater::run_helper_if_requested() { return Ok(()); }
+    let _runtime_lock = match updater::hold_runtime_lock() {
+        Ok(lock) => lock,
+        Err(error) => { eprintln!("Unable to initialize runtime lock: {error}"); return Ok(()); }
+    };
+    let _window_lock = match new_window::lock_current() {
+        Ok(lock) => lock,
+        Err(error) => { eprintln!("Unable to lock window session: {error}"); return Ok(()); }
+    };
     let paths = file_open::argument_paths(std::env::args_os().skip(1));
     #[cfg(target_os = "macos")]
     let _file_open_handler = file_open::macos::install();
@@ -50,6 +64,7 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        persistence_path: new_window::directory().map(|p| p.join("app.ron")),
         ..Default::default()
     };
     eframe::run_native(
@@ -63,6 +78,7 @@ fn main() -> eframe::Result {
             let mut app: LiteTextApp = cc
                 .storage
                 .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
+                .or_else(new_window::seed)
                 .unwrap_or_default();
             app.restore_session();
             app.open_paths(paths);
@@ -389,6 +405,11 @@ struct LiteTextApp {
     #[serde(skip)]
     menu_whitespace_open: bool,
     #[serde(skip)]
+    menu_conversion_open: bool,
+    #[cfg(test)]
+    #[serde(skip)]
+    new_window_requested: bool,
+    #[serde(skip)]
     plugin_error: Option<String>,
     #[serde(skip)]
     focus_editor: Option<u64>,
@@ -481,6 +502,9 @@ impl Default for LiteTextApp {
             menu_recent_open: false,
             menu_plugins_open: false,
             menu_whitespace_open: false,
+            menu_conversion_open: false,
+            #[cfg(test)]
+            new_window_requested: false,
             plugin_error: None,
             focus_editor: None,
             selection: None,
@@ -672,11 +696,12 @@ enum TabAction {
 
 enum MenuAction {
     Open,
-    New,
+    NewWindow,
     Recent(PathBuf),
     Settings,
     FormatJson,
     Whitespace(whitespace::Action),
+    Conversion(text_conversion::Action),
 }
 
 type RecoveryKey = (Option<u64>, Vec<(u64, PathBuf, String, ViewMode, u64, u64, Option<String>)>);
@@ -1536,6 +1561,7 @@ impl eframe::App for LiteTextApp {
         }
         self.file_dialogs(ctx);
         updater::acknowledge_startup();
+        new_window::restore_closed_windows();
         self.finish_update_restart(ctx, frame);
     }
 }
@@ -1546,6 +1572,7 @@ impl LiteTextApp {
             self.menu_recent_open = false;
             self.menu_plugins_open = false;
             self.menu_whitespace_open = false;
+            self.menu_conversion_open = false;
             return;
         }
         let t = tr(self.lang);
@@ -1553,6 +1580,9 @@ impl LiteTextApp {
         let mut recent_row = egui::Rect::NOTHING;
         let mut plugins_row = egui::Rect::NOTHING;
         let mut whitespace_row = egui::Rect::NOTHING;
+        let mut conversion_row = egui::Rect::NOTHING;
+        let new_window_label = if self.lang == Lang::ZhCn { "新窗口" } else { "New window" };
+        let conversion_label = if self.lang == Lang::ZhCn { "‹  文本转换" } else { "‹  Text conversion" };
         let plugins_label = format!("‹  {}", t.plugins);
         let whitespace_label = if self.lang == Lang::ZhCn { "‹  空白符处理" } else { "‹  Whitespace" };
         let recent_label = format!("‹  {}", t.open_recent);
@@ -1568,15 +1598,15 @@ impl LiteTextApp {
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         // Including the frame, longest label + one character on each side.
-                        let labels = [t.menu_open, t.new_file, &recent_label, &plugins_label, whitespace_label, t.settings];
+                        let labels = [t.menu_open, new_window_label, &recent_label, &plugins_label, whitespace_label, conversion_label, t.settings];
                         let width = app_menu_width(ui, &labels, pal);
                         ui.set_width(width);
                         if app_menu_row(ui, t.menu_open, false, pal).on_hover_text(t.open_file).clicked() {
                             action = Some(MenuAction::Open);
                         }
                         app_menu_separator(ui, pal);
-                        if app_menu_row(ui, t.new_file, false, pal).clicked() {
-                            action = Some(MenuAction::New);
+                        if app_menu_row(ui, new_window_label, false, pal).clicked() {
+                            action = Some(MenuAction::NewWindow);
                         }
                         app_menu_separator(ui, pal);
                         let recent = app_menu_row(ui, &recent_label, self.menu_recent_open, pal);
@@ -1585,6 +1615,7 @@ impl LiteTextApp {
                             self.menu_recent_open = true;
                             self.menu_plugins_open = false;
                             self.menu_whitespace_open = false;
+                            self.menu_conversion_open = false;
                             self.recent_files.retain(|p| p.is_file());
                         }
                         app_menu_separator(ui, pal);
@@ -1594,12 +1625,23 @@ impl LiteTextApp {
                             self.menu_plugins_open = true;
                             self.menu_recent_open = false;
                             self.menu_whitespace_open = false;
+                            self.menu_conversion_open = false;
                         }
                         app_menu_separator(ui, pal);
                         let whitespace = app_menu_row(ui, whitespace_label, self.menu_whitespace_open, pal);
                         whitespace_row = whitespace.rect;
                         if whitespace.hovered() || whitespace.clicked() {
                             self.menu_whitespace_open = true;
+                            self.menu_conversion_open = false;
+                            self.menu_recent_open = false;
+                            self.menu_plugins_open = false;
+                        }
+                        app_menu_separator(ui, pal);
+                        let conversion = app_menu_row(ui, conversion_label, self.menu_conversion_open, pal);
+                        conversion_row = conversion.rect;
+                        if conversion.hovered() || conversion.clicked() {
+                            self.menu_conversion_open = true;
+                            self.menu_whitespace_open = false;
                             self.menu_recent_open = false;
                             self.menu_plugins_open = false;
                         }
@@ -1610,6 +1652,36 @@ impl LiteTextApp {
                     });
             });
         let mut submenu_rect = None;
+        if self.menu_conversion_open {
+            let submenu = egui::Area::new(egui::Id::new("app_conversion_submenu"))
+                .order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP)
+                .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, conversion_row.top() - 6.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new().fill(pal.bg_panel)
+                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
+                        .corner_radius(8.0).inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            let labels: Vec<_> = text_conversion::ACTIONS.iter().map(|action| action.label(self.lang == Lang::ZhCn)).collect();
+                            ui.set_width(app_menu_width(ui, &labels, pal));
+                            let enabled = !self.shortcuts_blocked() && self.active().is_some_and(|f| f.view == ViewMode::Text && !f.is_binary && f.draft_text.is_some());
+                            ui.add_enabled_ui(enabled, |ui| {
+                                for (index, operation) in text_conversion::ACTIONS.into_iter().enumerate() {
+                                    if app_menu_row(ui, labels[index], false, pal).clicked() {
+                                        action = Some(MenuAction::Conversion(operation));
+                                    }
+                                }
+                            });
+                        });
+                });
+            submenu_rect = Some(submenu.response.rect);
+            let bridge = egui::Rect::from_min_max(
+                egui::pos2(submenu.response.rect.right().min(conversion_row.left()), conversion_row.top()),
+                conversion_row.right_bottom(),
+            );
+            if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+                !conversion_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
+            }) { self.menu_conversion_open = false; }
+        }
         if self.menu_whitespace_open {
             let submenu = egui::Area::new(egui::Id::new("app_whitespace_submenu"))
                 .order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP)
@@ -1725,10 +1797,11 @@ impl LiteTextApp {
             self.menu_recent_open = false;
             self.menu_plugins_open = false;
             self.menu_whitespace_open = false;
+            self.menu_conversion_open = false;
         }
         match action {
             Some(MenuAction::Open) => OPEN_REQUEST.store(true, Ordering::Relaxed),
-            Some(MenuAction::New) => self.new_document(),
+            Some(MenuAction::NewWindow) => self.open_new_window(),
             Some(MenuAction::Recent(path)) => self.open_paths(vec![path]),
             Some(MenuAction::Settings) => { self.show_settings = true; self.shortcuts_page = false; self.workspace_theme_page = false; },
             Some(MenuAction::FormatJson) if !self.shortcuts_blocked() => self.format_active_json(ctx),
@@ -1738,6 +1811,7 @@ impl LiteTextApp {
                 if let Some(file) = self.active_mut() { whitespace::apply(file, ctx, operation, mode); }
             }
             Some(MenuAction::Whitespace(_)) => {},
+            Some(MenuAction::Conversion(operation)) => self.convert_active_text(ctx, operation),
             None => {}
         }
     }
@@ -4037,7 +4111,7 @@ mod tests {
     }
 
     #[test]
-    fn app_menu_opens_below_button_and_creates_document() {
+    fn app_menu_opens_below_button_and_requests_empty_new_window() {
         let ctx = egui::Context::default();
         setup_fonts(&ctx);
         let mut app = LiteTextApp { show_menu: true, ..Default::default() };
@@ -4063,7 +4137,7 @@ mod tests {
                 for shape in output.shapes {
                     if let egui::Shape::Text(text) = shape.shape {
                         assert!(text.pos.y > anchor.bottom());
-                        if text.galley.text() == tr(app.lang).new_file {
+                        if text.galley.text() == "新窗口" {
                             new_pos = Some(text.pos + egui::vec2(8.0, 8.0));
                         }
                     }
@@ -4072,8 +4146,8 @@ mod tests {
             }
         }
         assert!(!app.show_menu);
-        assert_eq!(app.files.len(), 1);
-        assert!(app.active().unwrap().draft_text.is_some());
+        assert!(app.new_window_requested);
+        assert!(app.files.is_empty());
     }
 
     #[test]

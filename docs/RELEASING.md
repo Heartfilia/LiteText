@@ -5,7 +5,7 @@
 - `cargo run`、普通 `cargo build --release` 均显示 **dev**，不读取 Cargo 包版本或任意本地 Git tag。
 - 发布通过 `LITETEXT_VERSION` 注入 tag（例如 `v1.2.3`），构建时验证 SemVer。
 - 版本 tag 由维护者手动创建和推送，助手不代建、不移动既有 tag。推送 `v*` tag 触发 `.github/workflows/release.yml`；普通 main 推送不发布。每个平台先测试、Clippy，再构建；全部成功才发布 GitHub Release。
-- 产物：macOS arm64（Apple Silicon）的 `.dmg`（首次安装）与 `.zip`（自动更新）、Windows x64 ZIP、Linux x64 ZIP，以及统一 `SHA256SUMS`。不再编译或上传 macOS x64（Intel）。
+- 产物：macOS arm64（Apple Silicon）仅 `.dmg`、Windows x64 仅 `.exe`、Linux x64 ZIP，以及统一 `SHA256SUMS`。安装和自动更新共用平台产物，不再编译或上传 macOS x64（Intel）。
 - `-rc.1` 等带连字符的 tag 发布为 prerelease；应用内查询 GitHub Releases 列表并按 SemVer 选择当前平台的最高完整版本。稳定安装版只接受稳定版，beta／rc 安装版与 dev 同时接受稳定版和预发布版本；不会因发布时间顺序或 beta.9/beta.10 的字典序选错版本。
 - 配置目标仓库：**Heartfilia/LiteText**。发布前必须把 Cargo.lock、源码、assets、scripts 和 workflow 一并提交。失败任务的重跑仍使用原 tag 的旧提交，不会自动带入 main 上的修复；请在包含修复的提交上手动创建新版本 tag。
 
@@ -18,17 +18,19 @@ git push origin v0.1.1
 
 ## 用户更新流程
 
-1. 首次安装 Release：macOS 将 DMG 中的 LiteText.app 拖至可写的应用目录；Windows/Linux 解压到用户有写权限的固定目录。
+1. 首次安装 Release：macOS 将 DMG 中的 LiteText.app 拖至可写的应用目录；Windows 将 EXE 放在可写的固定目录；Linux 解压 ZIP。
 2. 系统设置中选择直连或专用 HTTP(S)/SOCKS5 代理，点击「检查更新」。两分钟内相同代理配置重复检查使用内存缓存；配置变动后重新检查。
-3. 点击「下载更新」，后台下载对应 OS/CPU 的 ZIP 和 SHA256SUMS，检查大小与哈希，安全解压，并运行版本查询核对 tag。
-4. 点击「安装并重启」：先写工作区恢复记录和配置，再启动独立更新助手，正常关闭应用。
+3. 点击「下载更新」，后台下载对应 OS/CPU 的 DMG/EXE/ZIP 和 SHA256SUMS，检查大小与哈希。macOS 只读挂载 DMG、检查应用树与签名、复制应用到暂存目录并卸载映像；Windows 暂存 EXE；Linux 安全解压。运行版本查询核对 tag，Windows GUI 程序使用显式版本结果文件，不依赖控制台 stdout。
+4. 先关闭其他 LiteText 窗口，再点击「安装并重启」：先写当前窗口独立的恢复记录和配置，再启动独立更新助手，正常关闭应用；助手通过共享运行锁等待其他窗口退出，超时则不替换。
 5. 助手等待应用释放安装锁，在同一文件系统中重命名旧版、放入新版并启动；新版恢复会话、完成第一帧后写入启动确认。45 秒未确认时停止该新进程并尝试恢复旧版。原始文档始终不由更新器写入。
 
 开发构建仅能检查版本，不自动覆盖 `target/` 中的程序。只读安装目录会报错，不自动提权。macOS 磁盘映像和 App Translocation 位置拒绝原位更新。
 
+**格式迁移：旧版更新器只接受 ZIP，无法从仅有 DMG/EXE 的新 Release 自动升级。用户需要手动安装此新版一次；此后支持新格式更新。** 新更新器兼容旧 ZIP，用于检查历史版本，但不绕过版本和哈希校验。不要为了迁移移动旧 tag 或添加不匹配的伪 ZIP。
+
 代理只用于本模块的 GitHub API、校验文件与下载请求。关闭代理时明确不读取 `HTTP_PROXY` 等环境变量。填写 `http://127.0.0.1:7890` 或 `socks5h://127.0.0.1:1080`，**不是** GitHub 镜像 URL 前缀。输入框明文显示地址，随设置持久化，不做加密；建议使用本机无凭据代理，不在共享机器的配置里保存密码。
 
-只有预发布时 `/releases/latest` 返回404是GitHub的正常行为，因此不再使用该端点。列表为空、没有匹配通道或当前平台缺少ZIP/SHA256SUMS时显示「暂无可用版本」；真正的HTTP错误（包括列表端点404、403/限流）仍报错，不掩盖连接或仓库权限问题。
+只有预发布时 `/releases/latest` 返回404是GitHub的正常行为，因此不再使用该端点。列表为空、没有匹配通道或当前平台缺少安装产物/SHA256SUMS时显示「暂无可用版本」；真正的HTTP错误（包括列表端点404、403/限流）仍报错，不掩盖连接或仓库权限问题。
 
 ## 安全边界与待验证项
 
@@ -37,7 +39,7 @@ git push origin v0.1.1
 - macOS 当前仅 ad-hoc 签名，**没有 Apple Developer ID 签名或 notarization**。应用及更新助手不会自动去除 quarantine 或绕过 Gatekeeper；可信安装包的手动首次打开方法及风险说明见 [README](../README.md#macosapple-silicon)。面向公开分发前建议配置 Developer ID、公证与签名验证。
 - 安装后的旧版本保留在安装目录内 `.litetext-stage-*` 的 `previous`；临时更新目录为 `litetext-update-*`，保留助手和诊断。未进入安装的下载/解压失败与取消会自动清理；安装交接后的目录故意保留供回退，不自动递归清理历史安装。
 - 安装结果写入应用数据目录 `update-result.txt`，应用读取后显示在设置页。新进程无法启动时，助手临时目录还保留 `install-error.txt`。
-- 不支持包管理器托管的安装升级（例如 Homebrew/apt）；应使用相应包管理器。Windows/Linux 首版是解压型应用，非 MSI/deb/rpm 安装器。
+- 不支持包管理器托管的安装升级（例如 Homebrew/apt）；应使用相应包管理器。Windows 为单 EXE、Linux 为 ZIP，非 MSI/deb/rpm 安装器。
 - macOS 本机编译与模拟事务已测；真实 GitHub tag 构建、跨平台首次安装、权限/Gatekeeper、真实版本升级和回退仍需 Release 验收。尚未替换用户当前应用或触发真实安装。
 
 ## 发布验收建议

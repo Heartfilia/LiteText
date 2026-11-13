@@ -43,13 +43,15 @@ if args.os == "macos":
     # Ad-hoc signing makes the bundle structurally valid on Apple Silicon.
     # This is NOT Developer ID signing/notarization and does not bypass Gatekeeper.
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(bundle)], check=True)
+elif args.os == "windows":
+    shutil.copy2(binary, out / f"LiteText-windows-{args.arch}.exe")
 else:
     shutil.copy2(binary, staging / binary.name)
-archive = out / f"LiteText-{args.os}-{args.arch}.zip"
-with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
-    for path in sorted(staging.rglob("*")):
-        if path.is_file():
-            zipped.write(path, path.relative_to(staging))
+    archive = out / f"LiteText-{args.os}-{args.arch}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+        for path in sorted(staging.rglob("*")):
+            if path.is_file():
+                zipped.write(path, path.relative_to(staging))
 if args.os == "macos":
     os.symlink("/Applications", staging / "Applications")
     subprocess.run(["hdiutil", "create", "-volname", "LiteText", "-srcfolder", str(staging),

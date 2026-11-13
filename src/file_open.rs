@@ -11,7 +11,10 @@ pub(crate) fn argument_paths(args: impl IntoIterator<Item = std::ffi::OsString>)
                 literal = true;
                 continue;
             }
-            if arg == "--litetext-update-ack" || arg == "--litetext-install-update" {
+            if arg == "--litetext-update-ack"
+                || arg == "--litetext-install-update"
+                || arg == "--litetext-window"
+            {
                 args.next();
                 continue;
             }
@@ -152,6 +155,8 @@ mod tests {
         let args = [
             "--litetext-update-ack",
             "/private/ack",
+            "--litetext-window",
+            "window-abc",
             "-psn_0_123",
             "中文 a.jsonl",
             "b.log",

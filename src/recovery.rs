@@ -190,6 +190,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    pub(crate) fn is_empty(&self) -> bool { self.files.is_empty() }
     #[cfg(test)]
     pub(crate) fn capture(files: &[LoadedFile], active_id: Option<u64>) -> Self {
         Self {
@@ -313,6 +314,7 @@ impl Session {
 }
 
 pub(crate) fn session_path() -> Option<PathBuf> {
+    if let Some(directory) = crate::new_window::directory() { return Some(directory.join("recovery/session.json")); }
     eframe::storage_dir("LiteText").map(|p| p.join("recovery").join("session.json"))
 }
 

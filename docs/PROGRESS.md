@@ -1,7 +1,7 @@
 # LiteText 项目文档
 
 > 轻量、快速、跨平台的文本/HEX 阅读器（Rust + egui）
-> 最后更新：2026-11-12
+> 最后更新：2026-11-13
 
 ## 项目简介
 
@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（macOS 160 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明。
+测试：`cargo test`（macOS 170 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。
 
 ## 目录结构
 
@@ -163,6 +163,16 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-13（精简发布产物、更新格式迁移、文本转换与新窗口）
+
+- CI 仅发布 macOS arm64 DMG、Windows x64 单 EXE、Linux x64 ZIP，统一生成 SHA256SUMS；保留仅用户 tag 触发和不构建 macOS Intel 的限制
+- 更新器优先使用 DMG/EXE，兼容历史 ZIP；macOS 只读挂载、检查应用树/签名、暂存复制并卸载，Windows 暂存原始 EXE；保留哈希/版本校验、原子替换、启动确认及回退，GUI 版本查询使用显式结果文件；旧客户端首次需手动安装新版，文档明确说明格式迁移边界
+- Windows 主程序使用 GUI subsystem，不附带控制台；版本检查、重启和新窗口子进程指定不创建控制台，不影响用户主动打开终端功能
+- 菜单“空白符处理”下新增“文本转换”，UTF-8 全文 MD5/Base64 编解码/URL 组件编解码仅作用当前激活文本标签，可一次撤销；失败保留文本，HEX/二进制/阻塞对话框不执行，不自动写原文件
+- 菜单“新建”改为“新窗口”，新进程复制偏好但无工作区，独立设置/恢复路径和会话锁防止互相覆盖；主窗口启动恢复未运行的附加窗口，顶部新建工作区按钮和 Cmd/Ctrl+N 保持原功能
+- 多窗口运行共享锁确保更新等待所有 GUI 退出，再替换程序；重启保留附加窗口 ID，安装 UI 提示先关闭其他窗口
+- Rust 1.99 全量 170 项测试、严格 Clippy、Python 两项打包测试通过，2 项手动性能测试跳过；实测签名测试应用 DMG 的创建/挂载/暂存/卸载。Windows 无终端实机效果、云端正式产物与真实跨版本更新仍需发布后验收
 
 ### 2026-11-12（滚动条淡色调整）
 
