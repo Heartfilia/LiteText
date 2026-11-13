@@ -28,6 +28,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 fs2 = "0.4"
 base64 = "0.22"
 md-5 = "0.10"
+markup_fmt = "0.27.6"
+url = "2"
+shlex = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

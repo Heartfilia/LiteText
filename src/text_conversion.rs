@@ -9,13 +9,15 @@ pub(crate) enum Action {
     Base64Decode,
     UrlEncode,
     UrlDecode,
+    UrlParse,
 }
-pub(crate) const ACTIONS: [Action; 5] = [
+pub(crate) const ACTIONS: [Action; 6] = [
     Action::Md5,
     Action::Base64Encode,
     Action::Base64Decode,
     Action::UrlEncode,
     Action::UrlDecode,
+    Action::UrlParse,
 ];
 
 impl Action {
@@ -29,12 +31,15 @@ impl Action {
             (Self::Base64Decode, false) => "Base64 to text",
             (Self::UrlEncode, _) => "urlencode",
             (Self::UrlDecode, _) => "urldecode",
+            (Self::UrlParse, true) => "url解析",
+            (Self::UrlParse, false) => "Parse URL",
         }
     }
 }
 
-fn convert(text: &str, action: Action) -> Result<String, String> {
+pub(crate) fn convert(text: &str, action: Action) -> Result<String, String> {
     match action {
+        Action::UrlParse => crate::web_tools::parse_url(text),
         Action::Md5 => Ok(format!("{:x}", md5::Md5::digest(text.as_bytes()))),
         Action::Base64Encode => Ok(STANDARD.encode(text.as_bytes())),
         Action::Base64Decode => {
@@ -100,6 +105,11 @@ impl crate::LiteTextApp {
             Ok(result) if result != text => {
                 let len = text.len();
                 crate::line_commands::commit_edits(file, ctx, vec![(0..len, result)], None);
+                if action == Action::UrlParse {
+                    file.language_override = Some("JSON".into());
+                    file.editor_state.folds.enabled = true;
+                    file.editor_state.folds.invalidate();
+                }
                 ctx.request_repaint();
             }
             Ok(_) => {}
@@ -128,6 +138,7 @@ mod tests {
                 let original = match action {
                     Action::Base64Decode => convert(&source, Action::Base64Encode).unwrap(),
                     Action::UrlDecode => convert(&source, Action::UrlEncode).unwrap(),
+                    Action::UrlParse => "https://example.com/a?q=中文&q=two#part".into(),
                     _ => source,
                 };
                 std::fs::write(&path, &original).unwrap();

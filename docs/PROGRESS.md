@@ -21,7 +21,7 @@ HEX 视图，带多标签页、主题切换、界面多语言与状态持久化�
 | 原子写入 | tempfile 3.27 | 同目录临时文件 + sync + 原子替换 |
 
 构建：`cargo run`（开发） / `cargo build --release`（已开 LTO + strip）。
-测试：`cargo test`（macOS 170 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。
+测试：`cargo test`（macOS 184 个常规测试 + 2 个手动性能测试：用户日志与合成大文本）；`python3 -m unittest discover -s scripts -p 'test_*.py'` 检查打包文件类型声明和各平台产物。
 
 ## 目录结构
 
@@ -41,6 +41,9 @@ src/
   terminal.rs 本机终端检测、持久化选择、安全启动计划与后台启动
   file_open.rs 命令行文件参数与 macOS 冷启动/运行中的 Finder 打开事件
   json_plugin.rs Format JSON、失败提示与显示层 JSON 折叠
+  web_tools.rs 离线 HTML/Header/Cookie 格式化、URL 拆分及共享可撤销结果提交
+  curl_plugin.rs 原生 cURL 安全子集解析、七种目标代码及工作区上方悬浮菜单
+  text_conversion.rs 当前工作区 MD5/Base64/URL 编解码与 URL 解析
   workspace_theme.rs 工作区独立配色、Dark+/Light+ 预设、syntect 语法与视口解析缓存
   i18n.rs      界面文案翻译表（简体中文 / English）
 assets/fonts/  内置 HarmonyOS Sans Regular / Medium
@@ -71,6 +74,10 @@ docs/          本文档
 - [x] 系统设置 → 全局主题：跟随系统、Dark+/Light+、JetBrains/Sublime 等风格统一控制软件与编辑区，15 项颜色自定义与预览，设置持久化
 - [x] 右上角下拉菜单：打开、新建、最近文件（悬停向左弹出独立列表）、插件、系统设置；按最长文字加两个字符宽度自适应，点击外部或 Esc 关闭
 - [x] 插件 → Format JSON：当前活动文本工作区无损格式化、失败行列提示、一次撤销；行号和正文之间独立 `+ / −` 方框折叠对象/数组
+- [x] 插件 → Format HTML/Header/Cookie：本地离线格式化与多格式解析，同名键保留数组，当前活动工作区一次撤销
+- [x] 插件 → curl解析：工作区上方独立目标菜单，Python/JavaScript/Node.js/Go/Rust/PHP/HTTP，安全解析常见字面请求；未支持参数报错，不运行命令或读取文件
+- [x] 文本转换 → url解析：基础 URL、协议、主机、端口、路径、参数和 fragment JSON，重复参数与空值保留
+- [x] Log 文件主题高亮：自动识别 `.log`、手动语言选择、明暗适配的级别/时间/数字/字符串；视口独立解析，无前缀扫描
 - [x] 新建空白文本：右上角极简单页纸按钮、菜单新建、Cmd+N；独立草稿标签，自动聚焦输入，支持基础文本编辑，内容同步到 HEX 视图
 - [x] 草稿行号栏：空白页默认第 1 行、独立底色与竖向分隔线、数字不可选中文字；左键点击/拖拽/Shift 连选行号，右键复制本行或多行、清除内容（保留换行，可撤销）
 - [x] 主题系统：两套完整调色板，跟随系统实时切换
@@ -163,6 +170,17 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-13（Log 高亮与离线 Web 工具）
+
+- `.log` 自动/手动 Log 高亮，时间、级别、数字与字符串按主题着色；无前缀状态，复用视口 token 缓存
+- 学习 SpiderTools 页面示例与前端行为，原生接入 Format HTML/Header/Cookie、url解析；不调用网站后端、不上传工作区文本
+- HTML 使用 MIT 的 markup_fmt，本地两空格缩进、保留空白敏感区与内嵌代码，限制大小/标签数/嵌套层数；Header 支持伪头及完整请求首行，Cookie 支持请求串、浏览器列表、Set-Cookie 和 Netscape 格式，重复键数组化
+- URL 输出结构化 JSON，保留基础 URL、协议/主机/端口/路径/fragment 与重复查询参数；查询采用表单 `+`/百分号解码，非法编码保留原文并报错
+- cURL 使用 Rust 安全子集而非嵌入 JS/WASM 运行时，目标为 Python/JavaScript/Node.js/Go/Rust/PHP/HTTP；插件入口点击打开工作区上方悬浮菜单，选择时转换当前激活标签，不执行 shell/HTTP、不读 @文件；未支持参数明确报错，README 记录与上游 curlconverter 的范围差异
+- 普通/大文本全部新增工具的一次撤销、原文件不写入、其他标签不变、失败不变、双语菜单点击、浮窗与 Esc、UTF-8/重复键/恶意 shell 输入均有回归测试；生成代码用本机 Python AST、Node 语法检查及 gofmt 检查（只检查，不执行请求）
+- Rust 1.99 全量 184 项测试、严格 Clippy、编译与 2 项 Python 打包测试通过，2 项手动性能测试未运行；Windows/Linux GUI 和 PHP/Rust 生成代码未做目标环境端到端请求验收
+- 保留原发布矩阵和 tag 策略，不变更安装器/更新器；用户日志哈希与 mtime 不变，缺失的 JSONL 未创建
 
 ### 2026-11-13（精简发布产物、更新格式迁移、文本转换与新窗口）
 

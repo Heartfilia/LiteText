@@ -117,7 +117,7 @@ impl LiteTextApp {
             return;
         };
         let mut open = true;
-        egui::Window::new("Format JSON")
+        egui::Window::new(if self.lang == Lang::ZhCn { "文本工具" } else { "Text tools" })
             .id(egui::Id::new("plugin_error"))
             .collapsible(false)
             .resizable(false)

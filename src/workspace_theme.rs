@@ -254,6 +254,13 @@ fn syntaxes() -> &'static SyntaxSet {
 }
 
 pub(crate) fn language(path: &Path, json: bool) -> String {
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("log"))
+    {
+        return "Log".into();
+    }
     if json {
         return "JSON".to_owned();
     }
@@ -301,6 +308,9 @@ enum Kind {
     Type,
     Property,
     Bracket,
+    LogError,
+    LogWarning,
+    LogInfo,
 }
 
 impl Kind {
@@ -315,6 +325,25 @@ impl Kind {
             Self::Type => c.type_name,
             Self::Property => c.property,
             Self::Bracket => c.bracket,
+            Self::LogError => {
+                if c.background.r() as u16 + c.background.g() as u16 + (c.background.b() as u16)
+                    < 420
+                {
+                    Color32::from_rgb(255, 112, 112)
+                } else {
+                    Color32::from_rgb(184, 28, 38)
+                }
+            }
+            Self::LogWarning => {
+                if c.background.r() as u16 + c.background.g() as u16 + (c.background.b() as u16)
+                    < 420
+                {
+                    Color32::from_rgb(230, 190, 95)
+                } else {
+                    Color32::from_rgb(143, 91, 0)
+                }
+            }
+            Self::LogInfo => c.type_name,
         }
     }
 }
@@ -405,6 +434,30 @@ fn json_tokens(text: &str) -> Vec<Token> {
         };
         push_token(&mut tokens, start..at, kind);
     }
+    tokens
+}
+
+/// Stateless viewport-only log lexer: no scan of a multi-gigabyte prefix.
+fn log_tokens(text: &str) -> Vec<Token> {
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| regex::Regex::new(r#"(?i)\b(?:fatal|critical|error|err|warn|warning|info|notice|debug|trace)\b|\b\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|\b\d+(?:\.\d+)?\b"#).expect("log token regex"));
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    for found in pattern.find_iter(text) {
+        push_token(&mut tokens, at..found.start(), Kind::Text);
+        let word = found.as_str().to_ascii_uppercase();
+        let kind = match word.as_str() {
+            "FATAL" | "CRITICAL" | "ERROR" | "ERR" => Kind::LogError,
+            "WARN" | "WARNING" => Kind::LogWarning,
+            "INFO" | "NOTICE" => Kind::LogInfo,
+            "DEBUG" | "TRACE" => Kind::Comment,
+            _ if word.starts_with(['\'', '"']) => Kind::String,
+            _ => Kind::Number,
+        };
+        push_token(&mut tokens, found.range(), kind);
+        at = found.end();
+    }
+    push_token(&mut tokens, at..text.len(), Kind::Text);
     tokens
 }
 
@@ -538,7 +591,9 @@ impl Render {
     /// Parse the viewport with the real prefix state, so multiline strings and
     /// comments retain their color when scrolling. Cache parser checkpoints.
     pub(crate) fn prepare_prefix(&self, full: &str, offset: usize) {
-        if !self.syntax || self.fast_json || matches!(self.language.as_str(), "Plain Text" | "text")
+        if !self.syntax
+            || self.fast_json
+            || matches!(self.language.as_str(), "Plain Text" | "text" | "Log")
         {
             return;
         }
@@ -582,8 +637,12 @@ impl Render {
         {
             return tokens.clone();
         }
-        if self.fast_json {
-            let tokens = Arc::new(json_tokens(text));
+        if self.fast_json || self.language == "Log" {
+            let tokens = Arc::new(if self.language == "Log" {
+                log_tokens(text)
+            } else {
+                json_tokens(text)
+            });
             cache.last = Some((offset, text.to_owned(), tokens.clone()));
             return tokens;
         }
@@ -773,13 +832,14 @@ pub(crate) fn language_options() -> Vec<String> {
         .iter()
         .map(|s| s.name.clone())
         .filter(|s| s != "Plain Text")
-        .chain(["TypeScript", "TSX", "JSX", "Vue", "Svelte"].map(str::to_owned))
+        .chain(["TypeScript", "TSX", "JSX", "Vue", "Svelte", "Log"].map(str::to_owned))
         .collect();
     names.sort_unstable();
     names.dedup();
     let common = [
         "text",
         "JSON",
+        "Log",
         "Python",
         "JavaScript",
         "TypeScript",
@@ -1176,6 +1236,53 @@ impl LiteTextApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_highlighting_is_theme_aware_utf8_safe_and_viewport_only() {
+        assert_eq!(language(Path::new("task.LOG"), false), "Log");
+        assert!(language_options().contains(&"Log".to_owned()));
+        let text = "2026-11-13 12:34:56.123 INFO 中文\r\n[WARNING] retry 3\nERROR failed \"a🙂\"\nDEBUG details\n";
+        let tokens = log_tokens(text);
+        let mut at = 0;
+        for token in &tokens {
+            assert_eq!(at, token.range.start);
+            assert!(
+                text.is_char_boundary(token.range.start) && text.is_char_boundary(token.range.end)
+            );
+            at = token.range.end;
+        }
+        assert_eq!(at, text.len());
+        assert!(tokens.iter().any(|t| t.kind == Kind::LogError));
+        assert!(tokens.iter().any(|t| t.kind == Kind::LogWarning));
+        for dark in [false, true] {
+            let cache = Arc::new(Mutex::new(SyntaxCache::default()));
+            let render = Render::prepare(
+                &WorkspaceTheme::default(),
+                dark,
+                "Log".into(),
+                (1, 1),
+                cache.clone(),
+            );
+            let full = format!("{}{}", "prefix\n".repeat(10000), text);
+            let offset = full.len() - text.len();
+            render.prepare_prefix(&full, offset);
+            assert!(cache.lock().unwrap().checkpoints.is_empty());
+            let job = render.layout(text, egui::FontId::monospace(14.0), f32::INFINITY, offset);
+            assert_eq!(job.text, text);
+            assert!(
+                job.sections
+                    .iter()
+                    .any(|s| s.format.color == Kind::LogError.color(render.colors))
+            );
+            assert_ne!(
+                Kind::LogError.color(render.colors),
+                Kind::LogWarning.color(render.colors)
+            );
+            assert_ne!(Kind::LogError.color(render.colors), render.colors.text);
+            let _ = render.layout(text, egui::FontId::monospace(14.0), f32::INFINITY, offset);
+            assert!(cache.lock().unwrap().checkpoints.is_empty());
+        }
+    }
 
     #[test]
     fn global_palettes_drive_app_and_editor_and_follow_system_without_legacy_dependency() {

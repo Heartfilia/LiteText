@@ -98,13 +98,25 @@ chmod +x "$HOME/.local/opt/litetext/litetext"
 
 - 右上角工具支持查找替换及文本显示选项；搜索按操作执行，可使用正则表达式。
 - 「菜单 → 插件 → Format JSON」格式化当前文本，支持撤销；JSON 对象／数组可折叠。
+- 「菜单 → 插件」新增 **Format HTML / Format Header / Format Cookie**，离线处理当前激活工作区的全部文本，可一次撤销；失败保留原文，不自动写原文件。HTML 使用两空格缩进，保留 `pre` 等空白敏感内容，不执行页面脚本；内嵌 JS/CSS 不另行美化。为避免递归解析阻塞，单次限 4 MiB、4096 个标签、128 层嵌套。
+- **Format Header** 支持 `Name: value`、HTTP 请求／状态首行、HTTP/2 伪头及 JSON 对象；值内的冒号原样保留，同名头（不区分大小写）输出数组。
+- **Format Cookie** 支持 `a=b; c=d`、`Cookie:`、多行 `Set-Cookie:`、浏览器导出的 JSON `name/value` 数组、JSON 对象和 Netscape cookie jar。`Set-Cookie` 属性不当作 Cookie；值里的 `=` 和百分号不解码，同名 Cookie 输出数组。
+- 「菜单 → 插件 → **curl解析**」点击后在工作区上方弹出目标菜单，支持转成 **Python requests、JavaScript fetch、Node.js fetch、Go net/http、Rust reqwest、PHP cURL、HTTP 请求文本**；点击时只转换当前激活工作区，自动切换对应高亮，可一次撤销。
 - 「菜单 → 空白符处理」可清理行首／行尾空白、转换 TAB 与空格；状态栏可选择 TAB 输入模式。
 - 「菜单 → 文本转换」支持文本转 MD5、文本转 Base64、Base64 转文本、urlencode 和 urldecode；只替换当前激活工作区的全部文本，可一次撤销，不自动保存原文件。MD5 为 UTF-8 字节的小写十六进制摘要；Base64 使用标准编码；URL 转换按 UTF-8 组件编码（空格 `%20`、加号 `%2B`，解码保留字面 `+`）。无效编码或非 UTF-8 解码结果会报错并保留原文。
+- 「菜单 → 文本转换 → **url解析**」将单个绝对 URL 输出为 JSON：基础 `url`、`scheme`、`host`、`port`（含协议默认端口）、`path`、`params`、`fragment`。查询参数按表单规则解码（`+` 表示空格，`%2B` 表示加号），重复参数保留为数组；路径和 fragment 保留编码形式。无效 URL／百分号／UTF-8 编码报错，不改原文。
 - 状态栏语言选项支持自动识别或手动选择语法高亮；行注释使用当前语言规则。
+- `.log` 文件自动使用 **Log** 高亮，也可在语言菜单手动选择：时间戳、数字、字符串、INFO、WARN、ERROR、DEBUG 等分别着色，随全局明暗主题适配；大文件仅分析可见区域，无需扫描全部前缀。
 - 双击正文按字符类别选词：连续中文与英文单词分别选中，不包含周围标点；中文按连续汉字选择，不进行词典分词。
 - TXT／二进制切换按钮可查看 HEX，HEX 目前用于阅读与选择，不支持字节编辑。
 - 正文右侧滚动条始终可见；底部未选中文字时显示光标所在的逻辑行号，选中文字后显示选中字数。
 - 工作区正文、行号及 HEX 支持快捷键缩放，字号范围为 **9～32 pt**，偏好自动保存；不会缩放菜单和设置界面，自动换行产生的视觉行不改变逻辑行号。
+
+### cURL 转换范围
+
+原生 Rust 实现参考 [curlconverter](https://github.com/curlconverter/curlconverter) 的“命令 → 请求模型 → 目标代码”流程，**不是完整嵌入上游库，不保证全部语言／参数兼容**，无需 Node.js／Python 运行时。接受 Bash/POSIX 引号和反斜杠续行；支持单个 HTTP(S) URL、`-X`、`-H`、`-b` Cookie 字符串、`-u user:password`、User-Agent、Referer、`--data` / `--data-raw` / `--data-binary` / `--data-urlencode` / `--json`、`-G`、`-I`、`-L`。请求正文以字面 UTF-8 保留，JSON 不重新解析为目标对象。
+
+转换时**不执行 shell、不发请求、不读取 `@file` 或 stdin**。不支持的参数（如 multipart、代理、`--compressed`）、动态 shell 表达式、多个请求及不能准确表示的组合会报错，不会悄悄忽略；Python/fetch 无法忠实表示的重复头会拒绝，fetch 的 GET/HEAD 正文会拒绝。浏览器 fetch 还受 CORS、禁用请求头和浏览器 Cookie 规则限制；生成的代码需要用户在对应环境自行运行，敏感 Cookie／凭据会原样包含在结果中。
 
 ### 打开终端
 

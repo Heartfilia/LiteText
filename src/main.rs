@@ -24,6 +24,8 @@ mod terminal;
 mod updater;
 mod file_open;
 mod text_conversion;
+mod web_tools;
+mod curl_plugin;
 mod windows;
 mod new_window;
 
@@ -406,6 +408,8 @@ struct LiteTextApp {
     menu_whitespace_open: bool,
     #[serde(skip)]
     menu_conversion_open: bool,
+    #[serde(skip)]
+    show_curl_menu: bool,
     #[cfg(test)]
     #[serde(skip)]
     new_window_requested: bool,
@@ -503,6 +507,7 @@ impl Default for LiteTextApp {
             menu_plugins_open: false,
             menu_whitespace_open: false,
             menu_conversion_open: false,
+            show_curl_menu: false,
             #[cfg(test)]
             new_window_requested: false,
             plugin_error: None,
@@ -702,6 +707,8 @@ enum MenuAction {
     FormatJson,
     Whitespace(whitespace::Action),
     Conversion(text_conversion::Action),
+    WebTool(web_tools::Action),
+    CurlMenu,
 }
 
 type RecoveryKey = (Option<u64>, Vec<(u64, PathBuf, String, ViewMode, u64, u64, Option<String>)>);
@@ -1545,6 +1552,7 @@ impl eframe::App for LiteTextApp {
 
         self.settings_window(ctx, pal);
         self.plugin_error_window(ctx);
+        self.curl_target_menu(ctx, pal);
         self.inspector_popup_window(ctx, pal);
         // Handle save after TextEdit so this frame's input is included.
         if cmd_s && let Some(id) = self.active_id {
@@ -1722,10 +1730,19 @@ impl LiteTextApp {
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
                         .corner_radius(8.0).inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
-                            ui.set_width(app_menu_width(ui, &["Format JSON"], pal));
-                            if app_menu_row(ui, "Format JSON", false, pal).clicked() {
-                                action = Some(MenuAction::FormatJson);
-                            }
+                            let curl_label = if self.lang == Lang::ZhCn { "curl解析  ›" } else { "Parse cURL  ›" };
+                            ui.set_width(app_menu_width(ui, &["Format JSON", "Format HTML", "Format Header", "Format Cookie", curl_label], pal));
+                            let enabled = !self.shortcuts_blocked() && self.active().is_some_and(|f| f.view == ViewMode::Text && !f.is_binary && f.draft_text.is_some());
+                            ui.add_enabled_ui(enabled, |ui| {
+                                if app_menu_row(ui, "Format JSON", false, pal).clicked() {
+                                    action = Some(MenuAction::FormatJson);
+                                }
+                                for tool in [web_tools::Action::Html, web_tools::Action::Header, web_tools::Action::Cookie] {
+                                    if app_menu_row(ui, tool.label(), false, pal).clicked() { action = Some(MenuAction::WebTool(tool)); }
+                                }
+                                app_menu_separator(ui, pal);
+                                if app_menu_row(ui, curl_label, false, pal).clicked() { action = Some(MenuAction::CurlMenu); }
+                            });
                         });
                 });
             submenu_rect = Some(submenu.response.rect);
@@ -1812,6 +1829,8 @@ impl LiteTextApp {
             }
             Some(MenuAction::Whitespace(_)) => {},
             Some(MenuAction::Conversion(operation)) => self.convert_active_text(ctx, operation),
+            Some(MenuAction::WebTool(operation)) => self.apply_web_tool(ctx, operation),
+            Some(MenuAction::CurlMenu) => self.show_curl_menu = true,
             None => {}
         }
     }
