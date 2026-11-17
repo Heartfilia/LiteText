@@ -106,7 +106,7 @@ fn load_inner(
     }
     let mut source = std::fs::File::open(path)?;
     let metadata = source.metadata()?;
-    let before = linkage::ReadStamp::of(&metadata)?;
+    let before = linkage::ReadStamp::file(&source)?;
     if linkage::ReadStamp::path(path)? != before {
         return Err(linkage::changed_during_load());
     }
@@ -136,7 +136,7 @@ fn load_inner(
     }
     drop(read_timing);
     after_read();
-    if linkage::ReadStamp::of(&source.metadata()?)? != before
+    if linkage::ReadStamp::file(&source)? != before
         || linkage::ReadStamp::path(path).ok().as_ref() != Some(&before)
         || bytes.len() as u64 != metadata.len()
     {

@@ -1,7 +1,7 @@
 # LiteText 项目文档
 
 > 轻量、快速、跨平台的文本/HEX 阅读器（Rust + egui）
-> 最后更新：2026-11-16
+> 最后更新：2026-11-17
 
 ## 项目简介
 
@@ -183,6 +183,12 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 合成大文本测试：`cargo test --locked benchmark_large_incremental_edits -- --ignored --nocapture`，测试 3/32/128MiB 内存文本的中部插入，不写用户文件
 
 ## 变更记录
+
+### 2026-11-17（Windows 加载期间路径替换检测）
+
+- 修复 Windows CI 的稳定读取回归：同长度文件在快速替换后可能保留相同时间戳，仅比较大小／时间不足以区分原文件与替代文件。
+- Windows 读取令牌增加打开句柄的卷序列号＋文件索引，使用稳定 Win32 `GetFileInformationByHandle`，不依赖 Rust nightly 元数据接口；读取句柄和路径重新打开的句柄都核对身份，身份查询失败不降级为接受旧结果。
+- 共享替换测试显式保留文件长度和修改时间，增加 Windows 专用身份回归；失败断言输出具体场景，不再以 `err().unwrap()` 掩盖原因。macOS 验证不能代替 Windows CI，目标平台结果待重跑；不改发布产物或 tag 策略。
 
 ### 2026-11-16（文件交互与失败恢复）
 

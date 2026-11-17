@@ -70,14 +70,25 @@ fn stable_loader_rejects_in_place_changes_and_path_replacement() {
             None,
             || {
                 if replace {
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
                     std::fs::rename(&path, dir.path().join("old.txt")).unwrap();
                     std::fs::write(&path, "new contents").unwrap();
+                    // Same length and modification time: identity must detect replacement.
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
                 } else {
                     std::fs::write(&path, "changed content length").unwrap();
                 }
             },
         );
-        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        let Err(error) = result else {
+            panic!("loader accepted changed file (path replacement: {replace})");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 }
 

@@ -33,10 +33,13 @@ pub(crate) struct ReadStamp {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    identity: windows_identity::Identity,
 }
 
 impl ReadStamp {
-    pub(crate) fn of(metadata: &std::fs::Metadata) -> io::Result<Self> {
+    pub(crate) fn file(file: &std::fs::File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Ok(Self {
@@ -47,10 +50,59 @@ impl ReadStamp {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(windows)]
+            identity: windows_identity::of(file)?,
         })
     }
     pub(crate) fn path(path: &Path) -> io::Result<Self> {
-        Self::of(&std::fs::metadata(path)?)
+        // Windows identity must come from an open handle, not path attributes alone.
+        Self::file(&std::fs::File::open(path)?)
+    }
+}
+
+#[cfg(windows)]
+mod windows_identity {
+    use std::{ffi::c_void, fs::File, io, os::windows::io::AsRawHandle};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Identity {
+        volume: u32,
+        index: u64,
+    }
+
+    // Win32 BY_HANDLE_FILE_INFORMATION, including all fields required by the ABI.
+    #[repr(C)]
+    struct FileInformation {
+        attributes: u32,
+        creation_time: [u32; 2],
+        access_time: [u32; 2],
+        write_time: [u32; 2],
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: *mut c_void, info: *mut FileInformation) -> i32;
+    }
+
+    pub(super) fn of(file: &File) -> io::Result<Identity> {
+        let mut info = std::mem::MaybeUninit::<FileInformation>::uninit();
+        // SAFETY: file owns a live handle for this call; info is writable, correctly
+        // aligned storage for the full Win32 structure. Only read it on success.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful call initialized the complete output structure.
+        let info = unsafe { info.assume_init() };
+        Ok(Identity {
+            volume: info.volume,
+            index: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+        })
     }
 }
 
@@ -179,6 +231,30 @@ pub(crate) struct PendingSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_stamp_uses_handle_identity_for_same_size_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let source = std::fs::File::open(&path).unwrap();
+        let before = ReadStamp::file(&source).unwrap();
+        assert_eq!(ReadStamp::path(&path).unwrap(), before);
+        std::fs::rename(&path, dir.path().join("old.txt")).unwrap();
+        std::fs::write(&path, "replaced").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified))
+            .unwrap();
+        let after = ReadStamp::path(&path).unwrap();
+        assert_eq!(before.len, after.len);
+        assert_eq!(before.modified, after.modified);
+        assert_ne!(before.identity, after.identity);
+        assert_eq!(ReadStamp::file(&source).unwrap().identity, before.identity);
+    }
 
     #[test]
     fn detached_binary_copy_is_recoverable_without_source() {
