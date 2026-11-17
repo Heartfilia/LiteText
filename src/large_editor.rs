@@ -6,6 +6,10 @@ use std::ops::Range;
 
 pub(crate) const THRESHOLD: usize = 256 * 1024;
 
+pub(crate) fn needs_windowing(text: &str) -> bool {
+    text.len() >= THRESHOLD || text.len() > LAYOUT_BYTES && text.split('\n').any(|line| line.len() > LAYOUT_BYTES)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct State {
     pub(crate) active: bool,
@@ -20,6 +24,7 @@ pub(crate) struct State {
     char_starts: Vec<usize>,
     widths: Vec<usize>,
     pub(crate) characters: usize,
+    pub(crate) newlines: crate::line_endings::Counts,
     pub(crate) utf16_units: usize,
     metrics_encoding: Option<crate::recovery::Encoding>,
     pub(crate) legacy_bytes: usize,
@@ -37,6 +42,9 @@ pub(crate) struct State {
     visible_lines: Vec<usize>,
     fingerprints: Vec<u64>,
     tool_edits: Vec<(Range<usize>, usize)>,
+    ime_selection: Option<egui::text::CCursorRange>,
+    layout_limited: bool,
+    wrap_incomplete: bool,
     #[cfg(test)]
     pub(crate) laid_out_bytes: usize,
 }
@@ -44,6 +52,8 @@ pub(crate) struct State {
 const HISTORY_BYTES: usize = 16 * 1024 * 1024;
 // A small navigation cushion, not hundreds of potentially long JSONL rows.
 const OVERSCAN_LINES: usize = 12;
+const LAYOUT_BYTES: usize = 64 * 1024;
+const LONG_LINE_COLUMNS: usize = 32 * 1024;
 
 #[derive(Clone)]
 struct Edit {
@@ -93,6 +103,60 @@ pub(crate) fn difference(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
 }
 
 impl State {
+    /// Install a worker-built document/index without rescanning the live text.
+    /// Keep the existing delta history, with precisely one new undo point.
+    pub(crate) fn commit_prepared(&mut self, text: &mut String, mut prepared: PreparedReplacement) {
+        let _timing = crate::timing::phase("batch.publish");
+        self.next_revision += 1;
+        prepared.edit.before = self.revision;
+        prepared.edit.after = self.next_revision;
+        prepared.edit.cursor_before = self.cursor;
+        prepared.state.revision = self.next_revision;
+        prepared.state.next_revision = self.next_revision;
+        prepared.state.cursor = prepared.edit.cursor_after;
+        prepared.state.undo = std::mem::take(&mut self.undo);
+        prepared.state.undo.push(prepared.edit);
+        prepared.state.trim_history();
+        *text = prepared.text;
+        *self = prepared.state;
+    }
+    pub(crate) fn prepare_loaded(&mut self, text: &str) {
+        self.index(text);
+        self.active = true;
+    }
+    /// Import native undo points once when switching renderers; retain bounded
+    /// deltas afterwards, not the native editor's full document snapshots.
+    pub(crate) fn import_history(
+        &mut self, ctx: &egui::Context, id: u64, text: &str,
+        cursor: Option<egui::text::CCursorRange>, saved: Option<&str>,
+    ) -> Option<u64> {
+        let id = egui::Id::new("draft_editor").with(id);
+        let mut native = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        *self = Self::default();
+        let mut undoer = native.undoer();
+        let mut current = (cursor.unwrap_or_default(), text.to_owned());
+        let mut points = vec![current.clone()];
+        while let Some(previous) = undoer.undo(&current).cloned() {
+            if previous.1 != current.1 { points.push(previous.clone()); }
+            current = previous;
+        }
+        points.reverse();
+        let mut working = points[0].1.clone();
+        let mut before = points[0].0;
+        let mut saved_revision = (saved == Some(working.as_str())).then_some(0);
+        for (after, next) in points.into_iter().skip(1) {
+            let (old, new) = difference(&working, &next);
+            self.record(&mut working, old, next[new].to_owned(), Some(before), Some(after));
+            if saved == Some(working.as_str()) { saved_revision = Some(self.revision); }
+            before = after;
+        }
+        self.index(text);
+        self.cursor = cursor;
+        self.tool_edits.clear(); // These edits already happened in the native editor.
+        native.clear_undoer();
+        native.store(ctx, id);
+        saved_revision
+    }
     pub(crate) fn line_start(&mut self, text: &str, line: usize) -> Option<usize> {
         self.index(text);
         self.char_starts.get(line).copied()
@@ -123,6 +187,7 @@ impl State {
             edit.cursor_after = Some(cursor);
         }
     }
+    pub(crate) fn tool_cursor(&self) -> Option<egui::text::CCursorRange> { self.cursor }
     fn index(&mut self, text: &str) {
         if self.indexed_len == Some(text.len()) {
             return;
@@ -138,6 +203,7 @@ impl State {
             chars += text[range.start..end].chars().count();
         }
         self.characters = chars;
+        self.newlines = crate::line_endings::Counts::of(text);
         self.utf16_units = text.chars().map(char::len_utf16).sum();
         self.widths = self
             .ranges
@@ -153,6 +219,112 @@ impl State {
         self.char_starts
             .partition_point(|&start| start <= character)
             .saturating_sub(1)
+    }
+
+    pub(crate) fn byte_for_char(&self, text: &str, character: usize) -> usize {
+        let line = self.line_for_char(character);
+        let byte = self.ranges.get(line).map_or(0, |range| range.start);
+        byte + crate::text_tools::byte_at(&text[byte..], character.saturating_sub(self.char_starts.get(line).copied().unwrap_or(0)))
+    }
+
+    fn global_selection_input(&mut self, text: &mut String, ctx: &egui::Context) -> bool {
+        let mut changed = false;
+        let events = ctx.input_mut(|i| std::mem::take(&mut i.events));
+        let mut retained = Vec::new();
+        for event in events {
+            if matches!(&event, egui::Event::Ime(egui::ImeEvent::Disabled)) { self.ime_selection = None; }
+            if matches!(&event, egui::Event::Key { key: egui::Key::A, pressed: true, modifiers, .. } if modifiers.matches_exact(egui::Modifiers::COMMAND)) {
+                self.cursor = Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.characters)));
+                continue;
+            }
+            if matches!(&event, egui::Event::Ime(egui::ImeEvent::Commit(_))) && self.ime_selection.is_some() {
+                self.cursor = self.ime_selection.take();
+            }
+            let cursor = self.cursor.unwrap_or_default();
+            if self.layout_limited
+                && let egui::Event::Key { key: egui::Key::Home | egui::Key::End, pressed: true, modifiers, .. } = &event {
+                let line = self.line_for_char(cursor.primary.index);
+                let primary = egui::text::CCursor::new(self.char_starts[line] + if matches!(&event, egui::Event::Key { key: egui::Key::End, .. }) { text[self.ranges[line].clone()].chars().count() } else { 0 });
+                self.cursor = Some(egui::text::CCursorRange::two(if modifiers.shift { cursor.secondary } else { primary }, primary));
+                self.invalidate_window();
+                continue;
+            }
+            // A bounded local selection remains native. Wider selections are
+            // document state, never a request to lay out all selected text.
+            if cursor.primary.index.abs_diff(cursor.secondary.index) < 4096
+                && !self.layout_limited {
+                retained.push(event);
+                continue;
+            }
+            let mut first_character = cursor.primary.index.min(cursor.secondary.index);
+            let mut last_character = cursor.primary.index.max(cursor.secondary.index);
+            let empty = first_character == last_character;
+            if empty && self.layout_limited && matches!(&event, egui::Event::Copy | egui::Event::Cut) {
+                let line = self.line_for_char(first_character);
+                let start = self.ranges[line].start;
+                let end = self.ranges.get(line + 1).map_or(text.len(), |range| range.start);
+                ctx.copy_text(text[start..end].to_owned());
+                if matches!(event, egui::Event::Cut) {
+                    let after = egui::text::CCursorRange::one(egui::text::CCursor::new(self.char_starts[line]));
+                    self.record(text, start..end, String::new(), Some(cursor), Some(after));
+                    self.cursor = Some(after);
+                    changed = true;
+                }
+                continue;
+            }
+            if empty && let egui::Event::Key { key, pressed: true, .. } = &event {
+                match key {
+                    egui::Key::Backspace => first_character = first_character.saturating_sub(1),
+                    egui::Key::Delete => last_character = (last_character + 1).min(self.characters),
+                    _ => {}
+                }
+            }
+            let start = self.byte_for_char(text, first_character);
+            let end = self.byte_for_char(text, last_character);
+            let inserted = match &event {
+                egui::Event::Copy => { ctx.copy_text(text[start..end].to_owned()); continue; }
+                egui::Event::Cut => { ctx.copy_text(text[start..end].to_owned()); Some(String::new()) }
+                egui::Event::Text(value) | egui::Event::Paste(value) => Some(value.clone()),
+                egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
+                    self.ime_selection = Some(cursor);
+                    continue;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(value)) => Some(value.clone()),
+                egui::Event::Ime(egui::ImeEvent::Disabled) => { self.ime_selection = None; continue; }
+                egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete, pressed: true, .. } => Some(String::new()),
+                egui::Event::Key { key, pressed: true, modifiers, .. }
+                    if matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Home | egui::Key::End | egui::Key::PageUp | egui::Key::PageDown | egui::Key::Escape) => {
+                    let mut primary = cursor.primary.index;
+                    let line = self.line_for_char(primary);
+                    let line_start = self.char_starts[line];
+                    let line_end = line_start + text[self.ranges[line].clone()].chars().count();
+                    primary = match key {
+                        egui::Key::ArrowLeft => if modifiers.shift || empty { primary.saturating_sub(1) } else { cursor.primary.index.min(cursor.secondary.index) },
+                        egui::Key::ArrowRight => if modifiers.shift || empty { (primary + 1).min(self.characters) } else { cursor.primary.index.max(cursor.secondary.index) },
+                        egui::Key::Home => line_start,
+                        egui::Key::End => line_end,
+                        egui::Key::Escape => primary,
+                        _ => {
+                            let step = if matches!(key, egui::Key::PageUp | egui::Key::PageDown) { 20 } else { 1 };
+                            let target = if matches!(key, egui::Key::ArrowUp | egui::Key::PageUp) { line.saturating_sub(step) } else { (line + step).min(self.ranges.len() - 1) };
+                            self.char_starts[target] + (primary - line_start).min(text[self.ranges[target].clone()].chars().count())
+                        }
+                    };
+                    self.cursor = Some(egui::text::CCursorRange::two(if modifiers.shift && *key != egui::Key::Escape { cursor.secondary } else { egui::text::CCursor::new(primary) }, egui::text::CCursor::new(primary)));
+                    self.invalidate_window();
+                    continue;
+                }
+                _ => None,
+            };
+            if let Some(inserted) = inserted {
+                let after = egui::text::CCursorRange::one(egui::text::CCursor::new(first_character + inserted.chars().count()));
+                self.record(text, start..end, inserted, Some(cursor), Some(after));
+                self.cursor = Some(after);
+                changed = true;
+            } else { retained.push(event); }
+        }
+        ctx.input_mut(|i| i.events = retained);
+        changed
     }
 
     /// Rescan touched logical lines only; shift the compact suffix metadata, not its text.
@@ -184,6 +356,17 @@ impl State {
             self.legacy_bytes = self.legacy_bytes + added - removed;
             self.legacy_invalid = self.legacy_invalid + added_invalid - removed_invalid;
         }
+        // Include one byte on each side to account for edits splitting/joining CRLF.
+        let local_start = range.start.saturating_sub(1);
+        let local_end = (range.end + 1).min(text.len());
+        // Counts only inspect bytes; the context need not be a UTF-8 boundary.
+        let previous = local_start.checked_sub(1).map(|at| text.as_bytes()[at]);
+        let old_counts = crate::line_endings::Counts::from_bytes(text.as_bytes()[local_start..local_end].iter().copied(), previous);
+        let new_counts = crate::line_endings::Counts::from_bytes(
+            text.as_bytes()[local_start..range.start].iter().copied()
+                .chain(replacement.bytes()).chain(text.as_bytes()[range.end..local_end].iter().copied()), previous);
+        self.newlines.lf = self.newlines.lf + new_counts.lf - old_counts.lf;
+        self.newlines.crlf = self.newlines.crlf + new_counts.crlf - old_counts.crlf;
         text.replace_range(range, replacement);
         let end = old_end.saturating_add_signed(byte_delta);
         let mut ranges = editor::line_ranges(&text[start..end]);
@@ -260,6 +443,10 @@ impl State {
         self.revision = edit.after;
         self.redo.clear();
         self.undo.push(edit);
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
         let mut size: usize = self
             .undo
             .iter()
@@ -309,6 +496,10 @@ impl State {
                 encoding.map_or((0, 0), |e| e.legacy_metrics(text));
         }
     }
+    pub(crate) fn install_encoding_metrics(&mut self, encoding: crate::recovery::Encoding, metrics: (usize, usize)) {
+        self.metrics_encoding = encoding.is_legacy().then_some(encoding);
+        (self.legacy_bytes, self.legacy_invalid) = metrics;
+    }
 
     fn clear_lines(&mut self, text: &mut String, selection: (usize, usize)) {
         let range = self.ranges[selection.0].start..self.ranges[selection.1].end;
@@ -348,11 +539,19 @@ impl State {
             self.visual_rows = vec![0; self.ranges.len()];
         }
         self.visual_width = Some(key.0);
+        let started = std::time::Instant::now();
+        let _timing = crate::timing::phase("layout.wrap_slice");
+        let mut deferred = false;
         let mut rows = 0;
         self.visual_starts.clear();
         for (i, range) in self.ranges.iter().enumerate() {
             self.visual_starts.push(rows);
             if self.visual_rows[i] == 0 {
+                if wrap && started.elapsed() >= std::time::Duration::from_millis(3) {
+                    deferred = true;
+                    rows += 1; // Placeholder, never cached as a completed layout.
+                    continue;
+                }
                 self.visual_rows[i] = if wrap {
                     let mut job = egui::text::LayoutJob::simple(
                         text[range.clone()].to_owned(),
@@ -370,7 +569,9 @@ impl State {
         }
         self.visual_starts.push(rows);
         self.fold_generation = None;
-        self.wrap_key = Some(key);
+        self.wrap_incomplete = deferred;
+        self.wrap_key = (!deferred).then_some(key);
+        if deferred { ui.ctx().request_repaint_after(std::time::Duration::from_millis(16)); }
     }
 
     fn fold_index(&mut self, folds: &crate::json_plugin::Folds) {
@@ -384,12 +585,36 @@ impl State {
             self.visual_starts.push(rows);
             if !folds.hidden(line) {
                 self.visible_lines.push(line);
-                rows += height;
+                rows += (*height).max(1);
             }
         }
         self.visual_starts.push(rows);
         self.fold_generation = Some(folds.generation);
     }
+}
+
+pub(crate) struct PreparedReplacement {
+    text: String,
+    state: State,
+    edit: Edit,
+}
+
+pub(crate) fn prepare_replacement(
+    source: &str, range: Range<usize>, inserted: String,
+    cursor: egui::text::CCursorRange, encoding: crate::recovery::Encoding,
+) -> PreparedReplacement {
+    let _timing = crate::timing::phase("batch.output_and_index");
+    let mut text = String::with_capacity(source.len() - range.len() + inserted.len());
+    text.push_str(&source[..range.start]);
+    text.push_str(&inserted);
+    text.push_str(&source[range.end..]);
+    let mut state = State::default();
+    state.prepare_loaded(&text);
+    state.set_encoding(&text, encoding);
+    PreparedReplacement { text, state, edit: Edit {
+        start: range.start, removed: source[range].to_owned(), inserted,
+        before: 0, after: 0, cursor_before: None, cursor_after: Some(cursor),
+    } }
 }
 
 fn shift_cursor(cursor: egui::text::CCursorRange, delta: isize) -> egui::text::CCursorRange {
@@ -410,9 +635,9 @@ pub(crate) fn show(
     focus: bool,
     t: &Strings,
 ) -> bool {
-    let bounds = ui.available_rect_before_wrap();
     state.large.active = true;
     let id = egui::Id::new("large_editor").with(file_id);
+    if ui.is_enabled() { state.line_ending.remap_enter(ui.ctx(), id, &mut state.composing, text, state.large.cursor); }
     state
         .folds
         .prepare_input(ui, state.pending_selection.is_some(), id);
@@ -435,13 +660,23 @@ pub(crate) fn show(
     let number_probe = ui.painter().layout_no_wrap("0000000000".to_owned(), gutter_font.clone(), pal.text_faint);
     let number_digit_w = number_probe.rows[0].glyphs[1].pos.x - number_probe.rows[0].glyphs[0].pos.x;
     state.large.index(text);
+    let long_lines = state.large.max_columns > LONG_LINE_COLUMNS;
+    if long_lines { tools.wrap = false; }
+    if long_lines || state.large.wrap_incomplete {
+        let zh = t.encoding_binary == "二进制";
+        ui.add(egui::Label::new(egui::RichText::new(if long_lines {
+            if zh { "长行保护：暂停自动换行，按光标附近分段显示；全文搜索／复制／保存不截断。使用首尾导航或查找定位。" }
+            else { "Long-line protection: wrap paused; display is chunked near the caret. Search, copy and save retain all text. Use document navigation or Find." }
+        } else if zh { "正在分帧计算自动换行…" } else { "Preparing wrapped layout across frames…" }).small().color(pal.text_faint)).wrap());
+    }
+    let bounds = ui.available_rect_before_wrap();
     state
         .changes
         .update(&state.large.fingerprints, state.large.revision);
     let count = state.large.ranges.len();
     let number_w = editor::gutter_number_width(count, number_digit_w, fold_w);
     let wrap_width =
-        (bounds.width() - number_w - fold_w - 38.0).max(24.0);
+        (bounds.width() - number_w - fold_w - 38.0 - if tools.whitespace { 12.0 } else { 0.0 }).max(24.0);
     state
         .large
         .visual_index(ui, text, &font, pal, wrap_width, tools.wrap);
@@ -456,7 +691,6 @@ pub(crate) fn show(
     );
     ui.painter()
         .rect_filled(gutter, 0.0, gutter_bg);
-    let id = egui::Id::new("large_editor").with(file_id);
     let mut changed = false;
     // Document-level undo remains valid even after the visible text window moves.
     if ui.is_enabled() && ui.memory(|m| m.has_focus(id)) {
@@ -482,6 +716,40 @@ pub(crate) fn show(
             .visual_index(ui, text, &font, pal, wrap_width, tools.wrap);
         state.large.fold_index(&folds);
     }
+    // Whole-document navigation must not be delegated to the viewport fragment.
+    if ui.is_enabled() && ui.memory(|m| m.has_focus(id)) {
+        let mut moves = Vec::new();
+        ui.input_mut(|i| i.events.retain(|event| {
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                let end = match key {
+                    egui::Key::Home if modifiers.ctrl && !modifiers.alt => Some(false),
+                    egui::Key::End if modifiers.ctrl && !modifiers.alt => Some(true),
+                    egui::Key::ArrowUp if modifiers.command && !modifiers.alt => Some(false),
+                    egui::Key::ArrowDown if modifiers.command && !modifiers.alt => Some(true),
+                    _ => None,
+                };
+                if let Some(end) = end { moves.push((end, modifiers.shift)); return false; }
+            }
+            true
+        }));
+        for (end, extend) in moves {
+            let primary = egui::text::CCursor::new(if end { state.large.characters } else { 0 });
+            let secondary = if extend { state.large.cursor.unwrap_or_default().secondary } else { primary };
+            let cursor = egui::text::CCursorRange::two(secondary, primary);
+            state.large.cursor = Some(cursor);
+            state.pending_selection = Some(secondary.index..primary.index);
+            state.selection = None;
+            state.folds.expand_all();
+            ui.ctx().request_repaint();
+        }
+        state.large.fold_index(&state.folds);
+    }
+    let folds = state.folds.clone();
+    if ui.is_enabled() && ui.memory(|m| m.has_focus(id)) {
+        changed |= state.large.global_selection_input(text, ui.ctx());
+        state.large.visual_index(ui, text, &font, pal, wrap_width, tools.wrap);
+        state.large.fold_index(&folds);
+    }
     let reveal = state.pending_selection.is_some();
     if let Some(range) = state.pending_selection.take() {
         state.large.cursor = Some(egui::text::CCursorRange::two(
@@ -489,7 +757,7 @@ pub(crate) fn show(
             egui::text::CCursor::new(range.end),
         ));
         state.large.invalidate_window();
-        let line = state.large.line_for_char(range.start);
+        let line = state.large.line_for_char(range.end);
         let scroll_id = ui.make_persistent_id(egui::Id::new(("draft_scroll", file_id)));
         let mut scroll = egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
         scroll.offset.y =
@@ -539,15 +807,6 @@ pub(crate) fn show(
             });
             let pointer_down = ui.input(|i| i.pointer.primary_down());
             let focused = ui.is_enabled() && ui.memory(|m| m.has_focus(id));
-            let select_all = focused
-                && ui.input(|i| {
-                    i.events.iter().any(|event| {
-                        matches!(event,
-                            egui::Event::Key { key: egui::Key::A, pressed: true, modifiers, .. }
-                                if modifiers.matches_exact(egui::Modifiers::COMMAND)
-                        )
-                    })
-                });
             let mut window = desired;
             let cached = &state.large.window_lines;
             if cached.start <= first.saturating_sub(2)
@@ -558,9 +817,6 @@ pub(crate) fn show(
                 // viewport nears its edge, instead of re-highlighting each row.
                 window = cached.clone();
             }
-            if select_all {
-                window = 0..count;
-            }
             // Keep a focused off-screen cursor valid when typing after scrolling away.
             if focused
                 && (keyboard_input || pointer_down)
@@ -570,14 +826,12 @@ pub(crate) fn show(
                 if keyboard_input && (line < window.start || line >= window.end) {
                     window =
                         line.saturating_sub(OVERSCAN_LINES)..(line + OVERSCAN_LINES + 1).min(count);
-                } else if pointer_down {
-                    window.start = window.start.min(line);
-                    window.end = window.end.max((line + 1).min(count));
                 }
             }
             if focused
                 && let Some(cursor) = state.large.cursor
                 && cursor.primary.index != cursor.secondary.index
+                && cursor.primary.index.abs_diff(cursor.secondary.index) < 4096
             {
                 // Preserve explicit selections across viewport changes, including Select All + Copy.
                 for cursor in [cursor.primary, cursor.secondary] {
@@ -586,30 +840,53 @@ pub(crate) fn show(
                     window.end = window.end.max((line + 1).min(count));
                 }
             }
-            let start = state.large.ranges[window.start].start;
+            let mut start = state.large.ranges[window.start].start;
             // Exclude the boundary newline; edits replace exactly this byte range.
-            let end = state.large.ranges[window.end - 1].end;
+            let mut end = state.large.ranges[window.end - 1].end;
+            if long_lines && end - start > LAYOUT_BYTES {
+                let primary = state.large.cursor.unwrap_or_default().primary.index;
+                let caret = state.large.byte_for_char(text, primary);
+                let target = if caret >= start && caret <= end { caret } else { start };
+                // Keep at least a half-page before the caret; chunk boundaries
+                // are UTF-8 safe and do not become document/newline boundaries.
+                start = target.saturating_sub(LAYOUT_BYTES / 2).max(start);
+                while !text.is_char_boundary(start) { start += 1; }
+                end = (start + LAYOUT_BYTES).min(end);
+                while !text.is_char_boundary(end) { end -= 1; }
+                if end == caret && caret > start {
+                    start = end.saturating_sub(LAYOUT_BYTES);
+                    while !text.is_char_boundary(start) { start += 1; }
+                }
+                window.start = state.large.ranges.partition_point(|range| range.start <= start).saturating_sub(1);
+                window.end = (state.large.ranges.partition_point(|range| range.start < end)).max(window.start + 1);
+            }
             let bytes = start..end;
-            if state.large.window_lines != window || state.large.window_bytes != bytes || changed {
+            state.large.layout_limited = start != state.large.ranges[window.start].start || end != state.large.ranges[window.end - 1].end;
+            let wide_selection = state.large.cursor.is_some_and(|cursor| cursor.primary.index.abs_diff(cursor.secondary.index) >= 4096 || state.large.layout_limited && cursor.primary.index != cursor.secondary.index);
+            if state.large.window_lines != window || state.large.window_bytes != bytes || changed || wide_selection {
                 state.large.window = text[bytes.clone()].to_owned();
                 state.large.window_lines = window.clone();
                 state.large.window_bytes = bytes.clone();
-                let offset = state.large.char_starts[window.start];
+                let offset = state.large.char_starts[window.start] + text[state.large.ranges[window.start].start..start].chars().count();
                 state.large.char_start = offset;
                 let mut edit_state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
                 if let Some(cursor) = state.large.cursor {
-                    edit_state
-                        .cursor
-                        .set_char_range(Some(shift_cursor(cursor, -(offset as isize))));
+                    let mut local = shift_cursor(cursor, -(offset as isize));
+                    let length = state.large.window.chars().count();
+                    local.primary.index = local.primary.index.min(length);
+                    local.secondary.index = local.secondary.index.min(length);
+                    edit_state.cursor.set_char_range(Some(local));
                 }
                 edit_state.clear_undoer();
                 edit_state.store(ui.ctx(), id);
             }
             let char_start = state.large.char_start;
-            let content_w = if tools.wrap {
+            let content_w = if long_lines {
+                (columns(&state.large.window) as f32 * digit_w + gutter_w + 20.0).max(bounds.width() - 16.0)
+            } else if tools.wrap {
                 wrap_width + gutter_w + 16.0
             } else {
-                (state.large.max_columns as f32 * digit_w + gutter_w + 20.0)
+                (state.large.max_columns as f32 * digit_w + gutter_w + if tools.whitespace { 32.0 } else { 20.0 })
                     .max(bounds.width() - 16.0)
             };
             let rect = egui::Rect::from_min_size(
@@ -663,6 +940,7 @@ pub(crate) fn show(
                 folds.layout(ui.painter().layout_job(job), window.start)
             };
             let cursor_before = state.large.cursor;
+            let pointer_extends = ui.input(|input| input.modifiers.shift || input.pointer.primary_down() && !input.pointer.any_pressed());
             let previous =
                 egui::TextEdit::load_state(ui.ctx(), id).and_then(|edit| edit.cursor.char_range());
             let output = ui
@@ -698,18 +976,22 @@ pub(crate) fn show(
                 output.response.request_focus();
             }
             editor::reveal_cursor(ui, &output, previous, gutter_w, reveal);
-            if tools.whitespace {
-                crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal);
+            if tools.whitespace && !state.large.layout_limited {
+                crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal, &text[bytes.end..]);
             }
             folds.paint_summaries(ui, &output.galley, output.galley_pos, window.start, pal);
             if output.response.has_focus()
                 && (output.response.clicked()
                     || output.response.changed()
-                    || keyboard_input
-                    || pointer_down)
+                    || pointer_down
+                    || (!wide_selection && keyboard_input))
                 && let Some(cursor) = output.state.cursor.char_range()
             {
-                state.large.cursor = Some(shift_cursor(cursor, char_start as isize));
+                let mut global = shift_cursor(cursor, char_start as isize);
+                if pointer_extends && let Some(before) = cursor_before {
+                    global.secondary = before.secondary;
+                }
+                state.large.cursor = Some(global);
             }
             #[cfg(test)]
             {
@@ -943,6 +1225,47 @@ pub(crate) fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sliced_wrapping_eventually_has_exact_rows_and_never_caches_placeholders() {
+        let ctx = egui::Context::default();
+        let text: String = (0..2000).map(|line| format!("{line} {}\n", "value ".repeat(line % 24 + 1))).collect();
+        let mut state = State::default();
+        state.prepare_loaded(&text);
+        for _ in 0..400 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| state.visual_index(ui, &text, &FontId::monospace(13.5), &crate::DARK, 250.0, true));
+            });
+            if !state.wrap_incomplete { break; }
+            assert!(state.wrap_key.is_none());
+        }
+        assert!(!state.wrap_incomplete);
+        assert!(state.visual_rows.iter().all(|rows| *rows > 0));
+        assert_eq!(state.visual_starts.last().copied(), Some(state.visual_rows.iter().sum()));
+        assert!(state.visual_rows.iter().any(|rows| *rows > 1));
+    }
+
+    #[test]
+    fn incremental_newline_counts_match_full_scan_through_crlf_boundary_edits_and_undo() {
+        for source in ["\r\n\n中🙂\r\nend", "\n\r\nx\n", "", "abc\r"] {
+            for start in 0..=source.len() {
+                if !source.is_char_boundary(start) { continue; }
+                for end in start..=source.len() {
+                    if !source.is_char_boundary(end) { continue; }
+                    for inserted in ["", "\r", "\n", "\r\n", "中🙂\n"] {
+                        let mut text = source.to_owned();
+                        let mut state = State::default();
+                        state.index(&text);
+                        state.record(&mut text, start..end, inserted.into(), None, None);
+                        assert_eq!(state.newlines, crate::line_endings::Counts::of(&text), "{source:?} {start}..{end} {inserted:?}");
+                        state.undo(&mut text, false);
+                        assert_eq!(text, source);
+                        assert_eq!(state.newlines, crate::line_endings::Counts::of(source));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn zoom_rebuilds_wrapped_visual_index_without_changing_document_or_cursor() {

@@ -159,6 +159,8 @@ pub(crate) struct EditorState {
     pub(crate) changes: crate::changes::Changes,
     pub(crate) folds: crate::json_plugin::Folds,
     pub(crate) syntax_cache: std::sync::Arc<std::sync::Mutex<crate::workspace_theme::SyntaxCache>>,
+    pub(crate) line_ending: crate::line_endings::LineEnding,
+    pub(crate) composing: bool,
 }
 
 impl EditorState {
@@ -275,11 +277,12 @@ pub(crate) fn show(
     focus: bool,
     t: &Strings,
 ) -> bool {
-    if text.len() >= crate::large_editor::THRESHOLD || state.large.active {
+    if crate::large_editor::needs_windowing(text) || state.large.active {
         return crate::large_editor::show(ui, text, state, file_id, pal, focus, t);
     }
     let bounds = ui.available_rect_before_wrap();
     let editor_id = egui::Id::new("draft_editor").with(file_id);
+    if ui.is_enabled() { state.line_ending.remap_enter(ui.ctx(), editor_id, &mut state.composing, text, state.cursor); }
     state
         .folds
         .prepare_input(ui, state.pending_selection.is_some(), editor_id);
@@ -348,7 +351,7 @@ pub(crate) fn show(
                         text,
                         font.clone(),
                         pal,
-                        if tools.wrap { width } else { f32::INFINITY },
+                        if tools.wrap { (width - if tools.whitespace { 12.0 } else { 0.0 }).max(24.0) } else { f32::INFINITY },
                         &current_tools,
                     )),
                     0,
@@ -394,7 +397,7 @@ pub(crate) fn show(
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
             }
-            ui.set_min_width(gutter_w + EDITOR_LEFT_PADDING + output.galley.size().x + 12.0);
+            ui.set_min_width(gutter_w + EDITOR_LEFT_PADDING + output.galley.size().x + if tools.whitespace { 24.0 } else { 12.0 });
             if focus {
                 output.response.request_focus();
             }
@@ -409,7 +412,7 @@ pub(crate) fn show(
             state.tools.handle_marker(ui, &output, text, 0);
             reveal_cursor(ui, &output, previous, gutter_w, reveal);
             if tools.whitespace {
-                crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal);
+                crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal, "");
             }
             folds.paint_summaries(ui, &output.galley, output.galley_pos, 0, pal);
             let mut logical = 0;

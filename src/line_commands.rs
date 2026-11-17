@@ -93,7 +93,7 @@ impl CommentStyle {
     }
 }
 
-fn line_span(text: &str, selection: Range<usize>) -> Range<usize> {
+pub(crate) fn line_span(text: &str, selection: Range<usize>) -> Range<usize> {
     let start = text[..selection.start].rfind('\n').map_or(0, |i| i + 1);
     let last = if selection.end > selection.start
         && text.as_bytes().get(selection.end - 1) == Some(&b'\n')
@@ -122,8 +122,11 @@ pub(crate) fn selected_bytes(file: &LoadedFile, text: &str) -> Range<usize> {
         start..end
     } else {
         let cursor = file.editor_state.cursor.unwrap_or_default();
-        text_tools::byte_at(text, cursor.primary.index.min(cursor.secondary.index))
-            ..text_tools::byte_at(text, cursor.primary.index.max(cursor.secondary.index))
+        let byte = |character| if file.editor_state.large.active && file.editor_state.large.indexed_len == Some(text.len()) {
+            file.editor_state.large.byte_for_char(text, character)
+        } else { text_tools::byte_at(text, character) };
+        byte(cursor.primary.index.min(cursor.secondary.index))
+            ..byte(cursor.primary.index.max(cursor.secondary.index))
     }
 }
 
@@ -267,6 +270,27 @@ pub(crate) fn commit_edits(
     edits: Vec<(Range<usize>, String)>,
     selected: Option<Range<usize>>,
 ) {
+    if ctx.data(|data| data.get_temp::<std::sync::Arc<std::sync::Mutex<Option<PendingBatch>>>>(egui::Id::new("prepared_line_batch")).is_some()) { return; }
+    if file.draft_text.as_ref().is_some_and(|text| text.len() >= 2 * 1024 * 1024) && edits.len() > 1000 {
+        // Stored in Context until the application polls it later in this frame.
+        // The worker never owns the live document or commits a result itself.
+        let source = file.draft_text.clone().unwrap();
+        let reversed = file.editor_state.cursor.is_some_and(|cursor| cursor.primary.index < cursor.secondary.index);
+        let revision = (file.content_revision, file.editor_state.large.revision);
+        let encoding = file.encoding;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_edits = edits.clone();
+        std::thread::spawn(move || {
+            let mut prepared = prepare_batch(&source, &worker_edits, selected, reversed);
+            if let Some(prepared) = &mut prepared {
+                prepared.document = Some(crate::large_editor::prepare_replacement(&source, prepared.range.clone(), std::mem::take(&mut prepared.inserted), prepared.cursor, encoding));
+            }
+            let _ = sender.send(prepared);
+        });
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("prepared_line_batch"), std::sync::Arc::new(std::sync::Mutex::new(Some(PendingBatch { id: file.id, revision, edits, receiver, line_ending: None })))));
+        ctx.request_repaint();
+        return;
+    }
     let text = file.draft_text.as_deref().expect("editable text");
     if edits.is_empty() {
         return;
@@ -277,10 +301,33 @@ pub(crate) fn commit_edits(
     {
         return;
     }
-    let range = edits.first().unwrap().0.start..edits.last().unwrap().0.end;
-    let mut inserted = String::new();
+    let reversed = file.editor_state.cursor.is_some_and(|cursor| cursor.primary.index < cursor.secondary.index);
+    let Some(prepared) = prepare_batch(text, &edits, selected, reversed) else { return; };
+    apply_batch(file, ctx, edits, prepared);
+}
+
+struct PreparedBatch {
+    range: Range<usize>,
+    inserted: String,
+    cursor: egui::text::CCursorRange,
+    document: Option<crate::large_editor::PreparedReplacement>,
+}
+
+pub(crate) struct PendingBatch {
+    id: u64,
+    revision: (u64, u64),
+    edits: Vec<(Range<usize>, String)>,
+    receiver: std::sync::mpsc::Receiver<Option<PreparedBatch>>,
+    pub(crate) line_ending: Option<crate::line_endings::LineEnding>,
+}
+
+fn prepare_batch(text: &str, edits: &[(Range<usize>, String)], selected: Option<Range<usize>>, reversed: bool) -> Option<PreparedBatch> {
+    let range = edits.first()?.0.start..edits.last()?.0.end;
+    let removed: usize = edits.iter().map(|(range, _)| range.len()).sum();
+    let added: usize = edits.iter().map(|(_, value)| value.len()).sum();
+    let mut inserted = String::with_capacity(range.len() - removed + added);
     let mut at = range.start;
-    for (edit, value) in &edits {
+    for (edit, value) in edits {
         inserted.push_str(&text[at..edit.start]);
         inserted.push_str(value);
         at = edit.end;
@@ -288,7 +335,7 @@ pub(crate) fn commit_edits(
     inserted.push_str(&text[at..range.end]);
     let map = |position: usize| {
         let mut delta = 0isize;
-        for (edit, value) in &edits {
+        for (edit, value) in edits {
             if position < edit.start {
                 break;
             }
@@ -320,10 +367,16 @@ pub(crate) fn commit_edits(
     };
     let start = as_char(selection.start);
     let end = as_char(selection.end);
+    let (anchor, primary) = if reversed { (end, start) } else { (start, end) };
     let cursor = egui::text::CCursorRange::two(
-        egui::text::CCursor::new(start),
-        egui::text::CCursor::new(end),
+        egui::text::CCursor::new(anchor),
+        egui::text::CCursor::new(primary),
     );
+    Some(PreparedBatch { range, inserted, cursor, document: None })
+}
+
+fn apply_batch(file: &mut LoadedFile, ctx: &egui::Context, edits: Vec<(Range<usize>, String)>, prepared: PreparedBatch) {
+    let PreparedBatch { range, inserted, cursor, document } = prepared;
     // Preserve marks between individual line prefixes, not just outside the batch.
     for (edit, value) in edits.iter().rev() {
         file.editor_state
@@ -331,10 +384,61 @@ pub(crate) fn commit_edits(
             .apply_edit(edit.clone(), value.len());
     }
     let marks = std::mem::take(&mut file.editor_state.tools.marks);
-    text_tools::replace_range_with_cursor(file, ctx, range, inserted, Some(cursor));
+    if let Some(document) = document {
+        if !file.editor_state.large.active { file.activate_large(ctx); }
+        file.editor_state.large.commit_prepared(file.draft_text.as_mut().unwrap(), document);
+        file.character_count = file.editor_state.large.characters;
+        file.bytes.clear();
+        file.lines.clear();
+        file.bytes_dirty = true;
+        file.editor_state.selection = None;
+        file.editor_state.tools.apply_edit(range, 0); // Invalidate search; marks are restored below.
+    } else {
+        text_tools::replace_range_with_cursor(file, ctx, range, inserted, Some(cursor));
+    }
     file.editor_state.tools.marks = marks;
-    file.editor_state.pending_selection = Some(start..end);
+    file.editor_state.pending_selection = Some(cursor.secondary.index..cursor.primary.index);
     file.editor_state.cursor = Some(cursor);
+}
+
+impl crate::LiteTextApp {
+    pub(crate) fn poll_batch(&mut self, ctx: &egui::Context) {
+        type Handoff = std::sync::Arc<std::sync::Mutex<Option<PendingBatch>>>;
+        if crate::new_window::finished() {
+            self.pending_batch = None;
+            ctx.data_mut(|data| data.remove_temp::<Handoff>(egui::Id::new("prepared_line_batch")));
+            return;
+        }
+        if let Some(handoff) = ctx.data_mut(|data| data.remove_temp::<Handoff>(egui::Id::new("prepared_line_batch"))) {
+            self.pending_batch = handoff.lock().unwrap().take();
+        }
+        let Some(job) = self.pending_batch.take() else { return; };
+        match job.receiver.try_recv() {
+            Ok(Some(prepared)) => {
+                if let Some(file) = self.files.iter_mut().find(|file| file.id == job.id && (file.content_revision, file.editor_state.large.revision) == job.revision) {
+                    apply_batch(file, ctx, job.edits, prepared);
+                    if let Some(ending) = job.line_ending { file.line_ending = ending; file.content_revision += 1; }
+                    if self.active_id == Some(file.id) {
+                        file.editor_state.focus_requested = true;
+                        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(if file.editor_state.large.active { "large_editor" } else { "draft_editor" }).with(file.id)));
+                    }
+                }
+            }
+            Ok(None) => {},
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.pending_batch = Some(job),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.io_error = Some("Text processing worker stopped; working copy retained".into()),
+        }
+        if self.pending_batch.is_some() {
+            let mut cancel = false;
+            egui::Window::new(if self.lang == crate::Lang::ZhCn { "正在处理文本" } else { "Processing text" }).id(egui::Id::new("pending_batch"))
+                .collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.spinner();
+                    cancel = ui.button(crate::tr(self.lang).cancel).clicked();
+                });
+            if cancel { self.pending_batch = None; }
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+    }
 }
 
 #[cfg(test)]

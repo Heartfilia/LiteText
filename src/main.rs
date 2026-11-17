@@ -29,6 +29,15 @@ mod curl_plugin;
 mod windows;
 mod new_window;
 mod preferences;
+mod line_endings;
+#[cfg(test)]
+mod editor_regressions;
+mod file_actions;
+mod indentation;
+mod background_io;
+mod timing;
+mod encoding_ui;
+mod reload;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
@@ -471,6 +480,23 @@ struct LiteTextApp {
     #[serde(skip)]
     io_error: Option<String>,
     #[serde(skip)]
+    open_errors: Vec<file_actions::OpenError>,
+    #[serde(skip)]
+    background_io: background_io::State,
+    #[serde(skip)]
+    pending_batch: Option<line_commands::PendingBatch>,
+    #[serde(skip)]
+    pending_search: Option<text_tools::background_search::PendingSearch>,
+    #[serde(skip)]
+    encoding_task: Option<encoding_ui::Task>,
+    #[serde(skip)]
+    reload_task: Option<reload::Task>,
+    #[serde(skip)]
+    save_failure: Option<file_actions::SaveFailure>,
+    #[cfg(test)]
+    #[serde(skip)]
+    save_as_target_override: Option<Option<PathBuf>>,
+    #[serde(skip)]
     pending_close: Option<TabAction>,
     #[serde(skip)]
     pending_window_close: bool,
@@ -546,6 +572,15 @@ impl Default for LiteTextApp {
             recovery_stamp: None,
             recovery_versions: Default::default(),
             io_error: None,
+            open_errors: Vec::new(),
+            background_io: Default::default(),
+            pending_batch: None,
+            pending_search: None,
+            encoding_task: None,
+            reload_task: None,
+            save_failure: None,
+            #[cfg(test)]
+            save_as_target_override: None,
             pending_close: None,
             pending_window_close: false,
             window_close_ready: false,
@@ -598,9 +633,32 @@ struct LoadedFile {
     source_path: Option<PathBuf>,
     #[serde(skip)]
     disk: linkage::DiskState,
+    #[serde(default)]
+    line_ending: line_endings::LineEnding,
+    #[serde(skip)]
+    saved_generation: u64,
 }
 
 impl LoadedFile {
+    fn newline_counts(&self) -> line_endings::Counts {
+        if self.editor_state.large.active && self.editor_state.large.indexed_len.is_some() { self.editor_state.large.newlines }
+        else { self.draft_text.as_deref().map_or(line_endings::Counts::default(), line_endings::Counts::of) }
+    }
+
+    fn activate_large(&mut self, ctx: &egui::Context) {
+        if self.editor_state.large.active { return; }
+        let text = self.draft_text.as_deref().expect("text document");
+        let saved = self.saved_encoding.decode_as(&self.saved_bytes);
+        self.saved_large_revision = self.editor_state.large.import_history(
+            ctx, self.id, text, self.editor_state.cursor, saved.as_deref());
+        self.editor_state.large.active = true;
+        self.editor_state.large.set_encoding(text, self.encoding);
+        // Transfer focus without changing the document cursor or selection.
+        let old = egui::Id::new("draft_editor").with(self.id);
+        if ctx.memory(|m| m.has_focus(old)) {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("large_editor").with(self.id)));
+        }
+    }
     fn prepare_changes(&mut self) {
         if self.editor_state.changes.baseline.is_none()
             && (!self.path.as_os_str().is_empty() || self.source_path.is_some())
@@ -714,10 +772,12 @@ enum TabAction {
     CloseLeft(u64),
     CloseRight(u64),
     OpenFolder(u64),
+    Reload(u64),
 }
 
 enum MenuAction {
     Open,
+    SaveAs,
     NewWindow,
     Recent(PathBuf),
     Settings,
@@ -772,6 +832,11 @@ impl LiteTextApp {
     }
 
     fn write_recovery(&mut self) -> std::io::Result<()> {
+        self.finish_restore();
+        // Background workers only stage private temporary files. They can never
+        // publish an older snapshot after this synchronous lifecycle barrier.
+        self.invalidate_recovery_worker();
+        self.prune_io_caches();
         if new_window::finished() { return Ok(()); }
         let path = self.recovery_path().ok_or_else(|| std::io::Error::other("Application storage directory unavailable"))?;
         let key = (self.active_id, self.files.iter().map(|f| (f.id, f.path.clone(), f.name.clone(), f.view,
@@ -820,35 +885,21 @@ impl LiteTextApp {
         let Some(file) = self.files.iter().find(|f| f.id == id) else { return false };
         if file.draft_text.is_none() { return true; }
         let target = if file.path.as_os_str().is_empty() {
-            let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.txt", file.name)).save_file() else { return false };
+            let Some(path) = self.choose_save_target(id) else { return false };
             path
         } else { file.path.clone() };
-        if self.files.iter().any(|f| f.id != id && !f.path.as_os_str().is_empty()
-            && std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone())
-                == std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone()))
-        {
-            self.io_error = Some(format!("{}: file is already open in another tab", tr(self.lang).save_failed));
-            return false;
-        }
-        let detached = self.files.iter().find(|f| f.id == id).is_some_and(|f| f.path.as_os_str().is_empty());
-        if detached {
-            match std::fs::read(&target) {
-                Ok(expected) => { self.pending_save = Some(linkage::PendingSave { id, target, expected }); return false; }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => { self.io_error = Some(format!("{}: {error}", tr(self.lang).save_failed)); return false; }
-            }
-        }
-        self.commit_save(id, &target, None)
+        self.request_save_to(id, target)
     }
 
     fn commit_save(&mut self, id: u64, target: &std::path::Path, expected: Option<&[u8]>) -> bool {
         if self.files.iter().any(|f| f.id != id && !f.path.as_os_str().is_empty() && linkage::resolved(&f.path) == linkage::resolved(target)) {
-            self.io_error = Some(format!("{}: file is already open in another tab", tr(self.lang).save_failed));
+            self.report_save_failure(id, target.to_path_buf(), std::io::Error::new(std::io::ErrorKind::AlreadyExists, tr(self.lang).target_open));
             return false;
         }
         let Some(file) = self.files.iter_mut().find(|f| f.id == id) else { return false; };
         match recovery::save_document_checked(file, target, expected) {
             Ok(()) => {
+                if self.save_failure.as_ref().is_some_and(|failure| failure.document_id() == id) { self.save_failure = None; self.io_error = None; }
                 let path = file.path.clone();
                 self.recent_files.retain(|p| p != &path);
                 self.recent_files.insert(0, path);
@@ -858,26 +909,27 @@ impl LiteTextApp {
             }
             Err(error) => {
                 linkage::check(file, true);
-                self.io_error = Some(format!("{}: {error}", tr(self.lang).save_failed));
+                self.report_save_failure(id, target.to_path_buf(), error);
                 false
             }
         }
     }
 
     fn closing_ids(&self, action: &TabAction) -> Vec<u64> {
-        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) => return Vec::new() };
+        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) | TabAction::Reload(_) => return Vec::new() };
         let Some(pos) = self.files.iter().position(|f| f.id == target) else { return Vec::new() };
         self.files.iter().enumerate().filter(|(i, f)| match action {
             TabAction::Close(_) => f.id == target,
             TabAction::CloseOthers(_) => f.id != target,
             TabAction::CloseLeft(_) => *i < pos,
             TabAction::CloseRight(_) => *i > pos,
-            TabAction::OpenFolder(_) => false,
+            TabAction::OpenFolder(_) | TabAction::Reload(_) => false,
         }).map(|(_, f)| f.id).collect()
     }
 
     fn apply_tab_action(&mut self, action: TabAction) {
         match action {
+            TabAction::Reload(id) => { self.request_reload(id, false); return; }
             TabAction::Close(id) => self.close_tab(id),
             TabAction::CloseOthers(id) => self.close_others(id),
             TabAction::CloseLeft(id) => self.close_left(id),
@@ -905,7 +957,7 @@ impl LiteTextApp {
 
     fn file_dialogs(&mut self, ctx: &egui::Context) {
         let t = tr(self.lang);
-        if let Some(index) = self.files.iter().position(|f| f.disk.pending.is_some()) {
+        if self.reload_task.is_none() && self.encoding_task.is_none() && self.save_failure.is_none() && let Some(index) = self.files.iter().position(|f| f.disk.pending.is_some()) {
             let file = &self.files[index];
             let mut choice = 0;
             egui::Window::new(t.external_title).id(egui::Id::new("external_change"))
@@ -924,13 +976,7 @@ impl LiteTextApp {
                     });
                 });
             if choice == 1 {
-                // Reload is explicitly confirmed above. Read/decode first so a
-                // failure retains the current buffer, without historical copies.
-                let result = linkage::reload(&mut self.files[index]);
-                match result {
-                    Ok(()) => { self.selection = None; self.drag_anchor = None; self.inspector_popup = None; self.backup_or_report(); }
-                    Err(error) => self.io_error = Some(format!("{}: {error}", t.reload_failed)),
-                }
+                self.request_reload(self.files[index].id, true);
             } else if choice == 2 {
                 linkage::detach(&mut self.files[index]);
                 self.backup_or_report();
@@ -952,7 +998,7 @@ impl LiteTextApp {
                 if choice == 1 { self.commit_save(pending.id, &pending.target, Some(&pending.expected)); }
             }
         }
-        if self.pending_close.is_some() && self.pending_save.is_none() && !self.files.iter().any(|f| f.disk.pending.is_some()) {
+        if self.pending_close.is_some() && self.pending_save.is_none() && self.save_failure.is_none() && self.reload_task.is_none() && !self.files.iter().any(|f| f.disk.pending.is_some()) {
             let mut choice = 0;
             egui::Window::new(t.save).id(egui::Id::new("unsaved_close"))
                 .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -980,13 +1026,15 @@ impl LiteTextApp {
                 }
             }
         }
-        if let Some(error) = self.io_error.clone() {
-            egui::Window::new(t.save).id(egui::Id::new("io_error"))
+        if self.save_failure.is_none() && let Some(error) = self.io_error.clone() {
+            egui::Window::new(t.file_error).id(egui::Id::new("io_error"))
                 .collapsible(false).resizable(false).show(ctx, |ui| {
                     ui.label(error);
                     if ui.button(t.done).clicked() { self.io_error = None; }
                 });
         }
+        self.open_error_dialog(ctx);
+        self.save_failure_dialog(ctx);
         self.window_close_dialog(ctx);
     }
 
@@ -1021,6 +1069,8 @@ impl LiteTextApp {
             saved_encoding: recovery::Encoding::default(),
             source_path: None,
             disk: linkage::DiskState::default(),
+            line_ending: line_endings::LineEnding::default(),
+            saved_generation: 0,
         };
         file.sync_draft();
         self.files.push(file);
@@ -1033,12 +1083,26 @@ impl LiteTextApp {
 
     /// 打开文件（多选）：已存在的只激活，其余追加为新标签并激活。
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        #[cfg(not(test))]
+        { self.queue_open(paths); }
+        #[cfg(test)]
+        self.open_paths_now(paths);
+    }
+
+    #[cfg(test)]
+    fn open_paths_now(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             if let Some(existing) = self.files.iter().find(|f| f.path == path) {
                 self.active_id = Some(existing.id);
             } else {
-                let Ok(bytes) = std::fs::read(&path) else { continue };
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.open_errors.push(file_actions::OpenError { path, reason: error.to_string() });
+                        continue;
+                    }
+                };
                 let is_binary = detect_binary(&bytes);
                 let (encoding, text) = if is_binary {
                     (recovery::Encoding::default(), String::new())
@@ -1053,6 +1117,7 @@ impl LiteTextApp {
                 let id = self.next_file_id;
                 self.next_file_id += 1;
                 let character_count = text.chars().count();
+                let line_ending = line_endings::Counts::of(&text).preferred(line_endings::LineEnding::default());
                 self.files.push(LoadedFile {
                     id,
                     path: path.clone(),
@@ -1076,6 +1141,8 @@ impl LiteTextApp {
                     saved_encoding: encoding,
                     source_path: None,
                     disk: linkage::DiskState::default(),
+                    line_ending,
+                    saved_generation: 0,
                 });
                 self.active_id = Some(id);
                 self.selection = None;
@@ -1094,6 +1161,12 @@ impl LiteTextApp {
         let source = new_window::restore_path();
         #[cfg(test)]
         let source = self.recovery_path_override.clone().or(source);
+        #[cfg(not(test))]
+        if let Some(path) = source {
+            self.start_restore(path);
+            return;
+        }
+        #[cfg(test)]
         if let Some(path) = source {
             match recovery::load(&path) {
                 Ok(Some(session)) => {
@@ -1447,7 +1520,10 @@ fn format_size(size: u64) -> String {
 
 impl eframe::App for LiteTextApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(test)]
         self.backup_or_report();
+        #[cfg(not(test))]
+        self.start_background_recovery();
         if let Err(error) = self.save_preferences(true) { self.io_error = Some(format!("Unable to save preferences: {error}")); }
         eframe::set_value(storage, eframe::APP_KEY, self);
         #[cfg(not(test))]
@@ -1465,6 +1541,7 @@ impl eframe::App for LiteTextApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.cancel_open();
         if let Err(error) = self.write_recovery() {
             eprintln!("Recovery save on exit failed: {error}");
         }
@@ -1480,6 +1557,8 @@ impl eframe::App for LiteTextApp {
         } else { 13.5 };
         self.poll_terminal();
         self.poll_updates();
+        self.poll_background_io(ctx);
+        self.poll_search(ctx);
         // 跟踪窗口几何（外框），供退出时持久化
         if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
             self.window_size = Some([rect.width(), rect.height()]);
@@ -1518,10 +1597,11 @@ impl eframe::App for LiteTextApp {
         }
 
         self.top_bar(ctx, pal);
+        self.poll_batch(ctx);
         let focused = ctx.input(|i| i.focused);
         let force = (focused && !self.had_focus) || self.last_checked_tab != self.active_id;
         if force || self.last_disk_check.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2)) {
-            for file in &mut self.files { linkage::check(file, force); }
+            self.start_disk_checks(force);
             self.last_disk_check = Some(std::time::Instant::now());
             self.last_checked_tab = self.active_id;
         }
@@ -1594,9 +1674,12 @@ impl eframe::App for LiteTextApp {
             ctx.request_repaint();
         }
         if self.last_recovery.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5)) {
-            self.backup_or_report();
+            self.start_background_recovery();
             ctx.request_repaint();
         }
+        self.background_io_panel(ctx);
+        self.encoding_dialog(ctx);
+        self.reload_dialog(ctx);
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
         if ctx.input(|i| i.viewport().close_requested()) { self.request_window_close(ctx); }
         self.file_dialogs(ctx);
@@ -1639,12 +1722,16 @@ impl LiteTextApp {
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         // Including the frame, longest label + one character on each side.
-                        let labels = [t.menu_open, new_window_label, &recent_label, &plugins_label, whitespace_label, conversion_label, t.settings];
+                        let labels = [t.menu_open, t.save_as, new_window_label, &recent_label, &plugins_label, whitespace_label, conversion_label, t.settings];
                         let width = app_menu_width(ui, &labels, pal);
                         ui.set_width(width);
                         if app_menu_row(ui, t.menu_open, false, pal).on_hover_text(t.open_file).clicked() {
                             action = Some(MenuAction::Open);
                         }
+                        app_menu_separator(ui, pal);
+                        let enabled = self.active().is_some() && !self.shortcuts_blocked();
+                        let save_as = ui.add_enabled_ui(enabled, |ui| app_menu_row(ui, t.save_as, false, pal)).inner;
+                        if save_as.clicked() { action = Some(MenuAction::SaveAs); }
                         app_menu_separator(ui, pal);
                         if app_menu_row(ui, new_window_label, false, pal).clicked() {
                             action = Some(MenuAction::NewWindow);
@@ -1851,6 +1938,7 @@ impl LiteTextApp {
         }
         match action {
             Some(MenuAction::Open) => OPEN_REQUEST.store(true, Ordering::Relaxed),
+            Some(MenuAction::SaveAs) => { self.save_as(); },
             Some(MenuAction::NewWindow) => self.open_new_window(),
             Some(MenuAction::Recent(path)) => self.open_paths(vec![path]),
             Some(MenuAction::Settings) => { self.show_settings = true; self.shortcuts_page = false; self.workspace_theme_page = false; },
@@ -2031,6 +2119,10 @@ impl LiteTextApp {
                                         action = Some(TabAction::OpenFolder(id));
                                         menu.close_menu();
                                     }
+                                    let reload = menu.add_enabled(has_path, egui::Button::new(if self.lang == Lang::ZhCn { "从磁盘重新加载" } else { "Reload from disk" }))
+                                        .on_hover_text(if self.lang == Lang::ZhCn { "重新读取原文件，成功后重置标记与撤销历史；失败或取消保留工作区。" } else { "Reread disk; reset marks and undo history only on success. Cancel/failure retains the workspace." });
+                                    menu.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("reload_tab_rect", id)), reload.rect));
+                                    if reload.clicked() { action = Some(TabAction::Reload(id)); menu.close_menu(); }
                                     menu.separator();
                                     if menu.button(t.close).clicked() {
                                         action = Some(TabAction::Close(id));
@@ -2252,6 +2344,8 @@ impl LiteTextApp {
         let language_enabled = !self.shortcuts_blocked() && !file.is_binary;
         let mut language_change = None;
         let mut tab_change = None;
+        let mut ending_change = None;
+        let mut encoding_change = None;
         egui::TopBottomPanel::bottom("status_bar")
             .frame(egui::Frame::new().fill(pal.bg_panel).inner_margin(egui::Margin::symmetric(14, 5)))
             .show(ctx, |ui| {
@@ -2263,7 +2357,7 @@ impl LiteTextApp {
                     ui.label(RichText::new(&info).color(pal.text_faint).size(12.0));
                     ui.separator();
                     if file.draft_text.is_some() {
-                        ui.add(egui::Label::new(RichText::new(if file.encoding == recovery::Encoding::Lossy { t.encoding_unknown } else { file.encoding.name() }).color(pal.text_faint).size(12.0)).selectable(false));
+                        encoding_change = encoding_ui::picker(ui, file, self.lang, pal, language_enabled);
                     } else {
                         ui.add(egui::Label::new(RichText::new(t.encoding_binary).color(pal.text_faint).size(12.0)).selectable(false));
                     }
@@ -2275,6 +2369,10 @@ impl LiteTextApp {
                     }).color(pal.text_faint).size(12.0)).selectable(false));
                     ui.separator();
                     tab_change = whitespace::picker(ui, self.tab_mode, self.lang, pal, language_enabled);
+                    if file.view == ViewMode::Text && !file.is_binary {
+                        ui.separator();
+                        ending_change = line_endings::picker(ui, file, self.lang, pal, language_enabled);
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
@@ -2298,6 +2396,10 @@ impl LiteTextApp {
             ctx.request_repaint();
         }
         if let Some(mode) = tab_change { self.tab_mode = mode; }
+        if let Some((reopen, encoding)) = encoding_change { self.request_encoding(reopen, encoding); }
+        if let Some(ending) = ending_change && let Some(file) = self.active_mut() {
+            line_endings::convert(file, ctx, ending);
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -2516,7 +2618,7 @@ fn app_menu_row(ui: &mut egui::Ui, label: &str, active: bool, pal: &Palette) -> 
         ui.painter().rect_filled(rect, 5.0, pal.bg_elevated);
     }
     let font = FontId::proportional(13.0);
-    let color = if active { pal.accent } else { pal.text_main };
+    let color = if !ui.is_enabled() { pal.text_faint } else if active { pal.accent } else { pal.text_main };
     let padding = app_menu_padding(ui, pal);
     let text = elide_tab_title(label, (rect.width() - 2.0 * padding).max(0.0), |text| {
         ui.painter().layout_no_wrap(text.to_owned(), font.clone(), color).size().x
@@ -3230,11 +3332,11 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
     let requested_focus = std::mem::take(&mut file.editor_state.focus_requested);
     let focus = focus || requested_focus;
     file.editor_state.folds.sync(file.draft_text.as_deref().expect("text buffer"), (file.content_revision, file.editor_state.large.revision));
-    if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|t| t.len() >= large_editor::THRESHOLD)
-        && file.saved_large_revision.is_none()
-    {
-        file.saved_large_revision = (!file.is_modified()).then_some(0);
+    if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|t| large_editor::needs_windowing(t)) {
+        file.activate_large(ui.ctx());
     }
+    let ending = file.newline_counts().preferred(file.line_ending);
+    file.editor_state.line_ending = ending;
     file.editor_state.large.set_encoding(file.draft_text.as_ref().expect("text buffer"), file.encoding);
     let before_selection = (file.editor_state.selected_characters, file.editor_state.cursor_line);
     if editor::show(
@@ -3248,6 +3350,9 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
     ) {
         ui.ctx().request_repaint();
         file.editor_state.tools.current = None;
+        if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|t| large_editor::needs_windowing(t)) {
+            file.activate_large(ui.ctx());
+        }
         if file.editor_state.large.active {
             file.character_count = file.editor_state.large.characters;
             file.bytes_dirty = true;
@@ -3920,7 +4025,7 @@ mod tests {
     }
 
     #[test]
-    fn status_encoding_is_read_only_and_selection_count_follows_it() {
+    fn status_encoding_opens_picker_without_changing_text_and_selection_count_follows_it() {
         let ctx = egui::Context::default();
         let mut app = LiteTextApp::default();
         app.new_document();
@@ -3942,10 +4047,9 @@ mod tests {
             let mut selected_x = None;
             for shape in output.shapes {
                 if let egui::Shape::Text(text) = shape.shape {
-                    if text.galley.text() == "UTF-8" {
+                    if text.galley.text() == "UTF-8" && text.pos.y > 650.0 {
                         encoding_pos = Some(text.pos + text.galley.size() * 0.5);
                     }
-                    assert_ne!(text.galley.text(), "GBK");
                     if text.galley.text() == "选中2字" { selected_x = Some(text.pos.x); }
                 }
             }

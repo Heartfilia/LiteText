@@ -2,6 +2,8 @@
 use crate::Palette;
 use eframe::egui;
 use std::ops::Range;
+#[path = "background_search.rs"]
+pub(crate) mod background_search;
 
 pub(crate) fn toolbar(
     ui: &mut egui::Ui,
@@ -458,6 +460,11 @@ pub(crate) fn replace_range_with_cursor(
     after: Option<egui::text::CCursorRange>,
 ) {
     file.prepare_changes();
+    if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|text|
+        text.len().saturating_sub(range.len()).saturating_add(replacement.len()) >= crate::large_editor::THRESHOLD
+        || text.len() >= crate::large_editor::THRESHOLD) {
+        file.activate_large(ctx);
+    }
     let text = file.draft_text.as_mut().expect("text document");
     if text
         .len()
@@ -467,13 +474,6 @@ pub(crate) fn replace_range_with_cursor(
         || text.len() >= crate::large_editor::THRESHOLD
         || file.editor_state.large.active
     {
-        if !file.editor_state.large.active {
-            file.saved_large_revision = (file.bytes == file.saved_bytes).then_some(0);
-            file.editor_state.large.active = true;
-            if let Some(cursor) = file.editor_state.cursor {
-                file.editor_state.large.set_tool_cursor(cursor);
-            }
-        }
         file.editor_state.large.set_encoding(text, file.encoding);
         file.editor_state
             .large
@@ -694,10 +694,7 @@ pub(crate) fn find_bar(
                                     )
                                 });
                                 if count.clicked() {
-                                    tools.count_all(
-                                        file.draft_text.as_deref().unwrap_or_default(),
-                                        (file.content_revision, file.editor_state.large.revision),
-                                    );
+                                    action = 5;
                                 }
                                 if (tools.count_result.is_some() || tools.not_found)
                                     && tools.search_error.is_none()
@@ -755,7 +752,9 @@ pub(crate) fn find_bar(
         file.editor_state.tools.find_open = false;
     }
     if action != 0 {
-        if action == 5 {
+        if file.draft_text.as_ref().is_some_and(|text| text.len() >= crate::large_editor::THRESHOLD) {
+            background_search::start(file, ui.ctx(), action);
+        } else if action == 5 {
             file.editor_state.tools.count_all(
                 file.draft_text.as_deref().unwrap_or_default(),
                 (file.content_revision, file.editor_state.large.revision),
@@ -817,6 +816,10 @@ pub(crate) fn bulk_paste(file: &mut crate::LoadedFile, ctx: &egui::Context, focu
 }
 
 fn search_action(file: &mut crate::LoadedFile, ctx: &egui::Context, action: usize) {
+    if file.draft_text.as_ref().is_some_and(|text| text.len() >= crate::large_editor::THRESHOLD) {
+        background_search::start(file, ctx, action);
+        return;
+    }
     let revision = (file.content_revision, file.editor_state.large.revision);
     if !file.editor_state.tools.prepare_matcher(revision) {
         return;
@@ -1214,6 +1217,10 @@ fn replace_all(file: &mut crate::LoadedFile, ctx: &egui::Context) {
         .iter()
         .map(|range| (range.clone(), tools.replacement_for(text, range)))
         .collect();
+    if text.len() >= 2 * 1024 * 1024 && replacements.len() > 1000 {
+        crate::line_commands::commit_edits(file, ctx, replacements, None);
+        return;
+    }
     let mut result = String::with_capacity(text.len());
     let mut offset = 0;
     for (range, replacement) in &replacements {
@@ -1355,17 +1362,19 @@ pub(crate) fn paint_whitespace(
     galley: &egui::Galley,
     pos: egui::Pos2,
     pal: &Palette,
+    following: &str,
 ) {
     let painter = ui.painter();
-    for row in &galley.rows {
+    for (row_index, row) in galley.rows.iter().enumerate() {
         if row.rect.height() == 0.0 || !row.rect.translate(pos.to_vec2()).intersects(ui.clip_rect())
         {
             continue;
         }
-        for glyph in &row.glyphs {
+        for (index, glyph) in row.glyphs.iter().enumerate() {
             let hint = match glyph.chr {
                 ' ' => "·",
                 '\t' => "→",
+                '\r' if row.ends_with_newline && index + 1 == row.glyphs.len() => continue,
                 '\r' => "␍",
                 _ => continue,
             };
@@ -1377,14 +1386,33 @@ pub(crate) fn paint_whitespace(
                 pal.text_faint,
             );
         }
-        if row.ends_with_newline {
+        // A viewport fragment excludes its boundary terminator, but the final
+        // visible line still needs the original document's LF/CRLF hint.
+        let boundary = (row_index + 1 == galley.rows.len()).then_some(following);
+        let boundary_ending = boundary.and_then(|tail| {
+            if tail.starts_with("\r\n") { Some(true) }
+            else if tail.starts_with('\n') { Some(false) }
+            else { None }
+        });
+        if row.ends_with_newline || boundary_ending.is_some() {
+            let crlf = boundary_ending.unwrap_or_else(|| row.glyphs.last().is_some_and(|g| g.chr == '\r'));
+            let marker = pos + row.rect.right_center().to_vec2();
             painter.text(
-                pos + row.rect.right_center().to_vec2(),
+                marker + egui::vec2(0.0, if crlf { 2.0 } else { 0.0 }),
                 egui::Align2::LEFT_CENTER,
                 "↵",
                 egui::FontId::monospace(11.0),
                 pal.text_faint,
             );
+            if crlf {
+                painter.text(
+                    marker + egui::vec2(3.5, -1.5),
+                    egui::Align2::CENTER_BOTTOM,
+                    "CR",
+                    egui::FontId::monospace(7.0),
+                    pal.text_faint,
+                );
+            }
         }
     }
 }
@@ -2342,9 +2370,15 @@ mod tests {
             assert!(file.editor_state.tools.matches.is_empty());
             assert!(file.editor_state.tools.current.is_none());
             file.editor_state.cursor = cursor(5, 5);
-            search_action(file, &ctx, 3); // Single replace without a located result does nothing.
+            let run = |app: &mut crate::LiteTextApp, action| {
+                search_action(app.active_mut().unwrap(), &ctx, action);
+                background_search::drain(app, &ctx);
+            };
+            run(&mut app, 3); // Single replace without a located result does nothing.
+            let file = app.active_mut().unwrap();
             assert_eq!(file.draft_text.as_deref(), Some(original.as_str()));
-            search_action(file, &ctx, 2);
+            run(&mut app, 2);
+            let file = app.active_mut().unwrap();
             assert_eq!(file.editor_state.tools.current, Some(11..14));
             assert!(file.editor_state.tools.matches.is_empty());
             let job = layout(
@@ -2364,13 +2398,19 @@ mod tests {
             assert_eq!(painted[0], 11..14);
             // Mimic the editor applying the pending result selection.
             file.editor_state.cursor = cursor(11, 14);
-            search_action(file, &ctx, 2);
+            file.editor_state.pending_selection = None;
+            run(&mut app, 2);
+            let file = app.active_mut().unwrap();
             assert_eq!(file.editor_state.tools.current, Some(19..22));
             file.editor_state.cursor = cursor(19, 22);
-            search_action(file, &ctx, 1);
+            file.editor_state.pending_selection = None;
+            run(&mut app, 1);
+            let file = app.active_mut().unwrap();
             assert_eq!(file.editor_state.tools.current, Some(11..14));
             file.editor_state.cursor = cursor(11, 14);
-            search_action(file, &ctx, 3);
+            file.editor_state.pending_selection = None;
+            run(&mut app, 3);
+            let file = app.active_mut().unwrap();
             assert!(
                 file.draft_text
                     .as_deref()
@@ -2380,7 +2420,8 @@ mod tests {
             assert!(file.editor_state.tools.current.is_none());
             // A second replacement cannot touch another occurrence without navigation.
             let after = file.draft_text.clone();
-            search_action(file, &ctx, 3);
+            run(&mut app, 3);
+            let file = app.active_mut().unwrap();
             assert_eq!(file.draft_text, after);
             let revision = (file.content_revision, file.editor_state.large.revision);
             file.editor_state

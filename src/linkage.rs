@@ -1,5 +1,7 @@
 //! Disk association: an empty writable path means a detached/untitled working copy.
-use crate::{LoadedFile, editor, recovery};
+use crate::LoadedFile;
+#[cfg(test)]
+use crate::{editor, recovery};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -18,6 +20,58 @@ pub(crate) struct DiskState {
     pub checked: bool,
     pub stamp: Option<(u64, SystemTime)>,
     pub pending: Option<External>,
+    pub loaded: Option<ReadStamp>,
+}
+
+/// A best-effort stable read token, not a cross-process filesystem lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ReadStamp {
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+    pub(crate) fn path(path: &Path) -> io::Result<Self> {
+        Self::of(&std::fs::metadata(path)?)
+    }
+}
+
+pub(crate) fn changed_during_load() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "File changed, moved or was replaced while loading; result discarded. Retry to read the latest version; working copy retained.",
+    )
+}
+
+pub(crate) fn validate_loaded(file: &LoadedFile) -> io::Result<()> {
+    if file
+        .disk
+        .loaded
+        .as_ref()
+        .is_some_and(|expected| ReadStamp::path(&file.path).as_ref().ok() == Some(expected))
+    {
+        Ok(())
+    } else {
+        Err(changed_during_load())
+    }
 }
 
 pub(crate) fn stamp(path: &Path) -> io::Result<(u64, SystemTime)> {
@@ -68,6 +122,7 @@ pub(crate) fn detach(file: &mut LoadedFile) {
     file.content_revision += 1;
 }
 
+#[cfg(test)]
 pub(crate) fn reload(file: &mut LoadedFile) -> io::Result<()> {
     // Read and decode completely before replacing any working state.
     let bytes = std::fs::read(&file.path)?;
@@ -99,6 +154,7 @@ pub(crate) fn reload(file: &mut LoadedFile) -> io::Result<()> {
     file.draft_text = (!binary).then_some(text);
     file.bytes = bytes.clone();
     file.saved_bytes = bytes;
+    file.saved_generation += 1;
     file.bytes_dirty = false;
     file.saved_large_revision = None;
     file.editor_state = editor::EditorState::default();

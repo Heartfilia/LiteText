@@ -480,6 +480,13 @@ impl LiteTextApp {
 
     pub(crate) fn shortcuts_blocked(&self) -> bool {
         self.show_settings
+            || self.restoring()
+            || !self.open_errors.is_empty() && !self.opening_files()
+            || self.pending_batch.is_some()
+            || self.pending_search.is_some()
+            || self.encoding_task.is_some()
+            || self.reload_task.is_some()
+            || self.save_failure.is_some()
             || self.plugin_error.is_some()
             || self.pending_close.is_some()
             || self.pending_window_close
@@ -594,6 +601,10 @@ impl LiteTextApp {
         }
         if !self.shortcuts_blocked() {
             self.remap_edit_keys(ctx);
+            let mode = self.tab_mode;
+            if let Some(file) = self.active_mut() {
+                crate::indentation::handle_tab(file, ctx, mode);
+            }
             if let Some(file) = self
                 .active()
                 .filter(|f| f.view == ViewMode::Text && !f.is_binary)

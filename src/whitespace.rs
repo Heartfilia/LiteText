@@ -199,9 +199,9 @@ pub(crate) fn picker(
         egui::Sense::click(),
     );
     let response = response.on_hover_text(if zh {
-        "TAB 输入方式：默认输入制表符，或输入 2/4 个空格。默认转换宽度为 4。"
+        "TAB 输入方式：制表符或 2/4 空格。多行选区按 Tab 缩进，Shift+Tab 反缩进；默认转换宽度为 4。"
     } else {
-        "Tab input: a literal tab, 2 spaces or 4 spaces. Default conversion width: 4."
+        "Tab: a literal tab, 2 or 4 spaces. Tab indents selected lines; Shift+Tab unindents. Default conversion width: 4."
     });
     ui.ctx().data_mut(|d| d.insert_temp(id.with("rect"), rect));
     ui.painter()

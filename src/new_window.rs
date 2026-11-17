@@ -239,7 +239,12 @@ impl crate::LiteTextApp {
     }
 
     pub(crate) fn request_window_close(&mut self, ctx: &eframe::egui::Context) {
+        self.finish_restore();
         use eframe::egui::ViewportCommand;
+        if self.save_failure.is_some() || self.reload_task.is_some() {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            return;
+        }
         if self.update_restarting {
             if !self.backup_or_report() { ctx.send_viewport_cmd(ViewportCommand::CancelClose); }
             return;
@@ -270,7 +275,7 @@ impl crate::LiteTextApp {
     }
 
     pub(crate) fn window_close_dialog(&mut self, ctx: &eframe::egui::Context) {
-        if !self.pending_window_close || self.pending_save.is_some() || self.files.iter().any(|f| f.disk.pending.is_some()) { return; }
+        if !self.pending_window_close || self.pending_save.is_some() || self.save_failure.is_some() || self.reload_task.is_some() || self.files.iter().any(|f| f.disk.pending.is_some()) { return; }
         let t = crate::tr(self.lang);
         let mut choice = 0;
         eframe::egui::Window::new(t.save).id(eframe::egui::Id::new("unsaved_window_close"))

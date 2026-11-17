@@ -22,6 +22,17 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
+    pub(crate) const CHOICES: [Self; 9] = [Self::Utf8, Self::Utf8Bom, Self::Utf16Le, Self::Utf16Be, Self::Gbk, Self::Gb18030, Self::Big5, Self::ShiftJis, Self::Windows1252];
+
+    /// Explicit reopening never substitutes invalid input or guesses another encoding.
+    /// BOM variants require their BOM so a clean buffer round-trips exactly.
+    pub(crate) fn decode_explicit(self, bytes: &[u8]) -> io::Result<String> {
+        let text = if self == Self::Utf8 {
+            if bytes.starts_with(b"\xEF\xBB\xBF") { None }
+            else { std::str::from_utf8(bytes).ok().map(str::to_owned) }
+        } else { self.decode_as(bytes) };
+        text.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("Input is not valid, lossless {} (BOM variants require the matching BOM)", self.name())))
+    }
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Utf8 => "UTF-8",
@@ -180,6 +191,8 @@ struct Record {
     baseline: Option<Vec<u8>>,
     #[serde(default)]
     raw: Option<Vec<u8>>,
+    #[serde(default)]
+    line_ending: crate::line_endings::LineEnding,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,10 +202,76 @@ pub(crate) struct Session {
     files: Vec<Record>,
 }
 
+/// Copy at most a bounded slice of live buffers each frame. The caller checks
+/// the complete document/version key before every step and before publication.
+pub(crate) struct Capture {
+    session: Session,
+    record: usize,
+    field: usize,
+}
+
+impl Capture {
+    pub(crate) fn new(files: &[LoadedFile], active_id: Option<u64>) -> Self {
+        Self {
+            record: 0, field: 0,
+            session: Session { version: 1, active_id, files: files.iter().map(|file| {
+                let modified = file.is_modified();
+                Record {
+                    id: file.id, path: file.path.clone(), source_path: file.source_path.clone(),
+                    name: file.name.clone(), view: file.view, language_override: file.language_override.clone(),
+                    encoding: file.encoding, saved_encoding: Some(file.saved_encoding),
+                    text: (modified && file.draft_text.is_some()).then(String::new),
+                    baseline: modified.then(Vec::new),
+                    raw: (file.is_binary && file.path.as_os_str().is_empty()).then(Vec::new),
+                    line_ending: file.line_ending,
+                }
+            }).collect() },
+        }
+    }
+
+    pub(crate) fn step(&mut self, files: &[LoadedFile], mut budget: usize) -> bool {
+        let _timing = crate::timing::phase("recovery.snapshot_slice");
+        while self.record < self.session.files.len() && budget > 0 {
+            let record = &mut self.session.files[self.record];
+            let file = &files[self.record];
+            let copied = match self.field {
+                0 => if let Some(target) = &mut record.text {
+                    let source = file.draft_text.as_deref().unwrap();
+                    if target.is_empty() { target.reserve_exact(source.len()); }
+                    let start = target.len();
+                    let mut end = (start + budget).min(source.len());
+                    while !source.is_char_boundary(end) { end -= 1; }
+                    if end == start && start < source.len() { return false; }
+                    target.push_str(&source[start..end]);
+                    if end == source.len() { self.field += 1; }
+                    end - start
+                } else { self.field += 1; 0 },
+                1 | 2 => {
+                    let (target, source) = if self.field == 1 { (&mut record.baseline, &file.saved_bytes) } else { (&mut record.raw, &file.bytes) };
+                    if let Some(target) = target {
+                        if target.is_empty() { target.reserve_exact(source.len()); }
+                        let start = target.len();
+                        let end = (start + budget).min(source.len());
+                        target.extend_from_slice(&source[start..end]);
+                        if end == source.len() { self.field += 1; }
+                        end - start
+                    } else { self.field += 1; 0 }
+                }
+                _ => { self.record += 1; self.field = 0; 0 }
+            };
+            budget -= copied;
+        }
+        self.record == self.session.files.len()
+    }
+
+    pub(crate) fn finish(self) -> Session { self.session }
+}
+
 impl Session {
     pub(crate) fn has_files(&self) -> bool { !self.files.is_empty() }
     #[cfg(test)]
     pub(crate) fn capture(files: &[LoadedFile], active_id: Option<u64>) -> Self {
+        let _timing = crate::timing::phase("recovery.snapshot");
         Self {
             version: 1,
             active_id,
@@ -210,6 +289,7 @@ impl Session {
                     text: f.is_modified().then(|| f.draft_text.clone()).flatten(),
                     baseline: f.is_modified().then(|| f.saved_bytes.clone()),
                     raw: (f.is_binary && f.path.as_os_str().is_empty()).then(|| f.bytes.clone()),
+                    line_ending: f.line_ending,
                 })
                 .collect(),
         }
@@ -240,6 +320,8 @@ impl Session {
                         bytes_dirty: false,
                         content_revision: 0,
                         disk: crate::linkage::DiskState::default(),
+                        line_ending: record.line_ending,
+                        saved_generation: 0,
                     });
                 }
                 if let Some(text) = &record.text {
@@ -263,6 +345,8 @@ impl Session {
                         saved_encoding: record.saved_encoding.unwrap_or(record.encoding),
                         source_path: record.source_path.clone(),
                         disk: crate::linkage::DiskState::default(),
+                        line_ending: record.line_ending,
+                        saved_generation: 0,
                     };
                     file.sync_draft();
                     Some(file)
@@ -306,11 +390,38 @@ impl Session {
                         saved_encoding: encoding,
                         source_path: record.source_path.clone(),
                         disk: crate::linkage::DiskState::default(),
+                        line_ending: record.line_ending,
+                        saved_generation: 0,
                     })
                 }
             })
             .collect()
     }
+}
+
+/// A worker may serialize/fsync, but only the UI may publish a current snapshot.
+pub(crate) fn stage(path: &Path, session: &Session) -> io::Result<tempfile::NamedTempFile> {
+    let _timing = crate::timing::phase("recovery.serialize_fsync");
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        let mut writer = io::BufWriter::new(temp.as_file_mut());
+        serde_json::to_writer(&mut writer, session).map_err(io::Error::other)?;
+        writer.flush()?;
+    }
+    temp.as_file().sync_all()?;
+    Ok(temp)
+}
+
+pub(crate) fn publish(path: &Path, temp: tempfile::NamedTempFile, validate: bool) -> io::Result<()> {
+    if validate { preserve_invalid(path)?; }
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.permissions().readonly() { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Recovery file is read-only")); }
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    temp.persist(path).map_err(|error| error.error)?;
+    prune_reload_archives(path)
 }
 
 pub(crate) fn session_path() -> Option<PathBuf> {
@@ -412,6 +523,7 @@ fn store_buffers_inner(
         text: Option<&'a str>,
         baseline: Option<&'a [u8]>,
         raw: Option<&'a [u8]>,
+        line_ending: crate::line_endings::LineEnding,
     }
     #[derive(Serialize)]
     struct BorrowedSession<'a> {
@@ -442,6 +554,7 @@ fn store_buffers_inner(
                     baseline: dirty.then_some(f.saved_bytes.as_slice()),
                     raw: (f.is_binary && (f.path.as_os_str().is_empty() || archive))
                         .then_some(f.bytes.as_slice()),
+                    line_ending: f.line_ending,
                 }
             })
             .collect(),
@@ -503,10 +616,6 @@ pub(crate) fn save_document_checked(
     target: &Path,
     expected_target: Option<&[u8]>,
 ) -> io::Result<()> {
-    let text = file
-        .draft_text
-        .as_ref()
-        .ok_or_else(|| io::Error::other("Binary editing is not supported"))?;
     // A recovered buffer must not overwrite disk changes made by another application.
     let same_target = !file.path.as_os_str().is_empty()
         && crate::linkage::resolved(&file.path) == crate::linkage::resolved(target);
@@ -537,9 +646,13 @@ pub(crate) fn save_document_checked(
             Err(error) => return Err(error),
         }
     }
-    let bytes = file.encoding.encode(text)?;
+    let bytes = match file.draft_text.as_deref() {
+        Some(text) => file.encoding.encode(text)?,
+        None if file.is_binary => file.bytes.clone(),
+        None => return Err(io::Error::other("Document content is unavailable")),
+    };
     // Preserve symbolic links by replacing their target rather than the link itself.
-    let destination = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let destination = crate::linkage::resolved(target);
     // Recheck immediately before replacement; atomic write prevents partial output, not
     // simultaneous writes by uncooperative applications during this final small window.
     if same_target {
@@ -566,6 +679,7 @@ pub(crate) fn save_document_checked(
         .into_owned();
     file.bytes = bytes.clone();
     file.saved_bytes = bytes;
+    file.saved_generation += 1;
     file.bytes_dirty = false;
     file.saved_large_revision = Some(file.editor_state.large.revision);
     file.saved_encoding = file.encoding;
@@ -581,6 +695,20 @@ pub(crate) fn save_document_checked(
 mod tests {
     use super::*;
     use crate::LiteTextApp;
+
+    #[test]
+    fn partial_atomic_write_failure_preserves_original_and_removes_temporary_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.txt");
+        std::fs::write(&path, "original bytes").unwrap();
+        let error = atomic_write_with(&path, |writer| {
+            writer.write_all(b"partial replacement")?;
+            Err(io::Error::other("simulated disk full / write failure"))
+        }).unwrap_err();
+        assert!(error.to_string().contains("write failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn closing_tabs_replaces_snapshot_with_only_open_tabs() {

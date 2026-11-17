@@ -418,7 +418,7 @@ fn shortcut_search_is_on_demand_and_replacement_uses_current_result_in_both_edit
         file.editor_state.tools.query = "hit".to_owned();
         file.editor_state.tools.replacement = "NEW".to_owned();
         let run = |app: &mut LiteTextApp, events| {
-            ctx.run(input(events), |ctx| {
+            let output = ctx.run(input(events), |ctx| {
                 app.handle_shortcuts(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     crate::draft_editor(
@@ -429,7 +429,14 @@ fn shortcut_search_is_on_demand_and_replacement_uses_current_result_in_both_edit
                         Lang::En,
                     );
                 });
-            })
+            });
+            if ctx.data(|data| data.get_temp::<std::sync::Arc<std::sync::Mutex<Option<crate::text_tools::background_search::PendingSearch>>>>(egui::Id::new("search_handoff")).is_some()) {
+                crate::text_tools::background_search::drain(app, &ctx);
+                let _ = ctx.run(input(vec![]), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, Lang::En));
+                });
+            }
+            output
         };
         run(&mut app, vec![key(Action::Find)]);
         run(&mut app, vec![]);
