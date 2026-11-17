@@ -1823,7 +1823,10 @@ mod tests {
         assert_eq!(effective_language(app.active().unwrap()), "Python");
         let run = |app: &mut LiteTextApp, events| {
             ctx.run(raw(events, egui::vec2(1080.0, 720.0)), |ctx| {
-                app.status_bar(ctx, &crate::DARK)
+                app.status_bar(ctx, &crate::DARK);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, Lang::En);
+                });
             })
         };
         let click = |app: &mut LiteTextApp, rect: egui::Rect| {
@@ -1884,6 +1887,7 @@ mod tests {
         assert!(ctx.memory(|m| m.is_popup_open(popup_id)));
         click(&mut app, get_rect("JSON"));
         assert_eq!(effective_language(app.active().unwrap()), "JSON");
+        assert_eq!(app.active().unwrap().editor_state.folds.width(), crate::json_plugin::FOLD_WIDTH);
         let render = app
             .active()
             .unwrap()
@@ -1905,6 +1909,7 @@ mod tests {
         run(&mut app, vec![]);
         click(&mut app, get_rect("auto"));
         assert_eq!(effective_language(app.active().unwrap()), "Python");
+        assert_eq!(app.active().unwrap().editor_state.folds.width(), 0.0);
         assert!(app.active().unwrap().language_override.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         // Clicking an already open control closes it instead of redrawing it.
@@ -2142,7 +2147,7 @@ mod tests {
                 let file = app.active_mut().unwrap();
                 file.draft_text = Some(original.clone());
                 file.sync_draft();
-                file.editor_state.folds.enabled = true;
+                file.language_override = Some("JSON".into());
                 let colors = Colors::preset(dark);
                 configure(file, &WorkspaceTheme { custom: Some(colors), ..Default::default() }, dark);
                 let output = ctx.run(raw(vec![], egui::vec2(1080.0, 720.0)), |ctx| {

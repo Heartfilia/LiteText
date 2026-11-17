@@ -19,6 +19,8 @@ pub(crate) struct State {
     window: String,
     window_lines: Range<usize>,
     window_bytes: Range<usize>,
+    projection: Vec<ProjectedLine>,
+    projection_generation: Option<u64>,
     char_start: usize,
     cursor: Option<egui::text::CCursorRange>,
     char_starts: Vec<usize>,
@@ -47,6 +49,8 @@ pub(crate) struct State {
     wrap_incomplete: bool,
     #[cfg(test)]
     pub(crate) laid_out_bytes: usize,
+    #[cfg(test)]
+    pub(crate) window_builds: usize,
 }
 
 const HISTORY_BYTES: usize = 16 * 1024 * 1024;
@@ -54,6 +58,29 @@ const HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const OVERSCAN_LINES: usize = 12;
 const LAYOUT_BYTES: usize = 64 * 1024;
 const LONG_LINE_COLUMNS: usize = 32 * 1024;
+
+/// One visible source line in a compact display buffer. Document cursor and
+/// byte coordinates always remain in the original, unprojected text.
+#[derive(Clone)]
+struct ProjectedLine {
+    line: usize,
+    local_char: usize,
+    global_char: usize,
+    local_byte: usize,
+    global_byte: usize,
+}
+
+fn project_cursor(cursor: egui::text::CCursorRange, lines: &[ProjectedLine], to_global: bool) -> egui::text::CCursorRange {
+    let map = |mut c: egui::text::CCursor| {
+        let at = lines.partition_point(|l| if to_global { l.local_char } else { l.global_char } <= c.index).saturating_sub(1);
+        if let Some(line) = lines.get(at) {
+            let (from, to) = if to_global { (line.local_char, line.global_char) } else { (line.global_char, line.local_char) };
+            c.index = to + c.index.saturating_sub(from);
+        }
+        c
+    };
+    egui::text::CCursorRange::two(map(cursor.secondary), map(cursor.primary))
+}
 
 #[derive(Clone)]
 struct Edit {
@@ -103,6 +130,8 @@ pub(crate) fn difference(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn wrapping_pending(&self) -> bool { self.wrap_incomplete }
     /// Install a worker-built document/index without rescanning the live text.
     /// Keep the existing delta history, with precisely one new undo point.
     pub(crate) fn commit_prepared(&mut self, text: &mut String, mut prepared: PreparedReplacement) {
@@ -180,6 +209,7 @@ impl State {
     }
     pub(crate) fn invalidate_window(&mut self) {
         self.window_lines = 0..0;
+        self.projection_generation = None;
     }
     pub(crate) fn set_tool_cursor(&mut self, cursor: egui::text::CCursorRange) {
         self.cursor = Some(cursor);
@@ -638,9 +668,12 @@ pub(crate) fn show(
     state.large.active = true;
     let id = egui::Id::new("large_editor").with(file_id);
     if ui.is_enabled() { state.line_ending.remap_enter(ui.ctx(), id, &mut state.composing, text, state.large.cursor); }
-    state
+    let fold_selection = state
         .folds
         .prepare_input(ui, state.pending_selection.is_some(), id);
+    if state.pending_selection.is_some() && !fold_selection || !state.folds.has_collapsed() {
+        state.fold_scroll_extent = 0.0;
+    }
     let folds = state.folds.clone();
     let fold_w = folds.width();
     editor::scroll_style(ui, pal);
@@ -674,7 +707,7 @@ pub(crate) fn show(
         .changes
         .update(&state.large.fingerprints, state.large.revision);
     let count = state.large.ranges.len();
-    let number_w = editor::gutter_number_width(count, number_digit_w, fold_w);
+    let number_w = editor::gutter_number_width(count, number_digit_w);
     let wrap_width =
         (bounds.width() - number_w - fold_w - 38.0 - if tools.whitespace { 12.0 } else { 0.0 }).max(24.0);
     state
@@ -750,26 +783,32 @@ pub(crate) fn show(
         state.large.visual_index(ui, text, &font, pal, wrap_width, tools.wrap);
         state.large.fold_index(&folds);
     }
-    let reveal = state.pending_selection.is_some();
+    let reveal = state.pending_selection.is_some() && !fold_selection;
     if let Some(range) = state.pending_selection.take() {
         state.large.cursor = Some(egui::text::CCursorRange::two(
             egui::text::CCursor::new(range.start),
             egui::text::CCursor::new(range.end),
         ));
         state.large.invalidate_window();
-        let line = state.large.line_for_char(range.end);
-        let scroll_id = ui.make_persistent_id(egui::Id::new(("draft_scroll", file_id)));
-        let mut scroll = egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
-        scroll.offset.y =
-            state.large.visual_starts.get(line).copied().unwrap_or(line) as f32 * row_height;
-        scroll.store(ui.ctx(), scroll_id);
+        if !fold_selection {
+            let line = state.large.line_for_char(range.end);
+            let scroll_id = ui.make_persistent_id(egui::Id::new(("draft_scroll", file_id)));
+            let mut scroll = egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+            scroll.offset.y =
+                state.large.visual_starts.get(line).copied().unwrap_or(line) as f32 * row_height;
+            scroll.store(ui.ctx(), scroll_id);
+        }
     }
     let count = state.large.ranges.len();
     let mut line_action = None;
+    let mut fold_pointer = false;
+    let mut viewport_offset = egui::Vec2::ZERO;
+    let mut depth_action = None;
+    let mut depth_offset = None;
     if let Some((start, end)) = state.selection {
         state.selection = Some((start.min(count - 1), end.min(count - 1)));
     }
-    egui::ScrollArea::both()
+    let scroll_output = egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .scroll_bar_rect(egui::Rect::from_min_max(
@@ -778,6 +817,7 @@ pub(crate) fn show(
         ))
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
+            viewport_offset = viewport.min.to_vec2();
             let origin = ui.cursor().min;
             let viewport_clip = ui.clip_rect();
             let at_row = |row: usize| {
@@ -791,8 +831,13 @@ pub(crate) fn show(
             let first = at_row(((viewport.top() - 12.0).max(0.0) / row_height) as usize);
             let visible_end =
                 (at_row((viewport.bottom() / row_height).ceil() as usize + 2) + 1).min(count);
-            let desired =
-                first.saturating_sub(OVERSCAN_LINES)..(visible_end + OVERSCAN_LINES).min(count);
+            let visible_first = state.large.visible_lines.partition_point(|&line| line < first);
+            let visible_last = state.large.visible_lines.partition_point(|&line| line < visible_end);
+            // Overscan visible rows, never a large span of hidden logical lines.
+            let window_first = visible_first.saturating_sub(OVERSCAN_LINES);
+            let window_last = (visible_last + OVERSCAN_LINES).min(state.large.visible_lines.len());
+            let desired = state.large.visible_lines[window_first]
+                ..state.large.visible_lines[window_last.saturating_sub(1)] + 1;
             let keyboard_input = ui.input(|i| {
                 i.events.iter().any(|event| {
                     matches!(
@@ -861,17 +906,45 @@ pub(crate) fn show(
                 window.end = (state.large.ranges.partition_point(|range| range.start < end)).max(window.start + 1);
             }
             let bytes = start..end;
+            let projected = folds.has_collapsed() && !long_lines;
             state.large.layout_limited = start != state.large.ranges[window.start].start || end != state.large.ranges[window.end - 1].end;
             let wide_selection = state.large.cursor.is_some_and(|cursor| cursor.primary.index.abs_diff(cursor.secondary.index) >= 4096 || state.large.layout_limited && cursor.primary.index != cursor.secondary.index);
-            if state.large.window_lines != window || state.large.window_bytes != bytes || changed || wide_selection {
-                state.large.window = text[bytes.clone()].to_owned();
+            if state.large.window_lines != window || state.large.window_bytes != bytes || changed || wide_selection
+                || state.large.projection_generation != Some(folds.generation) {
+                #[cfg(test)]
+                { state.large.window_builds += 1; }
+                state.large.projection.clear();
+                if projected {
+                    let mut display = String::new();
+                    let mut characters = 0;
+                    let first_visible = state.large.visible_lines.partition_point(|&l| l < window.start);
+                    let end_visible = state.large.visible_lines.partition_point(|&l| l < window.end);
+                    for &line in &state.large.visible_lines[first_visible..end_visible] {
+                        if !state.large.projection.is_empty() { display.push('\n'); characters += 1; }
+                        state.large.projection.push(ProjectedLine {
+                            line, local_char: characters, global_char: state.large.char_starts[line],
+                            local_byte: display.len(), global_byte: state.large.ranges[line].start,
+                        });
+                        // Keep a CR before LF for whitespace hints and exact
+                        // character mappings, but omit the boundary newline.
+                        let end = state.large.ranges.get(line + 1).map_or(text.len(), |r| r.start - 1);
+                        let value = &text[state.large.ranges[line].start..end];
+                        display.push_str(value);
+                        characters += value.chars().count();
+                    }
+                    state.large.window = display;
+                } else {
+                    state.large.window = text[bytes.clone()].to_owned();
+                }
+                state.large.projection_generation = Some(folds.generation);
                 state.large.window_lines = window.clone();
                 state.large.window_bytes = bytes.clone();
                 let offset = state.large.char_starts[window.start] + text[state.large.ranges[window.start].start..start].chars().count();
                 state.large.char_start = offset;
                 let mut edit_state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
                 if let Some(cursor) = state.large.cursor {
-                    let mut local = shift_cursor(cursor, -(offset as isize));
+                    let mut local = if projected { project_cursor(cursor, &state.large.projection, false) }
+                        else { shift_cursor(cursor, -(offset as isize)) };
                     let length = state.large.window.chars().count();
                     local.primary.index = local.primary.index.min(length);
                     local.secondary.index = local.secondary.index.min(length);
@@ -881,6 +954,21 @@ pub(crate) fn show(
                 edit_state.store(ui.ctx(), id);
             }
             let char_start = state.large.char_start;
+            // Project highlight byte ranges once; syntax tokenization now sees
+            // only visible JSON lines instead of all intervening hidden text.
+            let mut layout_tools = tools.clone();
+            if projected {
+                let project_ranges = |range: &Range<usize>| -> Vec<Range<usize>> {
+                    state.large.projection.iter().enumerate().filter_map(|(i, line)| {
+                        let local_end = state.large.projection.get(i + 1).map_or(state.large.window.len(), |l| l.local_byte.saturating_sub(1));
+                        let start = range.start.max(line.global_byte);
+                        let end = range.end.min(line.global_byte + local_end - line.local_byte);
+                        (start < end).then_some(line.local_byte + start.saturating_sub(line.global_byte)..line.local_byte + end.saturating_sub(line.global_byte))
+                    }).collect()
+                };
+                layout_tools.marks = tools.marks.iter().flat_map(|m| project_ranges(&m.range).into_iter().map(|range| crate::text_tools::Mark { range, color: m.color })).collect();
+                layout_tools.current = tools.current.as_ref().and_then(|r| project_ranges(r).into_iter().next());
+            }
             let content_w = if long_lines {
                 (columns(&state.large.window) as f32 * digit_w + gutter_w + 20.0).max(bounds.width() - 16.0)
             } else if tools.wrap {
@@ -905,6 +993,7 @@ pub(crate) fn show(
             );
             let before_layout = (!tools.marks.is_empty() || tools.current.is_some())
                 .then(|| state.large.window.clone());
+            let projected_before = projected.then(|| state.large.window.clone());
             if let Some(render) = &mut tools.workspace
                 && !render.prepare_prefix(text, bytes.start)
             {
@@ -912,7 +1001,7 @@ pub(crate) fn show(
                 ui.ctx().request_repaint();
             }
             let mut layouter = |ui: &egui::Ui, text: &str, _: f32| {
-                let mut current_tools = tools.clone();
+                let mut current_tools = layout_tools.clone();
                 if let Some(before) = &before_layout
                     && before != text
                 {
@@ -932,12 +1021,13 @@ pub(crate) fn show(
                         f32::INFINITY
                     },
                     &current_tools,
-                    bytes.start,
+                    if projected { 0 } else { bytes.start },
                 );
                 for section in &mut job.sections {
                     section.format.line_height = Some(row_height);
                 }
-                folds.layout(ui.painter().layout_job(job), window.start)
+                let galley = ui.painter().layout_job(job);
+                if projected { galley } else { folds.layout(galley, window.start) }
             };
             let cursor_before = state.large.cursor;
             let pointer_extends = ui.input(|input| input.modifiers.shift || input.pointer.primary_down() && !input.pointer.any_pressed());
@@ -975,11 +1065,21 @@ pub(crate) fn show(
             if focus {
                 output.response.request_focus();
             }
-            editor::reveal_cursor(ui, &output, previous, gutter_w, reveal);
+            if !fold_selection { editor::reveal_cursor(ui, &output, previous, gutter_w, reveal); }
             if tools.whitespace && !state.large.layout_limited {
                 crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal, &text[bytes.end..]);
             }
-            folds.paint_summaries(ui, &output.galley, output.galley_pos, window.start, pal);
+            if projected {
+                let mut logical = 0;
+                for row in &output.galley.rows {
+                    if let Some(line) = state.large.projection.get(logical)
+                        && folds.collapsed(line.line) && row.ends_with_newline {
+                        ui.painter().text(output.galley_pos + row.rect.right_center().to_vec2() + egui::vec2(8.0, 0.0),
+                            egui::Align2::LEFT_CENTER, "…", FontId::monospace(13.5), pal.text_faint);
+                    }
+                    if row.ends_with_newline { logical += 1; }
+                }
+            } else { folds.paint_summaries(ui, &output.galley, output.galley_pos, window.start, pal); }
             if output.response.has_focus()
                 && (output.response.clicked()
                     || output.response.changed()
@@ -987,7 +1087,8 @@ pub(crate) fn show(
                     || (!wide_selection && keyboard_input))
                 && let Some(cursor) = output.state.cursor.char_range()
             {
-                let mut global = shift_cursor(cursor, char_start as isize);
+                let mut global = if projected { project_cursor(cursor, &state.large.projection, true) }
+                    else { shift_cursor(cursor, char_start as isize) };
                 if pointer_extends && let Some(before) = cursor_before {
                     global.secondary = before.secondary;
                 }
@@ -998,11 +1099,20 @@ pub(crate) fn show(
                 state.large.laid_out_bytes = state.large.window.len();
             }
             if output.response.changed() {
-                let (old, new) = difference(&text[bytes.clone()], &state.large.window);
+                let before = projected_before.as_deref().unwrap_or(&text[bytes.clone()]);
+                let (old, new) = difference(before, &state.large.window);
                 let inserted = state.large.window[new].to_owned();
+                let removed = if projected {
+                    let global_byte = |local: usize| {
+                        let at = state.large.projection.partition_point(|l| l.local_byte <= local).saturating_sub(1);
+                        let line = &state.large.projection[at];
+                        line.global_byte + local.saturating_sub(line.local_byte)
+                    };
+                    global_byte(old.start)..global_byte(old.end)
+                } else { bytes.start + old.start..bytes.start + old.end };
                 state.large.record(
                     text,
-                    bytes.start + old.start..bytes.start + old.end,
+                    removed,
                     inserted,
                     cursor_before,
                     state.large.cursor,
@@ -1014,12 +1124,15 @@ pub(crate) fn show(
                 state.selection = None;
             }
             state.cursor = state.large.cursor;
-            state.tools.handle_marker(ui, &output, text, char_start);
-            ui.set_min_size(egui::vec2(
+            state.tools.handle_marker_mapped(ui, &output, text, |index| {
+                if projected { project_cursor(egui::text::CCursorRange::one(egui::text::CCursor::new(index)), &state.large.projection, true).primary.index }
+                else { index + char_start }
+            });
+            ui.expand_to_include_rect(egui::Rect::from_min_size(origin, egui::vec2(
                 content_w,
-                24.0 + state.large.visual_starts.last().copied().unwrap_or(count) as f32
-                    * row_height,
-            ));
+                (24.0 + state.large.visual_starts.last().copied().unwrap_or(count) as f32
+                    * row_height).max(state.fold_scroll_extent),
+            )));
             let number_gutter = egui::Rect::from_min_max(
                 gutter.min,
                 egui::pos2(gutter.left() + number_w, gutter.bottom()),
@@ -1061,7 +1174,7 @@ pub(crate) fn show(
                 let line = line_at(p);
                 state.selection = Some((anchor.min(line), anchor.max(line)));
             }
-            if response.secondary_clicked()
+            if !folds.enabled && response.secondary_clicked()
                 && let Some(p) = response.interact_pointer_pos()
             {
                 let line = line_at(p);
@@ -1071,10 +1184,7 @@ pub(crate) fn show(
                 }
             }
             let painter = ui.painter().with_clip_rect(gutter_clip);
-            for line in first..visible_end {
-                if folds.hidden(line) {
-                    continue;
-                }
+            for &line in &state.large.visible_lines[visible_first..visible_last] {
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(
                         gutter.left(),
@@ -1120,13 +1230,9 @@ pub(crate) fn show(
                 );
                 ui.painter()
                     .rect_filled(lane, 0.0, gutter_bg);
-                for block in &folds.blocks {
-                    if folds.hidden(block.start)
-                        || block.start < first
-                        || block.start >= visible_end
-                    {
-                        continue;
-                    }
+                for &line in &state.large.visible_lines[visible_first..visible_last] {
+                    let Ok(index) = folds.blocks.binary_search_by_key(&line, |b| b.start) else { continue };
+                    let block = &folds.blocks[index];
                     let rect = egui::Rect::from_min_size(
                         egui::pos2(
                             lane.left(),
@@ -1136,6 +1242,20 @@ pub(crate) fn show(
                         ),
                         egui::vec2(fold_w, row_height),
                     );
+                    let menu_rect = egui::Rect::from_min_max(
+                        egui::pos2(number_gutter.left(), rect.top()), rect.max);
+                    if menu_rect.intersects(ui.clip_rect()) {
+                        fold_pointer |= ui.input(|i| i.pointer.interact_pos().is_some_and(|p| menu_rect.contains(p))
+                            && (i.pointer.secondary_down() || i.pointer.button_released(egui::PointerButton::Secondary)));
+                        if crate::json_plugin::depth_menu(menu_rect, file_id, block.start,
+                            folds.collapsed(block.start), t.encoding_binary == "二进制", &response) {
+                            depth_action = Some(block.start);
+                        }
+                    }
+                    fold_pointer |= rect.intersects(lane.intersect(ui.clip_rect())) && ui.input(|input| {
+                        input.pointer.interact_pos().is_some_and(|pos| rect.contains(pos))
+                            && (input.pointer.any_down() || input.pointer.any_released())
+                    });
                     if rect.intersects(lane.intersect(ui.clip_rect()))
                         && crate::json_plugin::fold_button(
                             ui,
@@ -1147,6 +1267,8 @@ pub(crate) fn show(
                         )
                     {
                         state.folds.toggle(block.start);
+                        log::info!(target: "litetext::fold", "Toggle node: tab_id={file_id}; line={}; collapsed={}", block.start + 1, state.folds.collapsed(block.start));
+                        state.fold_scroll_extent = viewport.bottom();
                         let start = state.large.char_starts[block.start];
                         state.pending_selection = Some(start..start);
                         state.selection = None;
@@ -1154,7 +1276,7 @@ pub(crate) fn show(
                     }
                 }
             }
-            response.context_menu(|ui| {
+            if !folds.enabled { response.context_menu(|ui| {
                 let selection = state.selection.unwrap_or((0, 0));
                 let label = if selection.0 == selection.1 {
                         t.copy_line
@@ -1175,8 +1297,29 @@ pub(crate) fn show(
                     line_action = Some(selection);
                     ui.close_menu();
                 }
-            });
+            }); }
+            if let Some(line) = depth_action {
+                let before = state.large.visual_starts[line];
+                state.folds.toggle_depth(line);
+                log::info!(target: "litetext::fold", "Toggle depth: tab_id={file_id}; line={}; collapsed={}", line + 1, state.folds.collapsed(line));
+                state.large.fold_index(&state.folds);
+                let delta = (state.large.visual_starts[line] as f32 - before as f32) * row_height;
+                let height = 24.0 + state.large.visual_starts.last().copied().unwrap_or(0) as f32 * row_height;
+                let offset = editor::depth_scroll_offset(viewport, delta, height);
+                depth_offset = Some(offset);
+                state.fold_scroll_extent = 0.0;
+                let start = state.large.char_starts[line];
+                state.pending_selection = Some(start..start);
+                ui.ctx().request_repaint();
+            }
         });
+    let scroll_output = editor::finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("editor_scroll_geometry", file_id)), (scroll_output.id, scroll_output.state.offset, scroll_output.inner_rect)));
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("editor_content_geometry", file_id)), (gutter, scroll_output.content_size)));
+    #[cfg(not(test))]
+    let _ = scroll_output;
     if let Some(selection) = line_action {
         state.large.clear_lines(text, selection);
         changed = true;

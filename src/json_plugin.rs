@@ -141,20 +141,34 @@ pub(crate) const FOLD_WIDTH: f32 = 20.0;
 pub(crate) struct Block {
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) depth: usize,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct Folds {
     pub(crate) enabled: bool,
     key: Option<(u64, u64)>,
-    pub(crate) blocks: Vec<Block>,
-    collapsed: BTreeSet<usize>,
-    hidden: Vec<bool>,
+    pub(crate) blocks: Arc<Vec<Block>>,
+    collapsed: Arc<BTreeSet<usize>>,
+    hidden: Arc<Vec<bool>>,
     internal_selection: bool,
     pub(crate) generation: u64,
 }
 
 impl Folds {
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        self.key = None;
+        self.blocks = Default::default();
+        self.collapsed = Default::default();
+        self.hidden = Default::default();
+        self.internal_selection = false;
+        self.generation += 1;
+    }
+
     pub(crate) fn invalidate(&mut self) {
         self.key = None;
     }
@@ -164,9 +178,10 @@ impl Folds {
             return;
         }
         self.key = Some(key);
-        self.blocks.clear();
-        self.collapsed.clear();
-        self.hidden = vec![false; text.bytes().filter(|&c| c == b'\n').count() + 1];
+        self.blocks = Default::default();
+        self.collapsed = Default::default();
+        self.hidden = Arc::new(vec![false; text.bytes().filter(|&c| c == b'\n').count() + 1]);
+        let blocks = Arc::make_mut(&mut self.blocks);
         let mut stack = Vec::new();
         let (mut line, mut quoted, mut escaped) = (0, false, false);
         for ch in text.chars() {
@@ -184,15 +199,19 @@ impl Folds {
                     '{' | '[' => stack.push((ch, line)),
                     '}' | ']' => {
                         let Some((open, start)) = stack.pop() else {
-                            self.blocks.clear();
+                            blocks.clear();
                             break;
                         };
                         if (open == '{') != (ch == '}') {
-                            self.blocks.clear();
+                            blocks.clear();
                             break;
                         }
                         if start < line {
-                            self.blocks.push(Block { start, end: line });
+                            blocks.push(Block {
+                                start,
+                                end: line,
+                                depth: stack.len(),
+                            });
                         }
                     }
                     _ => {}
@@ -203,9 +222,11 @@ impl Folds {
             }
         }
         if !stack.is_empty() || quoted {
-            self.blocks.clear();
+            blocks.clear();
         }
-        self.blocks.sort_by_key(|b| b.start);
+        blocks.sort_by_key(|b| (b.start, b.depth));
+        // A line has one folding control; choose its outermost cross-line block.
+        blocks.dedup_by_key(|b| b.start);
         self.generation += 1;
     }
 
@@ -215,6 +236,7 @@ impl Folds {
     pub(crate) fn collapsed(&self, line: usize) -> bool {
         self.collapsed.contains(&line)
     }
+    pub(crate) fn has_collapsed(&self) -> bool { !self.collapsed.is_empty() }
     pub(crate) fn width(&self) -> f32 {
         if self.enabled { FOLD_WIDTH } else { 0.0 }
     }
@@ -223,12 +245,12 @@ impl Folds {
         if self.collapsed.is_empty() {
             return;
         }
-        self.collapsed.clear();
-        self.hidden.fill(false);
+        self.collapsed = Default::default();
+        Arc::make_mut(&mut self.hidden).fill(false);
         self.generation += 1;
     }
 
-    pub(crate) fn prepare_input(&mut self, ui: &egui::Ui, pending: bool, id: egui::Id) {
+    pub(crate) fn prepare_input(&mut self, ui: &egui::Ui, pending: bool, id: egui::Id) -> bool {
         let internal = std::mem::take(&mut self.internal_selection);
         let keyboard = ui.is_enabled()
             && ui.memory(|m| m.has_focus(id))
@@ -239,6 +261,8 @@ impl Folds {
                         egui::Event::Text(_)
                             | egui::Event::Paste(_)
                             | egui::Event::Cut
+                            | egui::Event::Copy
+                            | egui::Event::Ime(_)
                             | egui::Event::Key { pressed: true, .. }
                     )
                 })
@@ -246,16 +270,42 @@ impl Folds {
         if (pending && !internal) || keyboard {
             self.expand_all();
         }
+        internal && pending && !keyboard
     }
 
     pub(crate) fn toggle(&mut self, line: usize) {
-        if !self.collapsed.remove(&line) {
-            self.collapsed.insert(line);
+        let collapsed = Arc::make_mut(&mut self.collapsed);
+        if !collapsed.remove(&line) {
+            collapsed.insert(line);
         }
-        self.hidden.fill(false);
-        for block in &self.blocks {
+        self.rebuild();
+    }
+
+    pub(crate) fn toggle_depth(&mut self, line: usize) {
+        let Some(block) = self.blocks.iter().find(|b| b.start == line) else {
+            return;
+        };
+        let depth = block.depth;
+        let expand = self.collapsed(line);
+        let collapsed = Arc::make_mut(&mut self.collapsed);
+        for block in self.blocks.iter() {
+            if block.depth == depth {
+                if expand {
+                    collapsed.remove(&block.start);
+                } else {
+                    collapsed.insert(block.start);
+                }
+            }
+        }
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        let hidden = Arc::make_mut(&mut self.hidden);
+        hidden.fill(false);
+        for block in self.blocks.iter() {
             if self.collapsed.contains(&block.start) {
-                self.hidden[block.start + 1..=block.end].fill(true);
+                hidden[block.start + 1..=block.end].fill(true);
             }
         }
         self.internal_selection = true;
@@ -344,6 +394,47 @@ impl Folds {
     }
 }
 
+/// Only header rows own a JSON context menu. No whole-gutter popup or stale
+/// line selection is involved; the widget ID retains the original target.
+pub(crate) fn depth_menu(
+    rect: egui::Rect,
+    file_id: u64,
+    line: usize,
+    collapsed: bool,
+    zh: bool,
+    gutter_response: &egui::Response,
+) -> bool {
+    // Reuse the gutter interaction rather than overlaying a click widget, which
+    // would steal ordinary line selection and dragging on header rows.
+    let mut response = gutter_response.clone();
+    response.id = egui::Id::new(("json_depth_menu", file_id, line));
+    #[cfg(test)]
+    response.ctx.data_mut(|d| d.insert_temp(egui::Id::new(("json_depth_rect", file_id, line)), rect));
+    if !response.context_menu_opened()
+        && !response.interact_pointer_pos().is_some_and(|p| rect.contains(p))
+    {
+        return false;
+    }
+    let mut clicked = false;
+    response.context_menu(|menu| {
+        let label = match (collapsed, zh) {
+            (false, true) => "折叠当前层级",
+            (true, true) => "展开该层级",
+            (false, false) => "Collapse this level",
+            (true, false) => "Expand this level",
+        };
+        crate::editor::line_menu_style(menu, label, label);
+        let button = crate::editor::line_menu_button(menu, label);
+        #[cfg(test)]
+        menu.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("json_depth_choice", file_id)), button.rect));
+        if button.clicked() {
+            clicked = true;
+            menu.close_menu();
+        }
+    });
+    clicked
+}
+
 /// A fixed, independent control lane between line numbers and text.
 pub(crate) fn fold_button(
     ui: &mut egui::Ui,
@@ -401,11 +492,16 @@ pub(crate) fn fold_button(
 }
 
 #[cfg(test)]
+#[path = "json_fold_scroll_tests.rs"]
+mod scroll_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{DARK, LIGHT, LiteTextApp, recovery};
 
-    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+
+    pub(super) fn raw(events: Vec<egui::Event>) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -416,7 +512,7 @@ mod tests {
         }
     }
 
-    fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    pub(super) fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
         [true, false]
             .into_iter()
             .map(|pressed| egui::Event::Key {
@@ -429,7 +525,7 @@ mod tests {
             .collect()
     }
 
-    fn button(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    pub(super) fn button(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(pos),
             egui::Event::PointerButton {
@@ -439,6 +535,74 @@ mod tests {
                 modifiers: Default::default(),
             },
         ]
+    }
+
+    #[test]
+    fn json_language_enables_folding_without_formatting_and_clears_it_on_language_switch() {
+        for large in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = LiteTextApp::default();
+            app.new_document();
+            let original = format!("{{\n  \"items\": [\n{}    0\n  ]\n}}\n", "    123,\n".repeat(if large { 40_000 } else { 2 }));
+            let file = app.active_mut().unwrap();
+            file.draft_text = Some(original.clone());
+            file.sync_draft();
+            let id = file.id;
+            let draw = |app: &mut LiteTextApp, events| ctx.run(raw(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    crate::draft_editor(ui, app.active_mut().unwrap(), &DARK, false, Lang::En);
+                });
+            });
+            draw(&mut app, vec![]);
+            assert_eq!(app.active().unwrap().editor_state.folds.width(), 0.0);
+            app.active_mut().unwrap().language_override = Some("JSON".into());
+            for _ in 0..2 { draw(&mut app, vec![]); }
+            assert_eq!(app.active().unwrap().editor_state.folds.width(), FOLD_WIDTH);
+            let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("json_fold_rect", id, 0usize)))).unwrap();
+            for pressed in [true, false] { draw(&mut app, button(rect.center(), pressed)); }
+            draw(&mut app, vec![]);
+            assert!(app.active().unwrap().editor_state.folds.hidden(1));
+            app.active_mut().unwrap().language_override = Some("text".into());
+            draw(&mut app, vec![]);
+            let folds = &app.active().unwrap().editor_state.folds;
+            assert_eq!(folds.width(), 0.0);
+            assert!(!folds.hidden(1) && !folds.collapsed(0));
+            assert!(folds.blocks.is_empty());
+            app.active_mut().unwrap().language_override = Some("JSON".into());
+            draw(&mut app, vec![]);
+            let folds = &app.active().unwrap().editor_state.folds;
+            assert_eq!(folds.width(), FOLD_WIDTH);
+            assert!(!folds.hidden(1) && !folds.blocks.is_empty());
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(original.as_str()));
+        }
+    }
+
+    #[test]
+    fn detected_and_restored_json_show_fold_lane_including_unformatted_single_line() {
+        for (name, text) in [("data.json", "{\n \"a\": [\n  1\n ]\n}"), ("compact.JSON", "{\"a\":[1,2]}")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let snapshot = dir.path().join("session.json");
+            std::fs::write(&path, text).unwrap();
+            let ctx = egui::Context::default();
+            let mut app = LiteTextApp { recovery_path_override: Some(snapshot.clone()), ..Default::default() };
+            app.open_paths(vec![path.clone()]);
+            app.write_recovery().unwrap();
+            for restore in [false, true] {
+                if restore { app.files = recovery::load(&snapshot).unwrap().unwrap().restore(); }
+                let _ = ctx.run(raw(vec![]), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::draft_editor(ui, app.active_mut().unwrap(), &DARK, false, Lang::En);
+                    });
+                });
+                let file = app.active().unwrap();
+                assert_eq!(file.editor_state.folds.width(), FOLD_WIDTH);
+                assert_eq!(file.editor_state.folds.blocks.is_empty(), !text.contains('\n'));
+                assert_eq!(file.draft_text.as_deref(), Some(text));
+                assert!(!file.has_unsaved_changes());
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+        }
     }
 
     #[test]

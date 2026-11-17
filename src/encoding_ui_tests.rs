@@ -61,6 +61,7 @@ fn reopen_rejects_disk_change_before_publish_and_offers_retry_without_touching_w
     let mut app = LiteTextApp::default();
     app.open_paths(vec![path.clone()]);
     app.request_encoding(true, Encoding::Utf8);
+    app.active_mut().unwrap().pinned = true;
     app.begin_encoding();
     let result = app
         .encoding_task
@@ -89,6 +90,7 @@ fn reopen_rejects_disk_change_before_publish_and_offers_retry_without_touching_w
         app.active().unwrap().draft_text.as_deref(),
         Some("latest content")
     );
+    assert!(app.active().unwrap().pinned);
 }
 
 #[test]

@@ -162,6 +162,7 @@ mod tests {
         first.terminal.custom_path = "/Applications/Otty.app".into();
         first.workspace_font_size = 18.0;
         first.workspace_theme.preset = crate::workspace_theme::Preset::Nord;
+        first.diagnostics_settings = crate::diagnostics::Settings { unlocked: true, enabled: true };
         first.updates = serde_json::from_value(serde_json::json!({
             "proxy_enabled": true, "proxy_url": "http://127.0.0.1:7890"
         })).unwrap();
@@ -171,6 +172,7 @@ mod tests {
         first.save_preferences(true).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("private document"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("diagnostics"));
         other.save_preferences(true).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let mut reinstalled = app(); // no window app.ron / installation files
@@ -179,8 +181,33 @@ mod tests {
         assert_eq!(reinstalled.terminal, first.terminal);
         assert_eq!(reinstalled.workspace_font_size, 18.0);
         assert_eq!(reinstalled.workspace_theme.preset, crate::workspace_theme::Preset::Nord);
+        assert!(!reinstalled.diagnostics_settings.unlocked && !reinstalled.diagnostics_settings.enabled);
         assert_eq!(serde_json::to_value(Preferences::capture(&reinstalled)).unwrap(), serde_json::to_value(Preferences::capture(&first)).unwrap());
         assert!(reinstalled.files.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_are_session_only_even_with_legacy_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        let legacy = br#"{"lang":"en","diagnostics":{"unlocked":true,"enabled":true}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let mut app = LiteTextApp::default();
+        app.preferences.path_override = Some(path.clone());
+        app.load_preferences().unwrap();
+        assert_eq!(app.lang, crate::Lang::En);
+        assert!(!app.diagnostics_settings.unlocked && !app.diagnostics_settings.enabled);
+        app.diagnostics_settings = crate::diagnostics::Settings { unlocked: true, enabled: true };
+        app.save_preferences(true).unwrap();
+        // Unlocking/recording must not count as a preference edit.
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        app.workspace_font_size = 18.0;
+        app.save_preferences(true).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("diagnostics").is_none());
+        // Reloading ordinary preferences during the run doesn't hide the entry.
+        app.load_preferences().unwrap();
+        assert!(app.diagnostics_settings.unlocked && app.diagnostics_settings.enabled);
     }
 
     #[test]
@@ -192,6 +219,7 @@ mod tests {
         app.preferences.path_override = Some(path.clone());
         app.load_preferences().unwrap();
         assert_eq!(app.lang, crate::Lang::En);
+        assert!(!app.diagnostics_settings.unlocked && !app.diagnostics_settings.enabled);
         assert!(app.terminal.show_toolbar_button);
         app.save_preferences(true).unwrap();
         let restored: Preferences = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

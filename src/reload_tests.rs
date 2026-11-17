@@ -147,6 +147,7 @@ fn background_reload_preserves_read_encoding_preferences_and_line_without_steali
         )
         .unwrap();
         loaded.id = 1;
+        loaded.pinned = true;
         loaded.editor_state.cursor_line = 2;
         loaded.editor_state.tools.wrap = true;
         loaded.editor_state.tools.whitespace = true;
@@ -177,6 +178,7 @@ fn background_reload_preserves_read_encoding_preferences_and_line_without_steali
         assert_eq!(file.editor_state.pending_selection, Some(10..10));
         assert!(!file.is_modified());
         assert_eq!(file.id, 1);
+        assert!(file.pinned);
         assert!(
             !egui::TextEdit::load_state(&ctx, egui::Id::new("draft_editor").with(1))
                 .unwrap()

@@ -156,6 +156,7 @@ fn load_inner(
     phase.store(2, Ordering::Relaxed);
     let _index_timing = crate::timing::phase("open.index_baseline");
     let mut file = LoadedFile {
+        pinned: false,
         id: 0,
         path: linkage::resolved(path),
         name: path
@@ -347,6 +348,7 @@ impl LiteTextApp {
                         file.content_revision,
                         file.editor_state.large.revision,
                         file.language_override.clone(),
+                        file.pinned,
                     )
                 })
                 .collect(),

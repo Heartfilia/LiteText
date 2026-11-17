@@ -933,6 +933,16 @@ impl Tools {
         text: &str,
         character_offset: usize,
     ) {
+        self.handle_marker_mapped(ui, output, text, |index| index + character_offset);
+    }
+
+    pub(crate) fn handle_marker_mapped(
+        &mut self,
+        ui: &egui::Ui,
+        output: &egui::text_edit::TextEditOutput,
+        text: &str,
+        character: impl Fn(usize) -> usize,
+    ) {
         if self.pen.is_none() {
             self.marker_anchor = None;
             return;
@@ -952,14 +962,13 @@ impl Tools {
         if pressed && output.response.contains_pointer() && output.response.has_focus() {
             self.marker_anchor = position.map(|pos| {
                 if shift && let Some(cursor) = output.state.cursor.char_range() {
-                    cursor.secondary.index + character_offset
+                    character(cursor.secondary.index)
                 } else {
-                    output
+                    character(output
                         .galley
                         .cursor_from_pos(pos - output.galley_pos)
                         .ccursor
-                        .index
-                        + character_offset
+                        .index)
                 }
             });
         }
@@ -967,12 +976,11 @@ impl Tools {
             && let Some(anchor) = self.marker_anchor.take()
             && let Some(pos) = position
         {
-            let end = output
+            let end = character(output
                 .galley
                 .cursor_from_pos(pos - output.galley_pos)
                 .ccursor
-                .index
-                + character_offset;
+                .index);
             self.mark_selection(
                 text,
                 Some(egui::text::CCursorRange::two(
@@ -983,8 +991,8 @@ impl Tools {
             ui.ctx().request_repaint();
         } else if keyboard && output.response.has_focus() && !output.response.changed() {
             let cursor = output.state.cursor.char_range().map(|mut cursor| {
-                cursor.primary.index += character_offset;
-                cursor.secondary.index += character_offset;
+                cursor.primary.index = character(cursor.primary.index);
+                cursor.secondary.index = character(cursor.secondary.index);
                 cursor
             });
             self.mark_selection(text, cursor);
@@ -1429,7 +1437,7 @@ mod tests {
             let file = app.active_mut().unwrap();
             file.draft_text = Some(text.clone());
             file.sync_draft();
-            file.editor_state.folds.enabled = true;
+            file.language_override = Some("JSON".into());
             let draw = |app: &mut crate::LiteTextApp| {
                 let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))), ..Default::default() }, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, crate::Lang::En));

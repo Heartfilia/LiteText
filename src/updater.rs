@@ -62,6 +62,10 @@ pub(crate) struct State {
     last_status_check: Option<Instant>,
 }
 
+impl State {
+    pub(crate) fn diagnostic_status(&self) -> &str { &self.message }
+}
+
 struct Prepared {
     root: tempfile::TempDir,
     stage: tempfile::TempDir,
@@ -811,10 +815,12 @@ impl LiteTextApp {
                     self.updater.receiver = None;
                 }
                 Some(Ok(Event::Failed(error))) => {
+                    self.diagnostic_event("ERROR", "updater", "Update operation failed; URL and raw error omitted");
                     self.updater.message = format!("更新失败 / Update failed: {error}");
                     self.updater.receiver = None;
                 }
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.diagnostic_event("ERROR", "updater", "Update worker disconnected");
                     self.updater.message = "Update worker disconnected".into();
                     self.updater.receiver = None;
                 }
@@ -1013,7 +1019,13 @@ impl LiteTextApp {
             if response.clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(REPOSITORY));
             }
-            ui.label(egui::RichText::new(format!("LiteText  {VERSION}")).color(pal.text_faint));
+            let version = ui.add(egui::Label::new(egui::RichText::new(format!("LiteText  {VERSION}")).color(pal.text_faint)).sense(egui::Sense::click()));
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_version_rect"), version.rect));
+            if version.clicked() {
+                self.diagnostics_version_click(ui.input(|i| i.time));
+            } else if ui.input(|i| i.pointer.any_click()) {
+                self.diagnostics.reset_clicks();
+            }
         });
     }
 }

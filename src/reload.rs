@@ -143,6 +143,7 @@ impl LiteTextApp {
                                 .unwrap();
                             let line = file.editor_state.cursor_line;
                             loaded.id = file.id;
+                            loaded.pinned = file.pinned;
                             loaded.content_revision = file.content_revision + 1;
                             loaded.saved_generation = file.saved_generation + 1;
                             loaded.editor_state.tools.wrap = file.editor_state.tools.wrap;
@@ -187,6 +188,7 @@ impl LiteTextApp {
                             return;
                         }
                         Err(error) => {
+                            self.diagnostic_event("ERROR", "reload", &format!("Reload failed: tab_id={}; kind={:?}; os_code={:?}", task.id, error.kind(), error.raw_os_error()));
                             task.error =
                                 Some(format!("{}: {error}", crate::tr(self.lang).reload_failed));
                             task.receiver = None;
@@ -194,6 +196,7 @@ impl LiteTextApp {
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.diagnostic_event("ERROR", "reload", "Reload worker disconnected; working copy retained");
                     task.error = Some(format!(
                         "{}: Reload worker stopped; working copy retained",
                         crate::tr(self.lang).reload_failed

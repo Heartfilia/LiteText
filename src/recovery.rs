@@ -175,6 +175,8 @@ impl Encoding {
 
 #[derive(Serialize, Deserialize)]
 struct Record {
+    #[serde(default)]
+    pinned: bool,
     id: u64,
     path: PathBuf,
     #[serde(default)]
@@ -217,6 +219,7 @@ impl Capture {
             session: Session { version: 1, active_id, files: files.iter().map(|file| {
                 let modified = file.is_modified();
                 Record {
+                    pinned: file.pinned,
                     id: file.id, path: file.path.clone(), source_path: file.source_path.clone(),
                     name: file.name.clone(), view: file.view, language_override: file.language_override.clone(),
                     encoding: file.encoding, saved_encoding: Some(file.saved_encoding),
@@ -278,6 +281,7 @@ impl Session {
             files: files
                 .iter()
                 .map(|f| Record {
+                    pinned: f.pinned,
                     id: f.id,
                     path: f.path.clone(),
                     source_path: f.source_path.clone(),
@@ -301,6 +305,7 @@ impl Session {
             .filter_map(|record| {
                 if let Some(bytes) = &record.raw {
                     return Some(LoadedFile {
+                        pinned: record.pinned,
                         id: record.id,
                         path: record.path.clone(),
                         name: record.name.clone(),
@@ -326,6 +331,7 @@ impl Session {
                 }
                 if let Some(text) = &record.text {
                     let mut file = LoadedFile {
+                        pinned: record.pinned,
                         id: record.id,
                         path: record.path.clone(),
                         name: record.name.clone(),
@@ -363,6 +369,7 @@ impl Session {
                     };
                     let character_count = text.chars().count();
                     Some(LoadedFile {
+                        pinned: record.pinned,
                         id: record.id,
                         path: record.path.clone(),
                         name: record.name.clone(),
@@ -512,6 +519,7 @@ fn store_buffers_inner(
 ) -> io::Result<()> {
     #[derive(Serialize)]
     struct BorrowedRecord<'a> {
+        pinned: bool,
         id: u64,
         path: &'a Path,
         source_path: &'a Option<PathBuf>,
@@ -542,6 +550,7 @@ fn store_buffers_inner(
             .map(|f| {
                 let dirty = f.is_modified() || archive;
                 BorrowedRecord {
+                    pinned: f.pinned,
                     id: f.id,
                     path: &f.path,
                     source_path: &f.source_path,

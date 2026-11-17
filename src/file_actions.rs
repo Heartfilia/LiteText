@@ -23,6 +23,7 @@ impl SaveFailure {
 
 impl LiteTextApp {
     pub(crate) fn report_save_failure(&mut self, id: u64, target: PathBuf, error: std::io::Error) {
+        self.diagnostic_event("ERROR", "save", &format!("Save failed: tab_id={id}; kind={:?}; os_code={:?}; target omitted", error.kind(), error.raw_os_error()));
         let message = format!(
             "{}: {}\n{error}",
             tr(self.lang).save_failed,

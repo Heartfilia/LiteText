@@ -234,6 +234,7 @@ impl LiteTextApp {
                         match result {
                             Ok(ResultData::Reopened(mut loaded)) => {
                                 loaded.id = file.id;
+                                loaded.pinned = file.pinned;
                                 loaded.content_revision = file.content_revision + 1;
                                 loaded.saved_generation = file.saved_generation + 1;
                                 loaded.editor_state.tools.wrap = file.editor_state.tools.wrap;

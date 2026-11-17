@@ -38,6 +38,8 @@ mod background_io;
 mod timing;
 mod encoding_ui;
 mod reload;
+mod pinned_tabs;
+mod diagnostics;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
@@ -52,6 +54,7 @@ fn control_pictures_ok() -> bool {
 static OPEN_REQUEST: AtomicBool = AtomicBool::new(false);
 
 fn main() -> eframe::Result {
+    diagnostics::install_logger();
     new_window::initialize();
     if updater::run_helper_if_requested() { return Ok(()); }
     let _runtime_lock = match updater::hold_runtime_lock() {
@@ -96,6 +99,7 @@ fn main() -> eframe::Result {
             if let Err(error) = app.load_preferences() {
                 app.io_error = Some(format!("Unable to load preferences: {error}"));
             }
+            app.initialize_diagnostics();
             app.restore_session();
             app.open_paths(paths);
             Ok(Box::new(app))
@@ -382,6 +386,10 @@ struct LiteTextApp {
     terminal: terminal::Settings,
     updates: updater::Settings,
     #[serde(skip)]
+    diagnostics_settings: diagnostics::Settings,
+    #[serde(skip)]
+    diagnostics: diagnostics::State,
+    #[serde(skip)]
     updater: updater::State,
     #[serde(skip)]
     preferences: preferences::State,
@@ -454,6 +462,8 @@ struct LiteTextApp {
     /// 拖拽开始时指针相对标签左缘的偏移
     #[serde(skip)]
     tab_grab_dx: f32,
+    #[serde(skip)]
+    reveal_tab: Option<u64>,
     /// 右侧工具栏实测宽度（上一帧），用于标签区自适应
     #[serde(skip)]
     right_controls_w: f32,
@@ -527,6 +537,8 @@ impl Default for LiteTextApp {
             tab_mode: Default::default(),
             terminal: Default::default(),
             updates: Default::default(),
+            diagnostics_settings: Default::default(),
+            diagnostics: Default::default(),
             updater: Default::default(),
             preferences: Default::default(),
             terminal_installed: None,
@@ -561,6 +573,7 @@ impl Default for LiteTextApp {
             popup_opened_at: None,
             tab_drag_id: None,
             tab_grab_dx: 0.0,
+            reveal_tab: None,
             right_controls_w: 105.0,
             popup_pos: None,
             files: Vec::new(),
@@ -597,6 +610,8 @@ impl Default for LiteTextApp {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct LoadedFile {
+    #[serde(default)]
+    pinned: bool,
     id: u64,
     path: PathBuf,
     name: String,
@@ -773,6 +788,7 @@ enum TabAction {
     CloseRight(u64),
     OpenFolder(u64),
     Reload(u64),
+    Pin(u64),
 }
 
 enum MenuAction {
@@ -788,7 +804,7 @@ enum MenuAction {
     CurlMenu,
 }
 
-type RecoveryKey = (Option<u64>, Vec<(u64, PathBuf, String, ViewMode, u64, u64, Option<String>)>);
+type RecoveryKey = (Option<u64>, Vec<(u64, PathBuf, String, ViewMode, u64, u64, Option<String>, bool)>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryIndicator {
@@ -840,7 +856,7 @@ impl LiteTextApp {
         if new_window::finished() { return Ok(()); }
         let path = self.recovery_path().ok_or_else(|| std::io::Error::other("Application storage directory unavailable"))?;
         let key = (self.active_id, self.files.iter().map(|f| (f.id, f.path.clone(), f.name.clone(), f.view,
-            f.content_revision, f.editor_state.large.revision, f.language_override.clone())).collect());
+            f.content_revision, f.editor_state.large.revision, f.language_override.clone(), f.pinned)).collect());
         let stamp = |path: &std::path::Path| std::fs::metadata(path).ok().and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
         let external_change = stamp(&path) != self.recovery_stamp;
         if self.recovery_key.as_ref() != Some(&key) || external_change {
@@ -869,6 +885,7 @@ impl LiteTextApp {
         match self.write_recovery() {
             Ok(()) => true,
             Err(error) => {
+                self.diagnostic_event("ERROR", "recovery", &format!("Recovery write failed: kind={:?}; os_code={:?}", error.kind(), error.raw_os_error()));
                 self.io_error = Some(format!("{}: {error}", tr(self.lang).recovery_failed));
                 // Avoid retrying a failed write every frame.
                 self.last_recovery = Some(std::time::Instant::now());
@@ -916,19 +933,20 @@ impl LiteTextApp {
     }
 
     fn closing_ids(&self, action: &TabAction) -> Vec<u64> {
-        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) | TabAction::Reload(_) => return Vec::new() };
+        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) => return Vec::new() };
         let Some(pos) = self.files.iter().position(|f| f.id == target) else { return Vec::new() };
-        self.files.iter().enumerate().filter(|(i, f)| match action {
+        self.files.iter().enumerate().filter(|(i, f)| !f.pinned && match action {
             TabAction::Close(_) => f.id == target,
             TabAction::CloseOthers(_) => f.id != target,
             TabAction::CloseLeft(_) => *i < pos,
             TabAction::CloseRight(_) => *i > pos,
-            TabAction::OpenFolder(_) | TabAction::Reload(_) => false,
+            TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) => false,
         }).map(|(_, f)| f.id).collect()
     }
 
     fn apply_tab_action(&mut self, action: TabAction) {
         match action {
+            TabAction::Pin(id) => { self.toggle_pin(id); self.backup_or_report(); return; }
             TabAction::Reload(id) => { self.request_reload(id, false); return; }
             TabAction::Close(id) => self.close_tab(id),
             TabAction::CloseOthers(id) => self.close_others(id),
@@ -1050,6 +1068,7 @@ impl LiteTextApp {
             .collect();
         let number = (1..).find(|n| !used.contains(n)).unwrap();
         let mut file = LoadedFile {
+            pinned: false,
             id,
             path: PathBuf::new(),
             name: format!("{} {}", tr(self.lang).untitled, number),
@@ -1119,6 +1138,7 @@ impl LiteTextApp {
                 let character_count = text.chars().count();
                 let line_ending = line_endings::Counts::of(&text).preferred(line_endings::LineEnding::default());
                 self.files.push(LoadedFile {
+                    pinned: false,
                     id,
                     path: path.clone(),
                     name: path
@@ -1216,7 +1236,7 @@ impl LiteTextApp {
     }
 
     fn close_tab(&mut self, id: u64) {
-        if let Some(pos) = self.files.iter().position(|f| f.id == id) {
+        if let Some(pos) = self.files.iter().position(|f| f.id == id && !f.pinned) {
             self.files.remove(pos);
             if self.active_id == Some(id) {
                 // 优先激活右侧邻位，否则最后一个（左侧）
@@ -1233,7 +1253,7 @@ impl LiteTextApp {
     }
 
     fn close_others(&mut self, id: u64) {
-        self.files.retain(|f| f.id == id);
+        self.files.retain(|f| f.id == id || f.pinned);
         self.active_id = Some(id);
         self.selection = None;
         self.drag_anchor = None;
@@ -1246,7 +1266,7 @@ impl LiteTextApp {
                 .files
                 .drain(..)
                 .enumerate()
-                .filter(|(i, f)| *i >= pos || f.id == id)
+                .filter(|(i, f)| *i >= pos || f.id == id || f.pinned)
                 .map(|(_, f)| f)
                 .collect();
             self.ensure_active_exists(id);
@@ -1259,7 +1279,7 @@ impl LiteTextApp {
                 .files
                 .drain(..)
                 .enumerate()
-                .filter(|(i, f)| *i <= pos || f.id == id)
+                .filter(|(i, f)| *i <= pos || f.id == id || f.pinned)
                 .map(|(_, f)| f)
                 .collect();
             self.ensure_active_exists(id);
@@ -1541,8 +1561,10 @@ impl eframe::App for LiteTextApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.diagnostic_event("INFO", "session", "Window exiting");
         self.cancel_open();
         if let Err(error) = self.write_recovery() {
+            self.diagnostic_event("ERROR", "recovery", &format!("Exit recovery failed: kind={:?}", error.kind()));
             eprintln!("Recovery save on exit failed: {error}");
         }
         if !self.update_restarting
@@ -1551,6 +1573,7 @@ impl eframe::App for LiteTextApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let diagnostic_started = self.diagnostics_settings.enabled.then(std::time::Instant::now);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         self.workspace_font_size = if self.workspace_font_size.is_finite() {
             self.workspace_font_size.clamp(10.0, 32.0)
@@ -1606,6 +1629,7 @@ impl eframe::App for LiteTextApp {
             self.last_checked_tab = self.active_id;
         }
         self.had_focus = focused;
+        self.observe_diagnostics();
 
         if let Some(file) = self.active_mut() && file.view == ViewMode::Hex { file.ensure_bytes(); }
 
@@ -1664,6 +1688,7 @@ impl eframe::App for LiteTextApp {
                 }
             });
 
+        self.observe_diagnostics();
         self.settings_window(ctx, pal);
         self.plugin_error_window(ctx);
         self.curl_target_menu(ctx, pal);
@@ -1687,6 +1712,9 @@ impl eframe::App for LiteTextApp {
         self.finish_update_restart(ctx, frame);
         if let Err(error) = self.save_preferences(false) { self.io_error = Some(format!("Unable to save preferences: {error}")); }
         if let Some(delay) = self.preferences_repaint_after() { ctx.request_repaint_after(delay); }
+        self.observe_diagnostics();
+        self.capture_gui_diagnostics(ctx);
+        if let Some(started) = diagnostic_started { self.diagnostic_frame(started.elapsed()); }
     }
 }
 
@@ -1958,6 +1986,10 @@ impl LiteTextApp {
 
     fn top_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
         let t = tr(self.lang);
+        // Both strips must see the same tab partition for this entire pass.
+        // Applying Unpin inside the first strip would register the same widget
+        // again at a different rectangle when the normal strip renders later.
+        let mut pending_tab_action = None;
         ctx.data_mut(|d| {
             d.remove::<egui::Rect>(egui::Id::new("tab_blank_new_rect"));
             d.remove::<egui::Rect>(egui::Id::new("terminal_button_rect"));
@@ -1967,19 +1999,30 @@ impl LiteTextApp {
             .frame(
                 egui::Frame::new()
                     .fill(pal.bg_panel)
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
+                    .inner_margin(egui::Margin {
+                        left: if self.files.iter().any(|file| file.pinned) { 4 } else { 14 },
+                        right: 14,
+                        top: 0,
+                        bottom: 0,
+                    }),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     // ── 左：文件标签页（均分宽度 + 最小宽 + 悬停滚轮查看被遮标签）──
-                    let area_w = (ui.available_width() - self.right_controls_w - 10.0).max(60.0);
-                    let tab_w = tab_width_for(self.files.len(), area_w);
+                    let mut area_w = (ui.available_width() - self.right_controls_w - 10.0).max(60.0);
+                    let pinned = self.files.iter().filter(|file| file.pinned).count();
+                    if pinned > 0 {
+                        let width = pinned_tabs::area_width(pinned, area_w);
+                        pending_tab_action = self.pinned_tab_strip(ui, pal, width);
+                        area_w = (area_w - width - 17.0).max(40.0);
+                    }
+                    let tab_w = tab_width_for(self.files.iter().filter(|file| !file.pinned).count(), area_w);
                     let tab_step = tab_w + TAB_GAP;
-                    let tabs_width = (ui.available_width() - self.right_controls_w - 10.0).max(60.0);
+                    let tabs_width = area_w;
                     ui.scope(|ui| {
                     // 仅标签区将纵向滚轮映射为横向滚动，不影响正文或右侧控件。
                     ui.style_mut().always_scroll_the_only_direction = true;
-                    egui::ScrollArea::horizontal()
+                    let normal_tabs = egui::ScrollArea::horizontal()
                         .id_salt("file_tabs")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, true])
@@ -1991,7 +2034,7 @@ impl LiteTextApp {
                             let pointer = ui.input(|i| i.pointer.interact_pos());
                             let dragging_id = self.tab_drag_id;
 
-                            let ids: Vec<u64> = self.files.iter().map(|f| f.id).collect();
+                            let ids: Vec<u64> = self.files.iter().filter(|f| !f.pinned).map(|f| f.id).collect();
                             // 拖拽中的标签不占槽位，其余按顺序排布
                             let others: Vec<u64> = ids
                                 .iter()
@@ -2063,6 +2106,8 @@ impl LiteTextApp {
                                     egui::Sense::click_and_drag(),
                                 ));
                                 resp = resp.on_hover_text(path);
+                                ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("normal_tab_rect", id)), rect));
+                                if self.reveal_tab == Some(id) { ui.scroll_to_rect(rect, None); self.reveal_tab = None; }
                                 let p = ui.painter_at(rect.expand2(egui::vec2(TAB_FILLET_RADIUS, 0.0)));
 
                                 if active {
@@ -2114,32 +2159,7 @@ impl LiteTextApp {
                                     action = Some(TabAction::Close(id));
                                 }
                                 resp.context_menu(|menu| {
-                                    let has_path = self.files.iter().any(|f| f.id == id && !f.path.as_os_str().is_empty());
-                                    if menu.add_enabled(has_path, egui::Button::new(t.open_folder)).clicked() {
-                                        action = Some(TabAction::OpenFolder(id));
-                                        menu.close_menu();
-                                    }
-                                    let reload = menu.add_enabled(has_path, egui::Button::new(if self.lang == Lang::ZhCn { "从磁盘重新加载" } else { "Reload from disk" }))
-                                        .on_hover_text(if self.lang == Lang::ZhCn { "重新读取原文件，成功后重置标记与撤销历史；失败或取消保留工作区。" } else { "Reread disk; reset marks and undo history only on success. Cancel/failure retains the workspace." });
-                                    menu.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("reload_tab_rect", id)), reload.rect));
-                                    if reload.clicked() { action = Some(TabAction::Reload(id)); menu.close_menu(); }
-                                    menu.separator();
-                                    if menu.button(t.close).clicked() {
-                                        action = Some(TabAction::Close(id));
-                                        menu.close_menu();
-                                    }
-                                    if menu.button(t.close_others).clicked() {
-                                        action = Some(TabAction::CloseOthers(id));
-                                        menu.close_menu();
-                                    }
-                                    if menu.button(t.close_left).clicked() {
-                                        action = Some(TabAction::CloseLeft(id));
-                                        menu.close_menu();
-                                    }
-                                    if menu.button(t.close_right).clicked() {
-                                        action = Some(TabAction::CloseRight(id));
-                                        menu.close_menu();
-                                    }
+                                    if let Some(picked) = self.tab_context_menu(menu, id) { action = Some(picked); }
                                 });
                                 if switch {
                                     self.active_id = Some(id);
@@ -2162,7 +2182,7 @@ impl LiteTextApp {
                                 }
 
                                 if let Some(action) = action {
-                                    self.request_tab_action(action);
+                                    pending_tab_action = Some(action);
                                 }
                             }
 
@@ -2205,12 +2225,7 @@ impl LiteTextApp {
                                 if resp.drag_stopped() {
                                     if let Some(slot) = hover_slot {
                                         let order = insert_id(&others, drag_id, slot);
-                                        let mut old: std::collections::HashMap<_, _> = std::mem::take(&mut self.files)
-                                            .into_iter().map(|file| (file.id, file)).collect();
-                                        self.files = order
-                                            .iter()
-                                            .filter_map(|oid| old.remove(oid))
-                                            .collect();
+                                        self.reorder_normal_tabs(&order);
                                     }
                                     self.tab_drag_id = None;
                                     self.tab_grab_dx = 0.0;
@@ -2236,6 +2251,7 @@ impl LiteTextApp {
                             }
                             ui.allocate_space(egui::vec2(content_w, 38.0));
                         });
+                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("normal_tabs_viewport"), (normal_tabs.inner_rect, normal_tabs.state.offset.x)));
                     });
 
                     ui.separator();
@@ -2327,6 +2343,10 @@ impl LiteTextApp {
                     });
                 });
             });
+        if let Some(action) = pending_tab_action {
+            self.request_tab_action(action);
+            ctx.request_repaint();
+        }
     }
 
     fn status_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -2422,6 +2442,8 @@ impl LiteTextApp {
                     (ctx.screen_rect().width() - 56.0).clamp(320.0, 1240.0),
                     (ctx.screen_rect().height() - 64.0).max(300.0),
                 )
+            } else if self.diagnostics.page {
+                egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 1000.0), (ctx.screen_rect().height() - 80.0).clamp(240.0, 620.0))
             } else if self.workspace_theme_page {
                 egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 1120.0), (ctx.screen_rect().height() - 100.0).clamp(260.0, 620.0))
             } else { egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 460.0), (ctx.screen_rect().height() - 80.0).clamp(180.0, 620.0)) })
@@ -2437,6 +2459,8 @@ impl LiteTextApp {
                 settings_control_style(ui, pal);
                 if self.shortcuts_page {
                     self.shortcuts_ui(ui, pal);
+                } else if self.diagnostics.page {
+                    self.diagnostics_ui(ui, pal);
                 } else if self.workspace_theme_page {
                     self.workspace_theme_ui(ui, pal);
                 } else {
@@ -2483,6 +2507,12 @@ impl LiteTextApp {
                                 );
                                 ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_shortcuts_rect"), shortcuts.rect));
                                 if shortcuts.clicked() { self.shortcuts_page = true; }
+                                if self.diagnostics_settings.unlocked {
+                                    ui.add_space(4.0);
+                                    let diagnostics = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(if self.lang == Lang::ZhCn { "诊断日志    ›" } else { "Diagnostic logs    ›" }));
+                                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_diagnostics_rect"), diagnostics.rect));
+                                    if diagnostics.clicked() { self.diagnostics.page = true; }
+                                }
                             });
                             ui.add_space(8.0);
                             settings_card(ui, pal, |ui| {
@@ -2496,6 +2526,7 @@ impl LiteTextApp {
         if !recording && shortcuts::take_binding(ctx, self.shortcut_keys.binding(shortcuts::Action::Settings)) { done_clicked = true; }
         if !recording && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             if self.shortcuts_page { self.shortcuts_page = false; }
+            else if self.diagnostics.page { self.diagnostics.page = false; }
             else if self.workspace_theme_page { self.workspace_theme_page = false; }
             else { done_clicked = true; }
         }
@@ -2503,7 +2534,7 @@ impl LiteTextApp {
         if !self.show_settings
             && let Err(error) = self.save_preferences(true)
         { self.io_error = Some(format!("Unable to save preferences: {error}")); }
-        if !self.show_settings { self.shortcut_recording = None; self.shortcut_error = None; }
+        if !self.show_settings { self.shortcut_recording = None; self.shortcut_error = None; self.diagnostics.reset_clicks(); }
         if self.applied.as_ref() != Some(&self.workspace_theme.palette(ctx.system_theme())) { ctx.request_repaint(); }
     }
 }
@@ -3331,6 +3362,9 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
     if ui.is_enabled() { text_tools::bulk_paste(file, ui.ctx(), focus); }
     let requested_focus = std::mem::take(&mut file.editor_state.focus_requested);
     let focus = focus || requested_focus;
+    // Folding follows the selected/detected language, not whether Format JSON ran.
+    let json = workspace_theme::effective_language(file) == "JSON";
+    file.editor_state.folds.set_enabled(json);
     file.editor_state.folds.sync(file.draft_text.as_deref().expect("text buffer"), (file.content_revision, file.editor_state.large.revision));
     if !file.editor_state.large.active && file.draft_text.as_ref().is_some_and(|t| large_editor::needs_windowing(t)) {
         file.activate_large(ui.ctx());

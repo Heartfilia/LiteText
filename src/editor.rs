@@ -155,6 +155,9 @@ pub(crate) struct EditorState {
     pub(crate) cursor_line: usize,
     pub(crate) font_size: f32,
     pub(crate) pending_selection: Option<Range<usize>>,
+    /// Allow bottom whitespace after folding so a shorter document does not pull
+    /// the existing viewport upward merely to keep its old bottom edge filled.
+    pub(crate) fold_scroll_extent: f32,
     pub(crate) focus_requested: bool,
     pub(crate) changes: crate::changes::Changes,
     pub(crate) folds: crate::json_plugin::Folds,
@@ -260,10 +263,10 @@ pub(crate) fn gutter_columns(line_count: usize) -> usize {
     digits.div_ceil(2) * 2
 }
 
-/// Leave at least as much space before the widest number as between the
-/// number and the document, including the optional fold controls.
-pub(crate) fn gutter_number_width(line_count: usize, digit_width: f32, fold_width: f32) -> f32 {
-    let left_padding = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING + fold_width;
+/// Reserve digits for original logical line numbers, not the visible row count.
+/// The fold lane is allocated separately and must not also become left padding.
+pub(crate) fn gutter_number_width(line_count: usize, digit_width: f32) -> f32 {
+    let left_padding = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING;
     left_padding + gutter_columns(line_count) as f32 * digit_width + GUTTER_NUMBER_GAP
 }
 
@@ -283,9 +286,12 @@ pub(crate) fn show(
     let bounds = ui.available_rect_before_wrap();
     let editor_id = egui::Id::new("draft_editor").with(file_id);
     if ui.is_enabled() { state.line_ending.remap_enter(ui.ctx(), editor_id, &mut state.composing, text, state.cursor); }
-    state
+    let fold_selection = state
         .folds
         .prepare_input(ui, state.pending_selection.is_some(), editor_id);
+    if state.pending_selection.is_some() && !fold_selection || !state.folds.has_collapsed() {
+        state.fold_scroll_extent = 0.0;
+    }
     let folds = state.folds.clone();
     let fold_w = folds.width();
     scroll_style(ui, pal);
@@ -310,7 +316,7 @@ pub(crate) fn show(
         .first()
         .and_then(|row| (row.glyphs.len() >= 2).then(|| row.glyphs[1].pos.x - row.glyphs[0].pos.x))
         .unwrap_or(8.0);
-    let number_w = gutter_number_width(line_count, digit_w, fold_w);
+    let number_w = gutter_number_width(line_count, digit_w);
     let gutter_w = number_w + fold_w;
     let gutter = egui::Rect::from_min_max(
         bounds.min,
@@ -319,7 +325,11 @@ pub(crate) fn show(
     ui.painter()
         .rect_filled(gutter, 0.0, gutter_bg);
     let mut changed = false;
-    egui::ScrollArea::both()
+    let mut fold_pointer = false;
+    let mut viewport_offset = egui::Vec2::ZERO;
+    let mut depth_action = None;
+    let mut depth_offset = None;
+    let scroll_output = egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .scroll_bar_rect(egui::Rect::from_min_max(
@@ -327,7 +337,8 @@ pub(crate) fn show(
             bounds.max,
         ))
         .auto_shrink([false, false])
-        .show_viewport(ui, |ui, _| {
+        .show_viewport(ui, |ui, viewport| {
+            viewport_offset = viewport.min.to_vec2();
             let origin = ui.cursor().min;
             let viewport_clip = ui.clip_rect();
             let editor_rect = egui::Rect::from_min_size(
@@ -357,7 +368,7 @@ pub(crate) fn show(
                     0,
                 )
             };
-            let reveal = state.pending_selection.is_some();
+            let reveal = state.pending_selection.is_some() && !fold_selection;
             if let Some(range) = state.pending_selection.take() {
                 let mut edit = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
                 edit.cursor
@@ -410,7 +421,7 @@ pub(crate) fn show(
                     .count()
             });
             state.tools.handle_marker(ui, &output, text, 0);
-            reveal_cursor(ui, &output, previous, gutter_w, reveal);
+            if !fold_selection { reveal_cursor(ui, &output, previous, gutter_w, reveal); }
             if tools.whitespace {
                 crate::text_tools::paint_whitespace(ui, &output.galley, output.galley_pos, pal, "");
             }
@@ -484,7 +495,7 @@ pub(crate) fn show(
             {
                 state.selection = Some((anchor.min(line), anchor.max(line)));
             }
-            if response.secondary_clicked()
+            if !folds.enabled && response.secondary_clicked()
                 && let Some(line) = pointer_line
                 && !state
                     .selection
@@ -554,7 +565,7 @@ pub(crate) fn show(
                 );
                 ui.painter()
                     .rect_filled(lane, 0.0, gutter_bg);
-                for block in &folds.blocks {
+                for block in folds.blocks.iter() {
                     if folds.hidden(block.start) {
                         continue;
                     }
@@ -570,6 +581,20 @@ pub(crate) fn show(
                         egui::pos2(lane.left(), output.galley_pos.y + row.rect.top()),
                         egui::pos2(lane.right(), output.galley_pos.y + row.rect.bottom()),
                     );
+                    let menu_rect = egui::Rect::from_min_max(
+                        egui::pos2(number_gutter.left(), rect.top()), rect.max);
+                    if menu_rect.intersects(ui.clip_rect()) {
+                        fold_pointer |= ui.input(|i| i.pointer.interact_pos().is_some_and(|p| menu_rect.contains(p))
+                            && (i.pointer.secondary_down() || i.pointer.button_released(egui::PointerButton::Secondary)));
+                        if crate::json_plugin::depth_menu(menu_rect, file_id, block.start,
+                            folds.collapsed(block.start), t.encoding_binary == "二进制", &response) {
+                            depth_action = Some((block.start, row_index));
+                        }
+                    }
+                    fold_pointer |= rect.intersects(lane.intersect(ui.clip_rect())) && ui.input(|input| {
+                        input.pointer.interact_pos().is_some_and(|pos| rect.contains(pos))
+                            && (input.pointer.any_down() || input.pointer.any_released())
+                    });
                     if rect.intersects(lane.intersect(ui.clip_rect()))
                         && crate::json_plugin::fold_button(
                             ui,
@@ -581,6 +606,8 @@ pub(crate) fn show(
                         )
                     {
                         state.folds.toggle(block.start);
+                        log::info!(target: "litetext::fold", "Toggle node: tab_id={file_id}; line={}; collapsed={}", block.start + 1, state.folds.collapsed(block.start));
+                        state.fold_scroll_extent = viewport.bottom();
                         let start = text
                             .split_inclusive('\n')
                             .take(block.start)
@@ -593,7 +620,7 @@ pub(crate) fn show(
                 }
             }
 
-            response.context_menu(|menu| {
+            if !folds.enabled { response.context_menu(|menu| {
                 let selection = state.selection.unwrap_or((0, 0));
                 let label = if selection.0 == selection.1 {
                     t.copy_line
@@ -619,8 +646,34 @@ pub(crate) fn show(
                     changed |= *text != before;
                     menu.close_menu();
                 }
-            });
+            }); }
+            if let Some((line, row_index)) = depth_action {
+                state.folds.toggle_depth(line);
+                log::info!(target: "litetext::fold", "Toggle depth: tab_id={file_id}; line={}; collapsed={}", line + 1, state.folds.collapsed(line));
+                // Re-layout once, then compensate for same-depth blocks above
+                // the clicked header. Numeric offset alone cannot anchor it.
+                let galley = ui.fonts(|fonts| fonts.layout_job((*output.galley.job).clone()));
+                let galley = state.folds.layout(galley, 0);
+                let delta = galley.rows[row_index].rect.top() - output.galley.rows[row_index].rect.top();
+                let offset = depth_scroll_offset(viewport, delta, galley.size().y + 24.0);
+                depth_offset = Some(offset);
+                // Batch folding may remove most of the document, including
+                // nodes above this header. Keep the real document origin and
+                // scrollbar range instead of manufacturing scrollable space.
+                state.fold_scroll_extent = 0.0;
+                let start = text.split_inclusive('\n').take(line).map(|l| l.chars().count()).sum();
+                state.pending_selection = Some(start..start);
+                ui.ctx().request_repaint();
+            }
+            ui.set_min_height(state.fold_scroll_extent);
         });
+    let scroll_output = finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("editor_scroll_geometry", file_id)), (scroll_output.id, scroll_output.state.offset, scroll_output.inner_rect)));
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("editor_content_geometry", file_id)), (gutter, scroll_output.content_size)));
+    #[cfg(not(test))]
+    let _ = scroll_output;
     state.selected_characters = if let Some(selection) = state.selection {
         copy_lines(text, selection).chars().count()
     } else {
@@ -637,6 +690,31 @@ pub(crate) fn show(
         Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)),
     );
     changed
+}
+
+/// TextEdit may request an implicit cursor reveal even on the press frame of a
+/// gutter click. A display-only fold must cancel that target and its animation,
+/// not just restore the numeric offset while leaving a pending target alive.
+pub(crate) fn finish_fold_scroll<R>(
+    ctx: &egui::Context,
+    mut output: egui::scroll_area::ScrollAreaOutput<R>,
+    offset: Option<egui::Vec2>,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    if let Some(offset) = offset {
+        output.state = egui::scroll_area::State::default();
+        output.state.offset = offset;
+        output.state.store(ctx, output.id);
+    }
+    output
+}
+
+pub(crate) fn depth_scroll_offset(
+    viewport: egui::Rect,
+    delta: f32,
+    content_height: f32,
+) -> egui::Vec2 {
+    let max_offset = (content_height - viewport.height()).max(0.0);
+    egui::vec2(viewport.left(), (viewport.top() + delta).clamp(0.0, max_offset))
 }
 
 #[cfg(test)]
@@ -1014,16 +1092,14 @@ mod tests {
     }
 
     #[test]
-    fn gutter_left_padding_balances_right_gap_including_fold_lane() {
+    fn gutter_left_padding_does_not_duplicate_the_separate_fold_lane() {
         for count in [1usize, 10, 100, 1000, 10000] {
             for digit_width in [5.0, 8.0, 19.0] {
-                for folds in [0.0, 16.0] {
-                    let width = gutter_number_width(count, digit_width, folds);
-                    let reserved_digits = gutter_columns(count) as f32 * digit_width;
-                    let left = width - GUTTER_NUMBER_GAP - reserved_digits;
-                    let right = GUTTER_NUMBER_GAP + folds + EDITOR_LEFT_PADDING;
-                    assert!((left - right).abs() < 0.01);
-                }
+                let width = gutter_number_width(count, digit_width);
+                let reserved_digits = gutter_columns(count) as f32 * digit_width;
+                let left = width - GUTTER_NUMBER_GAP - reserved_digits;
+                let right = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING;
+                assert!((left - right).abs() < 0.01);
             }
         }
     }
