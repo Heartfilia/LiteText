@@ -90,6 +90,7 @@ impl Scan {
 
 fn font_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    #[cfg(target_os = "macos")]
     let home = std::env::var_os("HOME").map(PathBuf::from);
     #[cfg(target_os = "macos")]
     {
@@ -109,6 +110,8 @@ fn font_dirs() -> Vec<PathBuf> {
             dirs.push(local.join(r"Microsoft\Windows\Fonts"));
         }
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         dirs.push(PathBuf::from("/usr/share/fonts"));
