@@ -4,7 +4,7 @@ use crate::{Lang, LiteTextApp, Palette};
 use eframe::egui::{self, Color32};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::Path,
     sync::{Arc, Mutex, OnceLock},
@@ -295,6 +295,10 @@ pub(crate) struct SyntaxCache {
     key: Option<(String, u64, u64)>,
     checkpoints: BTreeMap<usize, Checkpoint>,
     last: Option<(usize, String, Arc<Vec<Token>>)>,
+    /// Recent tokenizations of the same language. Markdown can show several
+    /// code blocks in one frame; without this the last-block cache would miss
+    /// on every block and re-tokenize the whole document each frame.
+    recent: Vec<(usize, String, Arc<Vec<Token>>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,13 +647,20 @@ impl Render {
         {
             return tokens.clone();
         }
+        if let Some((_, _, tokens)) = cache
+            .recent
+            .iter()
+            .find(|(at, cached, _)| *at == offset && cached == text)
+        {
+            return tokens.clone();
+        }
         if self.fast_json || self.language == "Log" {
             let tokens = Arc::new(if self.language == "Log" {
                 log_tokens(text)
             } else {
                 json_tokens(text)
             });
-            cache.last = Some((offset, text.to_owned(), tokens.clone()));
+            remember_tokens(&mut cache, offset, text, tokens.clone());
             return tokens;
         }
         let mut state = cache
@@ -669,7 +680,7 @@ impl Render {
             position += line.len();
         }
         let tokens = Arc::new(tokens);
-        cache.last = Some((offset, text.to_owned(), tokens.clone()));
+        remember_tokens(&mut cache, offset, text, tokens.clone());
         tokens
     }
 
@@ -774,6 +785,92 @@ impl Render {
     }
 }
 
+fn remember_tokens(
+    cache: &mut SyntaxCache,
+    offset: usize,
+    text: &str,
+    tokens: Arc<Vec<Token>>,
+) {
+    cache.last = Some((offset, text.to_owned(), tokens.clone()));
+    cache.recent.retain(|(at, cached, _)| !(*at == offset && cached == text));
+    cache.recent.push((offset, text.to_owned(), tokens));
+    if cache.recent.len() > 8 {
+        cache.recent.remove(0);
+    }
+}
+
+/// Canonical syntect syntax name for a Markdown fence label such as `bash`,
+/// `rust` or `ts`; unknown labels fall back to plain text. Info strings may
+/// carry extra attributes, so the first word is tried when the whole label
+/// does not resolve.
+pub(crate) fn code_syntax_name(label: &str) -> String {
+    if let Some(syntax) = resolve_known(label) {
+        return syntax.name.clone();
+    }
+    let first = label
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .next()
+        .unwrap_or("");
+    resolve_known(first).map_or_else(
+        || "Plain Text".to_owned(),
+        |syntax| syntax.name.clone(),
+    )
+}
+
+/// Resolve a user-typed fence label by extension, token or display name.
+/// Names are matched case-insensitively so `python` and `Python` behave the
+/// same in the free-form language field.
+fn resolve_known(label: &str) -> Option<&'static SyntaxReference> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let lower = label.to_ascii_lowercase();
+    syntaxes()
+        .find_syntax_by_extension(&lower)
+        .or_else(|| syntaxes().find_syntax_by_token(&lower))
+        .or_else(|| syntaxes().find_syntax_by_name(label))
+        .or_else(|| {
+            syntaxes()
+                .syntaxes()
+                .iter()
+                .find(|syntax| syntax.name.eq_ignore_ascii_case(label))
+        })
+}
+
+fn code_renderers() -> &'static Mutex<HashMap<(String, bool), Render>> {
+    static RENDERERS: OnceLock<Mutex<HashMap<(String, bool), Render>>> = OnceLock::new();
+    RENDERERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Syntax-highlight a fenced Markdown code block using the same tokenizer and
+/// preset colors as the source editor. Unknown or empty languages stay plain.
+pub(crate) fn code_job(
+    text: &str,
+    label: &str,
+    font: egui::FontId,
+    width: f32,
+    dark: bool,
+) -> egui::text::LayoutJob {
+    let language = code_syntax_name(label);
+    if language == "Plain Text" {
+        return egui::text::LayoutJob::simple(text.to_owned(), font, Colors::preset(dark).text, width);
+    }
+    let mut renderers = code_renderers().lock().unwrap();
+    let render = renderers
+        .entry((language.clone(), dark))
+        .or_insert_with(|| {
+            Render::prepare(
+                &WorkspaceTheme::default(),
+                dark,
+                language,
+                (0, 0),
+                Arc::new(Mutex::new(SyntaxCache::default())),
+            )
+        });
+    render.layout(text, font, width, 0)
+}
+
 fn syntax_for(name: &str) -> &'static SyntaxReference {
     let name = match name {
         "text" => "Plain Text",
@@ -822,6 +919,11 @@ pub(crate) fn effective_language(file: &crate::LoadedFile) -> String {
             "jsx" => "JSX".to_owned(),
             "vue" => "Vue".to_owned(),
             "svelte" => "Svelte".to_owned(),
+            // Rendered Markdown and JSON never ask syntect for tokens. Keep
+            // their names here so starting in those modes does not load the
+            // full syntax set (tens of milliseconds) before the first frame.
+            "md" | "mdown" | "markdown" | "markdn" => "Markdown".to_owned(),
+            "json" | "jsonl" | "jsonc" => "JSON".to_owned(),
             _ => {
                 let detected = language(path, false);
                 if detected == "Plain Text" {
@@ -867,6 +969,39 @@ pub(crate) fn language_options() -> Vec<String> {
     options
 }
 
+/// First-letter bucket for the status-bar language menu. Names that do not
+/// start with an ASCII letter are grouped under `#`.
+fn language_initial(name: &str) -> char {
+    name.chars()
+        .next()
+        .map(|character| character.to_ascii_uppercase())
+        .filter(|character| character.is_ascii_alphabetic())
+        .unwrap_or('#')
+}
+
+/// All languages grouped by initial letter so the long status-bar menu can be
+/// scanned section by section. Built once; the list is static.
+pub(crate) fn language_groups() -> &'static [(char, Vec<String>)] {
+    static GROUPS: OnceLock<Vec<(char, Vec<String>)>> = OnceLock::new();
+    GROUPS.get_or_init(|| {
+        let mut names = language_options();
+        names.sort_by(|a, b| {
+            language_initial(a)
+                .cmp(&language_initial(b))
+                .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+        });
+        let mut groups: Vec<(char, Vec<String>)> = Vec::new();
+        for name in names {
+            let initial = language_initial(&name);
+            match groups.last_mut() {
+                Some((group, items)) if *group == initial => items.push(name),
+                _ => groups.push((initial, vec![name])),
+            }
+        }
+        groups
+    })
+}
+
 /// Compact status control; popup grows upwards without changing bar height.
 pub(crate) fn language_picker(
     ui: &mut egui::Ui,
@@ -879,17 +1014,25 @@ pub(crate) fn language_picker(
     let label = format!("{selected}  ▴");
     let font = egui::FontId::proportional(12.0);
     let galley = ui.painter().layout_no_wrap(label, font, pal.text_faint);
-    let (rect, response) = ui.allocate_exact_size(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(galley.size().x + 8.0, 14.0),
-        egui::Sense::click(),
+        egui::Sense::hover(),
     );
     let id = egui::Id::new(("workspace_language", file.id));
+    // The painted label is only 14 px tall inside a ~28 px status bar; without
+    // this padding clicks just above/below the text silently miss the control.
+    // The same expanded rect must be used for "click outside" checks, otherwise
+    // a click inside the padding opens and immediately closes the menu.
+    let hit = rect.expand2(egui::vec2(3.0, 5.0)).intersect(ui.clip_rect());
+    let response = ui
+        .interact(hit, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     ui.ctx().data_mut(|d| d.insert_temp(id.with("rect"), rect));
     if !enabled && ui.memory(|m| m.is_popup_open(id)) {
         ui.memory_mut(|m| m.close_popup());
     }
     let mut open = enabled && ui.memory(|m| m.is_popup_open(id));
-    if response.hovered() && enabled {
+    if (response.hovered() || open) && enabled {
         ui.painter()
             .rect_filled(rect.expand2(egui::vec2(2.0, 3.0)), 4.0, pal.bg_elevated);
     }
@@ -918,6 +1061,9 @@ pub(crate) fn language_picker(
         .order(egui::Order::Foreground)
         .pivot(egui::Align2::LEFT_BOTTOM)
         .fixed_pos(rect.left_top() - egui::vec2(0.0, 8.0))
+        // Opaque from the first visible frame: a fading menu would overlap the
+        // document and status-bar text behind it.
+        .fade_in(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style())
                 .fill(pal.bg_panel)
@@ -952,24 +1098,44 @@ pub(crate) fn language_picker(
                         .drag_to_scroll(false)
                         .max_height((ui.ctx().screen_rect().height() - 160.0).clamp(100.0, 340.0))
                         .show(ui, |ui| {
-                            for name in language_options() {
-                                let row = ui.selectable_label(selected == name, &name);
-                                ui.ctx()
-                                    .data_mut(|d| d.insert_temp(id.with(&name), row.rect));
-                                if row.clicked() {
-                                    picked = Some(Some(name));
+                            for (index, (initial, names)) in
+                                language_groups().iter().enumerate()
+                            {
+                                if index > 0 {
+                                    ui.add_space(4.0);
+                                }
+                                let header = ui.label(
+                                    egui::RichText::new(initial.to_string())
+                                        .size(11.0)
+                                        .strong()
+                                        .color(pal.text_faint),
+                                );
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(id.with(("group", *initial)), header.rect)
+                                });
+                                for name in names {
+                                    let row =
+                                        ui.selectable_label(selected == name.as_str(), name);
+                                    ui.ctx()
+                                        .data_mut(|d| d.insert_temp(id.with(name), row.rect));
+                                    if row.clicked() {
+                                        picked = Some(Some(name.clone()));
+                                    }
                                 }
                             }
                         });
                 });
         });
+    #[cfg(test)]
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(id.with("popup_rect"), popup.response.rect));
     if picked.is_some()
         || ui.input(|i| {
             i.key_pressed(egui::Key::Escape)
                 || i.pointer.any_click()
                     && i.pointer
                         .interact_pos()
-                        .is_some_and(|p| !rect.contains(p) && !popup.response.rect.contains(p))
+                        .is_some_and(|p| !hit.contains(p) && !popup.response.rect.contains(p))
         })
     {
         ui.memory_mut(|m| m.close_popup());
@@ -1808,6 +1974,40 @@ mod tests {
     }
 
     #[test]
+    fn language_menu_groups_entries_by_initial_letter() {
+        let groups = language_groups();
+        assert!(groups.len() > 4, "the language list spans many initials");
+        let mut letters = Vec::new();
+        for (initial, names) in groups {
+            assert!(!names.is_empty(), "{initial} must not be empty");
+            assert!(
+                !letters.contains(initial),
+                "{initial} must appear in one group only"
+            );
+            for name in names {
+                assert_eq!(language_initial(name), *initial, "{name:?}");
+            }
+            let mut alphabetical = names.clone();
+            alphabetical.sort_by_key(|name| name.to_lowercase());
+            assert_eq!(&alphabetical, names, "{initial} entries must be sorted");
+            letters.push(*initial);
+        }
+        let mut sorted_letters = letters.clone();
+        sorted_letters.sort_unstable();
+        assert_eq!(letters, sorted_letters);
+        let mut flat: Vec<String> = groups
+            .iter()
+            .flat_map(|(_, names)| names.iter().cloned())
+            .collect();
+        flat.sort();
+        let mut expected = language_options();
+        expected.sort();
+        assert_eq!(flat, expected);
+        assert!(flat.iter().any(|name| name == "Python"));
+        assert!(flat.iter().any(|name| name == "JSON"));
+    }
+
+    #[test]
     fn status_language_picker_updates_only_current_tab_and_colors_then_returns_to_auto() {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
@@ -1850,6 +2050,34 @@ mod tests {
             ctx.data(|d| d.get_temp::<egui::Rect>(popup_id.with(suffix)))
                 .unwrap()
         };
+        let scroll_to = |app: &mut LiteTextApp, suffix: &str| {
+            for _ in 0..120 {
+                let popup = ctx
+                    .data(|d| d.get_temp::<egui::Rect>(popup_id.with("popup_rect")))
+                    .unwrap();
+                let row = get_rect(suffix);
+                if popup.contains(row.center()) {
+                    return;
+                }
+                let delta = if row.center().y > popup.center().y {
+                    -120.0
+                } else {
+                    120.0
+                };
+                run(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(popup.center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, delta),
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            panic!("could not scroll the language menu to {suffix}");
+        };
         run(&mut app, vec![]);
         run(&mut app, vec![]);
         let rect = get_rect("rect");
@@ -1857,8 +2085,17 @@ mod tests {
         click(&mut app, rect);
         run(&mut app, vec![]);
         run(&mut app, vec![]);
+        let header = |initial: char| {
+            ctx.data(|d| {
+                d.get_temp::<egui::Rect>(popup_id.with(("group", initial)))
+            })
+            .unwrap()
+        };
+        assert!(header('A').top() < header('B').top());
+        assert!(header('B').top() < get_rect("C").top());
+        assert!(header('T').top() < get_rect("text").top());
+        scroll_to(&mut app, "text");
         let text_row = get_rect("text");
-        assert!(text_row.bottom() < rect.top());
         click(&mut app, text_row);
         assert_eq!(
             app.active().unwrap().language_override.as_deref(),
@@ -1885,6 +2122,7 @@ mod tests {
         run(&mut app, vec![]);
         run(&mut app, vec![]);
         assert!(ctx.memory(|m| m.is_popup_open(popup_id)));
+        scroll_to(&mut app, "JSON");
         click(&mut app, get_rect("JSON"));
         assert_eq!(effective_language(app.active().unwrap()), "JSON");
         assert_eq!(app.active().unwrap().editor_state.folds.width(), crate::json_plugin::FOLD_WIDTH);
@@ -2037,6 +2275,28 @@ mod tests {
             "SQL",
         ] {
             assert!(options.iter().any(|option| option == name), "{name}");
+        }
+    }
+
+    #[test]
+    fn typed_fence_labels_resolve_to_builtin_syntaxes() {
+        for (label, expected) in [
+            ("rust", "Rust"),
+            ("rs", "Rust"),
+            ("Rust", "Rust"),
+            ("Python", "Python"),
+            ("python", "Python"),
+            ("py", "Python"),
+            ("Bourne Again Shell (bash)", "Bourne Again Shell (bash)"),
+            ("bash", "Bourne Again Shell (bash)"),
+            ("sh", "Bourne Again Shell (bash)"),
+            ("rust,ignore", "Rust"),
+            ("C++", "C++"),
+            ("unknown-language", "Plain Text"),
+            ("text", "Plain Text"),
+            ("", "Plain Text"),
+        ] {
+            assert_eq!(code_syntax_name(label), expected, "{label:?}");
         }
     }
 
@@ -2255,4 +2515,6 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
     }
+
+
 }

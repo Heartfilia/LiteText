@@ -498,3 +498,54 @@ fn pinned_tabs_ignore_double_click_shortcut_and_bulk_close_until_unpinned() {
     }
     assert!(!app.files.iter().any(|file| file.id == ids[0]));
 }
+
+#[test]
+fn pinned_state_survives_restart_for_real_files_and_scratch_drafts() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("notes.md");
+    std::fs::write(&real, "# hi\n").unwrap();
+    let snapshot = dir.path().join("recovery/session.json");
+    let drafts = dir.path().join("drafts");
+    let mut app = LiteTextApp {
+        recovery_path_override: Some(snapshot.clone()),
+        scratch_dir: Some(drafts.clone()),
+        ..Default::default()
+    };
+    app.open_paths_now(vec![real.clone()]);
+    let real_id = app.active_id.unwrap();
+    app.toggle_pin(real_id);
+
+    app.new_document();
+    let draft_id = app.active_id.unwrap();
+    app.active_mut().unwrap().draft_text = Some("pinned draft".into());
+    app.active_mut().unwrap().sync_draft();
+    app.scratch_flush(None, true);
+    app.toggle_pin(draft_id);
+    app.write_recovery().unwrap();
+
+    let mut restored = LiteTextApp {
+        recovery_path_override: Some(snapshot),
+        scratch_dir: Some(drafts),
+        ..Default::default()
+    };
+    restored.restore_session();
+    assert_eq!(restored.files.len(), 2, "one real file and one draft");
+    assert!(
+        restored
+            .files
+            .iter()
+            .find(|file| file.path == crate::linkage::resolved(&real))
+            .unwrap()
+            .pinned,
+        "a pinned real file must reopen pinned"
+    );
+    assert!(
+        restored
+            .files
+            .iter()
+            .find(|file| file.is_scratch_mirror())
+            .unwrap()
+            .pinned,
+        "a pinned untitled draft must reopen pinned"
+    );
+}

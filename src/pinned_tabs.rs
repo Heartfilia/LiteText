@@ -130,10 +130,12 @@ impl LiteTextApp {
                             continue;
                         };
                         let title = self.tab_title(id);
-                        let tooltip = if file.path.as_os_str().is_empty() {
-                            title.clone()
-                        } else {
+                        let tooltip = if !file.path.as_os_str().is_empty() {
                             format!("{title}\n{}", file.path.display())
+                        } else if let Some(scratch) = &file.scratch_path {
+                            format!("{title}\n{}", scratch.display())
+                        } else {
+                            title.clone()
                         };
                         let rect = egui::Rect::from_min_size(
                             origin + egui::vec2(index as f32 * (WIDTH + GAP), 6.0),

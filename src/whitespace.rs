@@ -194,16 +194,28 @@ pub(crate) fn picker(
         egui::FontId::proportional(12.0),
         pal.text_faint,
     );
-    let (rect, response) = ui.allocate_exact_size(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(galley.size().x + 8.0, 14.0),
-        egui::Sense::click(),
+        egui::Sense::hover(),
     );
+    // Extend the clickable area to the full bar height; the painted 14 px text
+    // strip alone leaves dead space above and below. Outside-click checks use
+    // the same rect so a padded click does not open and instantly close it.
+    let hit = rect.expand2(egui::vec2(3.0, 5.0)).intersect(ui.clip_rect());
+    let response = ui
+        .interact(hit, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     let response = response.on_hover_text(if zh {
         "TAB 输入方式：制表符或 2/4 空格。多行选区按 Tab 缩进，Shift+Tab 反缩进；默认转换宽度为 4。"
     } else {
         "Tab: a literal tab, 2 or 4 spaces. Tab indents selected lines; Shift+Tab unindents. Default conversion width: 4."
     });
     ui.ctx().data_mut(|d| d.insert_temp(id.with("rect"), rect));
+    let open = enabled && ui.memory(|m| m.is_popup_open(id));
+    if (response.hovered() || open) && enabled {
+        ui.painter()
+            .rect_filled(rect.expand2(egui::vec2(2.0, 3.0)), 4.0, pal.bg_elevated);
+    }
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, pal.text_faint);
     if !enabled && ui.memory(|m| m.is_popup_open(id)) {
@@ -218,6 +230,8 @@ pub(crate) fn picker(
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::LEFT_BOTTOM)
             .fixed_pos(rect.left_top() - egui::vec2(0.0, 8.0))
+            // Opaque from the first visible frame; a fading menu overlaps the text behind it.
+            .fade_in(false)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style())
                     .fill(pal.bg_panel)
@@ -258,7 +272,7 @@ pub(crate) fn picker(
                     || i.pointer.any_click()
                         && i.pointer
                             .interact_pos()
-                            .is_some_and(|p| !rect.contains(p) && !popup.response.rect.contains(p))
+                            .is_some_and(|p| !hit.contains(p) && !popup.response.rect.contains(p))
             })
         {
             ui.memory_mut(|m| m.close_popup());

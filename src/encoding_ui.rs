@@ -51,8 +51,20 @@ pub(crate) fn picker(
         egui::FontId::proportional(12.0),
         pal.text_faint,
     );
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(galley.size().x, 14.0), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(galley.size().x, 14.0), egui::Sense::hover());
+    let id = egui::Id::new("status_encoding");
+    // Extend the clickable area to the full bar height; the painted 14 px text
+    // strip alone leaves dead space above and below. Outside-click checks use
+    // the same rect so a padded click does not open and instantly close it.
+    let hit = rect.expand2(egui::vec2(3.0, 5.0)).intersect(ui.clip_rect());
+    let response = ui
+        .interact(hit, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let open = enabled && ui.memory(|memory| memory.is_popup_open(id));
+    if (response.hovered() || open) && enabled {
+        ui.painter()
+            .rect_filled(rect.expand2(egui::vec2(2.0, 3.0)), 4.0, pal.bg_elevated);
+    }
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, pal.text_faint);
     let response = response.on_hover_text(if zh {
@@ -60,7 +72,6 @@ pub(crate) fn picker(
     } else {
         "Encoding: reopen disk bytes or convert the next save; never auto-saved"
     });
-    let id = egui::Id::new("status_encoding");
     ui.ctx()
         .data_mut(|data| data.insert_temp(id.with("rect"), rect));
     if !enabled {
@@ -74,7 +85,10 @@ pub(crate) fn picker(
     }
     let mut picked = None;
     if ui.memory(|memory| memory.is_popup_open(id)) {
-        let popup = egui::Area::new(id.with("popup")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(rect.left_top() - egui::vec2(0.0, 8.0)).show(ui.ctx(), |ui| {
+        let popup = egui::Area::new(id.with("popup")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(rect.left_top() - egui::vec2(0.0, 8.0))
+            // Opaque from the first visible frame; a fading menu overlaps the text behind it.
+            .fade_in(false)
+            .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).fill(pal.bg_panel).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for reopen in [true, false] {
@@ -97,7 +111,7 @@ pub(crate) fn picker(
                 input.key_pressed(egui::Key::Escape)
                     || input.pointer.any_click()
                         && input.pointer.interact_pos().is_some_and(|pos| {
-                            !rect.contains(pos) && !popup.response.rect.contains(pos)
+                            !hit.contains(pos) && !popup.response.rect.contains(pos)
                         })
             })
         {
@@ -112,7 +126,7 @@ impl LiteTextApp {
         let Some(file) = self.active() else {
             return;
         };
-        if self.shortcuts_blocked()
+        if self.status_controls_blocked()
             || file.draft_text.is_none()
             || encoding == Encoding::Lossy
             || reopen && file.path.as_os_str().is_empty()
@@ -235,6 +249,11 @@ impl LiteTextApp {
                             Ok(ResultData::Reopened(mut loaded)) => {
                                 loaded.id = file.id;
                                 loaded.pinned = file.pinned;
+                                // Reopening discards the working copy and its
+                                // edit mirror.
+                                if let Some(mirror) = file.scratch_path.take() {
+                                    let _ = crate::scratch::remove(&mirror);
+                                }
                                 loaded.content_revision = file.content_revision + 1;
                                 loaded.saved_generation = file.saved_generation + 1;
                                 loaded.editor_state.tools.wrap = file.editor_state.tools.wrap;

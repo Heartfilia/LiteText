@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod i18n;
 mod editor;
+mod insert_time;
+mod fonts;
 mod recovery;
 mod large_editor;
 mod text_tools;
@@ -40,9 +42,21 @@ mod encoding_ui;
 mod reload;
 mod pinned_tabs;
 mod diagnostics;
+mod markdown;
+mod scratch;
+#[cfg(test)]
+#[path = "settings_popup_tests.rs"]
+mod settings_popup_tests;
+#[cfg(test)]
+#[path = "status_bar_tests.rs"]
+mod status_bar_tests;
 
 const HEX_BYTES_PER_ROW: usize = 16;
 const BINARY_SAMPLE_SIZE: usize = 8192;
+
+/// Zoom bounds shared by the keyboard shortcuts and the settings page.
+pub(crate) const MIN_WORKSPACE_FONT_SIZE: f32 = 10.0;
+pub(crate) const MAX_WORKSPACE_FONT_SIZE: f32 = 32.0;
 
 /// 字体链是否包含控制图片字形（␀ ␊ ␍ 等），决定"显示不可见内容"的降级渲染。
 static CONTROL_PICTURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -89,19 +103,38 @@ fn main() -> eframe::Result {
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             #[cfg(target_os = "macos")]
             file_open::macos::bind(&cc.egui_ctx);
-            setup_fonts(&cc.egui_ctx);
-            let mut app: LiteTextApp = cc
-                .storage
-                .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
-                .or_else(new_window::seed)
-                .unwrap_or_default();
+            {
+                let _timing = timing::phase("startup.fonts");
+                setup_fonts(&cc.egui_ctx);
+            }
+            let mut app: LiteTextApp = {
+                let _timing = timing::phase("startup.load_state");
+                cc
+                    .storage
+                    .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
+                    .or_else(new_window::seed)
+                    .unwrap_or_default()
+            };
             app.migrate_legacy_theme();
-            if let Err(error) = app.load_preferences() {
-                app.io_error = Some(format!("Unable to load preferences: {error}"));
+            {
+                let _timing = timing::phase("startup.preferences");
+                if let Err(error) = app.load_preferences() {
+                    app.io_error = Some(format!("Unable to load preferences: {error}"));
+                }
+                {
+                    let _timing = timing::phase("startup.workspace_font");
+                    crate::fonts::apply(&cc.egui_ctx, app.workspace_font.as_ref());
+                }
             }
             app.initialize_diagnostics();
-            app.restore_session();
-            app.open_paths(paths);
+            {
+                let _timing = timing::phase("startup.restore_session");
+                app.restore_session();
+            }
+            {
+                let _timing = timing::phase("startup.queue_open");
+                app.open_paths(paths);
+            }
             Ok(Box::new(app))
         }),
     )
@@ -123,6 +156,37 @@ pub enum Theme {
     Dark,
     Light,
     System,
+}
+
+/// Pointer gesture that closes a normal tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum TabCloseMode {
+    /// Double-click with the primary button (the historical behaviour).
+    #[default]
+    DoubleClick,
+    /// Middle-click only.
+    MiddleClick,
+    /// Either gesture.
+    DoubleOrMiddle,
+}
+
+impl TabCloseMode {
+    pub(crate) fn allows_double(self) -> bool {
+        matches!(self, Self::DoubleClick | Self::DoubleOrMiddle)
+    }
+
+    pub(crate) fn allows_middle(self) -> bool {
+        matches!(self, Self::MiddleClick | Self::DoubleOrMiddle)
+    }
+
+    pub(crate) fn label(self, lang: Lang) -> &'static str {
+        let t = tr(lang);
+        match self {
+            Self::DoubleClick => t.close_tab_double,
+            Self::MiddleClick => t.close_tab_middle,
+            Self::DoubleOrMiddle => t.close_tab_both,
+        }
+    }
 }
 
 /// 一套完整的界面配色。视图函数全部从调色板取色，不使用硬编码颜色。
@@ -217,6 +281,13 @@ fn apply_style(ctx: &egui::Context, pal: &Palette) {
 /// 读入后直接在内存中把 lineGap 置 0，行盒恢复正常，中文基线与拉丁自然对齐。
 /// 剩余的微小偏差（中文墨迹中心 0.376em vs 数字 0.313em）用 y_offset_factor 光学校正。
 fn setup_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(build_font_definitions());
+}
+
+/// The base font definitions: built-in HarmonyOS Sans, the CJK and symbol
+/// fallbacks from the platform. A user-selected workspace font is layered on
+/// top of this by [`crate::fonts::apply`].
+fn build_font_definitions() -> egui::FontDefinitions {
     const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/HarmonyOS_Sans_Regular.ttf");
     const FONT_MEDIUM: &[u8] = include_bytes!("../assets/fonts/HarmonyOS_Sans_Medium.ttf");
 
@@ -257,7 +328,11 @@ fn setup_fonts(ctx: &egui::Context) {
             fonts
                 .font_data
                 .insert("cjk".to_owned(), std::sync::Arc::new(data));
-            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            for family in [
+                FontFamily::Proportional,
+                FontFamily::Monospace,
+                FontFamily::Name("brand".into()),
+            ] {
                 fonts.families.entry(family).or_default().push("cjk".to_owned());
             }
             break;
@@ -280,7 +355,11 @@ fn setup_fonts(ctx: &egui::Context) {
                 "symbols".to_owned(),
                 std::sync::Arc::new(egui::FontData::from_owned(bytes)),
             );
-            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            for family in [
+                FontFamily::Proportional,
+                FontFamily::Monospace,
+                FontFamily::Name("brand".into()),
+            ] {
                 fonts.families.entry(family).or_default().push("symbols".to_owned());
             }
             symbols_ok = true;
@@ -288,8 +367,7 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     let _ = CONTROL_PICTURES.set(symbols_ok);
-
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 /// 读取并校验一个系统字体文件：必须能被 ab_glyph 解析，且真的包含中文字形。
@@ -382,7 +460,18 @@ struct LiteTextApp {
     legacy_theme: Option<Theme>,
     workspace_theme: workspace_theme::WorkspaceTheme,
     workspace_font_size: f32,
+    /// Last Markdown view chosen from the status bar. New Markdown documents
+    /// open in this mode; it is persisted across app launches.
+    #[serde(default)]
+    markdown_mode: markdown::Mode,
+    /// Directory for untitled draft mirrors; `None` uses the app-data default.
+    #[serde(default)]
+    scratch_dir: Option<PathBuf>,
+    #[serde(skip)]
+    scratch: scratch::State,
     tab_mode: whitespace::TabMode,
+    /// Pointer gesture that closes a normal tab; pinned tabs stay protected.
+    tab_close_mode: TabCloseMode,
     terminal: terminal::Settings,
     updates: updater::Settings,
     #[serde(skip)]
@@ -399,6 +488,14 @@ struct LiteTextApp {
     terminal_pending: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     #[serde(skip)]
     workspace_theme_page: bool,
+    #[serde(skip)]
+    font_page: bool,
+    /// 选中的工作区字体；`None` 表示内置默认栈。
+    workspace_font: Option<crate::fonts::Choice>,
+    #[serde(skip)]
+    font_scan: crate::fonts::Scan,
+    #[serde(skip)]
+    font_previews: crate::fonts::Previews,
     shortcut_keys: shortcuts::Keymap,
     #[serde(skip)]
     shortcut_recording: Option<shortcuts::Action>,
@@ -533,8 +630,12 @@ impl Default for LiteTextApp {
             lang: Lang::default(),
             legacy_theme: None,
             workspace_theme: Default::default(),
-            workspace_font_size: 13.5,
+            workspace_font_size: 14.0,
+            markdown_mode: markdown::Mode::Source,
+            scratch_dir: None,
+            scratch: scratch::State::default(),
             tab_mode: Default::default(),
+            tab_close_mode: Default::default(),
             terminal: Default::default(),
             updates: Default::default(),
             diagnostics_settings: Default::default(),
@@ -544,6 +645,10 @@ impl Default for LiteTextApp {
             terminal_installed: None,
             terminal_pending: None,
             workspace_theme_page: false,
+            font_page: false,
+            workspace_font: None,
+            font_scan: Default::default(),
+            font_previews: Default::default(),
             shortcut_keys: Default::default(),
             shortcut_recording: None,
             shortcut_error: None,
@@ -650,6 +755,14 @@ struct LoadedFile {
     disk: linkage::DiskState,
     #[serde(default)]
     line_ending: line_endings::LineEnding,
+    /// Markdown workspace mode. Text languages keep using the ordinary editor.
+    #[serde(default)]
+    markdown_mode: markdown::Mode,
+    #[serde(skip)]
+    markdown: markdown::State,
+    /// Plain-text mirror for an untitled draft. This is never the user's file.
+    #[serde(skip)]
+    scratch_path: Option<PathBuf>,
     #[serde(skip)]
     saved_generation: u64,
 }
@@ -804,7 +917,21 @@ enum MenuAction {
     CurlMenu,
 }
 
-type RecoveryKey = (Option<u64>, Vec<(u64, PathBuf, String, ViewMode, u64, u64, Option<String>, bool)>);
+type RecoveryKey = (
+    Option<u64>,
+    Vec<(
+        u64,
+        PathBuf,
+        String,
+        ViewMode,
+        u64,
+        u64,
+        Option<String>,
+        bool,
+        Option<PathBuf>,
+        markdown::Mode,
+    )>,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryIndicator {
@@ -841,6 +968,16 @@ impl LiteTextApp {
         }
     }
 
+    /// Opening an extra file must not rewrite the modes of tabs already open.
+    #[cfg(test)]
+    fn apply_markdown_default_to_last(&mut self) {
+        if let Some(file) = self.files.last_mut()
+            && markdown::is_markdown(file)
+        {
+            file.markdown_mode = self.markdown_mode;
+        }
+    }
+
     fn remember_recovered_versions(&mut self) {
         self.recovery_versions = self.files.iter()
             .map(|file| (file.id, (file.content_revision, file.editor_state.large.revision)))
@@ -849,6 +986,9 @@ impl LiteTextApp {
 
     fn write_recovery(&mut self) -> std::io::Result<()> {
         self.finish_restore();
+        // Draft mirrors are authoritative for untitled tabs; flush them before
+        // the session snapshot so a crash right after this write loses nothing.
+        self.scratch_flush(None, true);
         // Background workers only stage private temporary files. They can never
         // publish an older snapshot after this synchronous lifecycle barrier.
         self.invalidate_recovery_worker();
@@ -856,7 +996,8 @@ impl LiteTextApp {
         if new_window::finished() { return Ok(()); }
         let path = self.recovery_path().ok_or_else(|| std::io::Error::other("Application storage directory unavailable"))?;
         let key = (self.active_id, self.files.iter().map(|f| (f.id, f.path.clone(), f.name.clone(), f.view,
-            f.content_revision, f.editor_state.large.revision, f.language_override.clone(), f.pinned)).collect());
+            f.content_revision, f.editor_state.large.revision, f.language_override.clone(), f.pinned,
+            f.scratch_path.clone(), f.markdown_mode)).collect());
         let stamp = |path: &std::path::Path| std::fs::metadata(path).ok().and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
         let external_change = stamp(&path) != self.recovery_stamp;
         if self.recovery_key.as_ref() != Some(&key) || external_change {
@@ -914,6 +1055,7 @@ impl LiteTextApp {
             return false;
         }
         let Some(file) = self.files.iter_mut().find(|f| f.id == id) else { return false; };
+        let mirror = file.scratch_path.clone();
         match recovery::save_document_checked(file, target, expected) {
             Ok(()) => {
                 if self.save_failure.as_ref().is_some_and(|failure| failure.document_id() == id) { self.save_failure = None; self.io_error = None; }
@@ -921,6 +1063,10 @@ impl LiteTextApp {
                 self.recent_files.retain(|p| p != &path);
                 self.recent_files.insert(0, path);
                 self.recent_files.truncate(10);
+                // The document now has a real path; its untitled mirror is
+                // obsolete. Retire it before rewriting the session so a crash
+                // cannot leave both a mirror and a real-file record behind.
+                self.retire_mirror_after_save(id, mirror, target);
                 self.backup_or_report();
                 true
             }
@@ -1062,9 +1208,16 @@ impl LiteTextApp {
         // Display numbers describe only currently open scratch tabs, not the
         // monotonic widget identity (which must not be reused after closing).
         let used: std::collections::HashSet<u64> = self.files.iter()
-            .filter(|f| f.path.as_os_str().is_empty() && f.source_path.is_none())
+            .filter(|f| f.is_untitled())
             .filter_map(|f| [tr(Lang::ZhCn).untitled, tr(Lang::En).untitled].into_iter()
-                .find_map(|prefix| f.name.strip_prefix(&format!("{prefix} "))?.parse().ok()))
+                .find_map(|prefix| {
+                    let rest = f.name.strip_prefix(&format!("{prefix} "))?;
+                    let rest = rest
+                        .strip_suffix(".md")
+                        .or_else(|| rest.strip_suffix(".txt"))
+                        .unwrap_or(rest);
+                    rest.parse().ok()
+                }))
             .collect();
         let number = (1..).find(|n| !used.contains(n)).unwrap();
         let mut file = LoadedFile {
@@ -1089,6 +1242,9 @@ impl LiteTextApp {
             source_path: None,
             disk: linkage::DiskState::default(),
             line_ending: line_endings::LineEnding::default(),
+            markdown_mode: markdown::Mode::Source,
+            markdown: markdown::State::default(),
+            scratch_path: None,
             saved_generation: 0,
         };
         file.sync_draft();
@@ -1112,7 +1268,12 @@ impl LiteTextApp {
     fn open_paths_now(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
-            if let Some(existing) = self.files.iter().find(|f| f.path == path) {
+            if let Some(existing) = self.files.iter().find(|f| {
+                f.path == path
+                    || f.scratch_path.as_deref().is_some_and(|scratch| {
+                        linkage::resolved(scratch) == path
+                    })
+            }) {
                 self.active_id = Some(existing.id);
             } else {
                 let bytes = match std::fs::read(&path) {
@@ -1162,8 +1323,12 @@ impl LiteTextApp {
                     source_path: None,
                     disk: linkage::DiskState::default(),
                     line_ending,
+                    markdown_mode: markdown::Mode::Source,
+                    markdown: markdown::State::default(),
+                    scratch_path: None,
                     saved_generation: 0,
                 });
+                self.apply_markdown_default_to_last();
                 self.active_id = Some(id);
                 self.selection = None;
                 self.drag_anchor = None;
@@ -1183,21 +1348,35 @@ impl LiteTextApp {
         let source = self.recovery_path_override.clone().or(source);
         #[cfg(not(test))]
         if let Some(path) = source {
-            self.start_restore(path);
+            let scratch = self.scratch_root();
+            self.start_restore(path, scratch);
             return;
         }
         #[cfg(test)]
         if let Some(path) = source {
-            match recovery::load(&path) {
-                Ok(Some(session)) => {
-                    self.files = session.restore();
-                    self.active_id = session.active_id;
-                    self.remember_recovered_versions();
-                }
-                Ok(None) => {}
-                Err(error) => self.io_error = Some(format!("{}: {error}", tr(self.lang).recovery_failed)),
-            }
+            let drafts = scratch::scan(self.scratch_root().as_deref());
+            let result = recovery::load(&path).map(|session| match session {
+                Some(session) => background_io::Restored {
+                    files: session.restore(),
+                    active: session.active_id,
+                    scratch_active: session.scratch_active().map(str::to_owned),
+                    scratch_meta: session.scratch_meta(),
+                    drafts,
+                },
+                None => background_io::Restored {
+                    files: Vec::new(),
+                    active: None,
+                    scratch_active: None,
+                    scratch_meta: Vec::new(),
+                    drafts,
+                },
+            });
+            self.apply_restored(result);
+            self.recent_files.retain(|p| p.exists());
+            return;
         }
+        self.open_scratch_files();
+        self.scratch_maintenance();
         self.next_file_id = self.files.iter().map(|f| f.id).max().unwrap_or(0) + 1;
         self.recent_files.retain(|p| p.exists());
         if !self.files.iter().any(|f| Some(f.id) == self.active_id) {
@@ -1237,7 +1416,8 @@ impl LiteTextApp {
 
     fn close_tab(&mut self, id: u64) {
         if let Some(pos) = self.files.iter().position(|f| f.id == id && !f.pinned) {
-            self.files.remove(pos);
+            let file = self.files.remove(pos);
+            self.retire_file(file);
             if self.active_id == Some(id) {
                 // 优先激活右侧邻位，否则最后一个（左侧）
                 self.active_id = self
@@ -1253,7 +1433,15 @@ impl LiteTextApp {
     }
 
     fn close_others(&mut self, id: u64) {
-        self.files.retain(|f| f.id == id || f.pinned);
+        let mut kept = Vec::with_capacity(self.files.len());
+        for file in std::mem::take(&mut self.files) {
+            if file.id == id || file.pinned {
+                kept.push(file);
+            } else {
+                self.retire_file(file);
+            }
+        }
+        self.files = kept;
         self.active_id = Some(id);
         self.selection = None;
         self.drag_anchor = None;
@@ -1262,26 +1450,30 @@ impl LiteTextApp {
 
     fn close_left(&mut self, id: u64) {
         if let Some(pos) = self.files.iter().position(|f| f.id == id) {
-            self.files = self
-                .files
-                .drain(..)
-                .enumerate()
-                .filter(|(i, f)| *i >= pos || f.id == id || f.pinned)
-                .map(|(_, f)| f)
-                .collect();
+            let mut kept = Vec::with_capacity(self.files.len());
+            for (index, file) in std::mem::take(&mut self.files).into_iter().enumerate() {
+                if index >= pos || file.id == id || file.pinned {
+                    kept.push(file);
+                } else {
+                    self.retire_file(file);
+                }
+            }
+            self.files = kept;
             self.ensure_active_exists(id);
         }
     }
 
     fn close_right(&mut self, id: u64) {
         if let Some(pos) = self.files.iter().position(|f| f.id == id) {
-            self.files = self
-                .files
-                .drain(..)
-                .enumerate()
-                .filter(|(i, f)| *i <= pos || f.id == id || f.pinned)
-                .map(|(_, f)| f)
-                .collect();
+            let mut kept = Vec::with_capacity(self.files.len());
+            for (index, file) in std::mem::take(&mut self.files).into_iter().enumerate() {
+                if index <= pos || file.id == id || file.pinned {
+                    kept.push(file);
+                } else {
+                    self.retire_file(file);
+                }
+            }
+            self.files = kept;
             self.ensure_active_exists(id);
         }
     }
@@ -1464,14 +1656,31 @@ fn tab_fillet_shapes(rect: &egui::Rect) -> [(egui::Rect, egui::Pos2); 2] {
 }
 
 fn open_file_folder(path: &std::path::Path) -> std::io::Result<()> {
-    let parent = file_parent_folder(path)?;
+    launch_in_file_manager(&file_parent_folder(path)?)
+}
+
+/// Open a directory itself (for example the configured scratch folder).
+fn open_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    launch_in_file_manager(path)
+}
+
+/// Unit tests exercise the settings UI without launching Finder/Explorer.
+#[cfg(test)]
+fn launch_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn launch_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
     #[cfg(target_os = "windows")]
     let mut command = std::process::Command::new("explorer");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut command = std::process::Command::new("xdg-open");
-    command.arg(parent).spawn()?;
+    command.arg(path).spawn()?;
     Ok(())
 }
 
@@ -1488,7 +1697,14 @@ fn path_copy_label(ui: &mut egui::Ui, path: &str, pal: &Palette, hint: &str) -> 
     let font = FontId::proportional(12.0);
     let galley = ui.painter().layout_no_wrap(path.to_owned(), font.clone(), pal.text_faint);
     let width = galley.size().x.min(ui.available_width()).max(0.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, galley.size().y), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, galley.size().y), egui::Sense::hover());
+    // Same as the status-bar pickers: expand the hit area vertically so the
+    // label is easy to click without making the bar taller.
+    let response = ui.interact(
+        rect.expand2(egui::vec2(2.0, 5.0)).intersect(ui.clip_rect()),
+        egui::Id::new(("copy_path", path)),
+        egui::Sense::click(),
+    );
     let display = elide_tab_title(path, width, |text| ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal.text_faint).size().x);
     ui.painter_at(rect).text(rect.left_center(), egui::Align2::LEFT_CENTER, display, font, pal.text_faint);
     let response = response
@@ -1540,6 +1756,7 @@ fn format_size(size: u64) -> String {
 
 impl eframe::App for LiteTextApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.scratch_flush(None, true);
         #[cfg(test)]
         self.backup_or_report();
         #[cfg(not(test))]
@@ -1575,9 +1792,13 @@ impl eframe::App for LiteTextApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let diagnostic_started = self.diagnostics_settings.enabled.then(std::time::Instant::now);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        // Sizes are whole points: the shortcuts step by 1 and the settings
+        // control has no half-point precision.
         self.workspace_font_size = if self.workspace_font_size.is_finite() {
-            self.workspace_font_size.clamp(10.0, 32.0)
-        } else { 13.5 };
+            self.workspace_font_size
+                .round()
+                .clamp(MIN_WORKSPACE_FONT_SIZE, MAX_WORKSPACE_FONT_SIZE)
+        } else { 14.0 };
         self.poll_terminal();
         self.poll_updates();
         self.poll_background_io(ctx);
@@ -1698,6 +1919,9 @@ impl eframe::App for LiteTextApp {
             self.save_file(id);
             ctx.request_repaint();
         }
+        // Flush mirrors first: a recovery snapshot may only reference a
+        // mirror after it contains the current revision.
+        self.scratch_flush(Some(ctx), false);
         if self.last_recovery.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5)) {
             self.start_background_recovery();
             ctx.request_repaint();
@@ -1969,7 +2193,7 @@ impl LiteTextApp {
             Some(MenuAction::SaveAs) => { self.save_as(); },
             Some(MenuAction::NewWindow) => self.open_new_window(),
             Some(MenuAction::Recent(path)) => self.open_paths(vec![path]),
-            Some(MenuAction::Settings) => { self.show_settings = true; self.shortcuts_page = false; self.workspace_theme_page = false; },
+            Some(MenuAction::Settings) => { self.show_settings = true; self.shortcuts_page = false; self.workspace_theme_page = false; self.font_page = false; self.font_previews.clear(); },
             Some(MenuAction::FormatJson) if !self.shortcuts_blocked() => self.format_active_json(ctx),
             Some(MenuAction::FormatJson) => {},
             Some(MenuAction::Whitespace(operation)) if !self.shortcuts_blocked() => {
@@ -2081,10 +2305,14 @@ impl LiteTextApp {
                                     .files
                                     .iter()
                                     .find(|f| f.id == id)
-                                    .map(|f| if f.path.as_os_str().is_empty() {
-                                        t.unsaved.to_owned()
-                                    } else {
-                                        f.path.to_string_lossy().into_owned()
+                                    .map(|f| {
+                                        if !f.path.as_os_str().is_empty() {
+                                            f.path.to_string_lossy().into_owned()
+                                        } else if let Some(scratch) = &f.scratch_path {
+                                            scratch.to_string_lossy().into_owned()
+                                        } else {
+                                            t.unsaved.to_owned()
+                                        }
                                     })
                                     .unwrap_or_default();
 
@@ -2155,7 +2383,11 @@ impl LiteTextApp {
                                 if resp.clicked() && !active {
                                     switch = true;
                                 }
-                                if resp.double_clicked() {
+                                let close_by_double = self.tab_close_mode.allows_double()
+                                    && resp.double_clicked();
+                                let close_by_middle = self.tab_close_mode.allows_middle()
+                                    && resp.clicked_by(egui::PointerButton::Middle);
+                                if close_by_double || close_by_middle {
                                     action = Some(TabAction::Close(id));
                                 }
                                 resp.context_menu(|menu| {
@@ -2335,7 +2567,17 @@ impl LiteTextApp {
                         if let Some(file) = self.active_mut()
                             && file.view == ViewMode::Text && file.draft_text.is_some()
                         {
-                            text_tools::toolbar(ui, file, pal, t);
+                            // Rendered Markdown has no source TextEdit to wrap,
+                            // reveal whitespace in or paint marks on. Huge
+                            // documents fall back to the source editor even in
+                            // rendered modes, so the controls stay usable then.
+                            let rendered = markdown::is_markdown(file)
+                                && file.markdown_mode != markdown::Mode::Source
+                                && !(file.editor_state.large.active
+                                    || file.draft_text.as_ref().is_some_and(|text| {
+                                        large_editor::needs_windowing(text)
+                                    }));
+                            text_tools::toolbar(ui, file, pal, t, rendered);
                         }
 
                         // 实测右侧控件总宽（下一帧供标签区自适应）
@@ -2359,13 +2601,29 @@ impl LiteTextApp {
         };
         let size_label = format_size(file.byte_len() as u64);
         let indicator = self.recovery_indicator(file);
-        let path = (!file.path.as_os_str().is_empty()).then(|| std::path::absolute(&file.path)
-            .unwrap_or_else(|_| file.path.clone()).to_string_lossy().into_owned());
-        let language_enabled = !self.shortcuts_blocked() && !file.is_binary;
+        let path = if !file.path.as_os_str().is_empty() {
+            std::path::absolute(&file.path)
+                .unwrap_or_else(|_| file.path.clone())
+                .to_string_lossy()
+                .into_owned()
+        } else if let Some(scratch) = &file.scratch_path {
+            std::path::absolute(scratch)
+                .unwrap_or_else(|_| scratch.clone())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::new()
+        };
+        let path = (!path.is_empty()).then_some(path);
+        // Do not reuse the keyboard-shortcut gate here: a running background search
+        // or the value popup must not turn the status menus into dead zones.
+        let language_enabled = !self.status_controls_blocked() && !file.is_binary;
+        let markdown_picker = file.view == ViewMode::Text && markdown::is_markdown(file);
         let mut language_change = None;
         let mut tab_change = None;
         let mut ending_change = None;
         let mut encoding_change = None;
+        let mut markdown_change = None;
         egui::TopBottomPanel::bottom("status_bar")
             .frame(egui::Frame::new().fill(pal.bg_panel).inner_margin(egui::Margin::symmetric(14, 5)))
             .show(ctx, |ui| {
@@ -2392,6 +2650,10 @@ impl LiteTextApp {
                     if file.view == ViewMode::Text && !file.is_binary {
                         ui.separator();
                         ending_change = line_endings::picker(ui, file, self.lang, pal, language_enabled);
+                    }
+                    if markdown_picker {
+                        ui.separator();
+                        markdown_change = markdown::picker(ui, file, self.lang, pal, language_enabled);
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2420,6 +2682,16 @@ impl LiteTextApp {
         if let Some(ending) = ending_change && let Some(file) = self.active_mut() {
             line_endings::convert(file, ctx, ending);
         }
+        if let Some(mode) = markdown_change {
+            // Remember the choice for future Markdown files and the next launch.
+            self.markdown_mode = mode;
+            if let Some(file) = self.active_mut() {
+                file.markdown_mode = mode;
+                file.markdown.editing = None;
+                file.markdown.split_offset = 0.0;
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -2438,14 +2710,21 @@ impl LiteTextApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size(if self.shortcuts_page {
+                // The shortcut groups sit two per row; a narrower page keeps the
+                // label and its control in one card from drifting apart.
                 egui::vec2(
-                    (ctx.screen_rect().width() - 56.0).clamp(320.0, 1240.0),
+                    (ctx.screen_rect().width() - 56.0).clamp(320.0, 900.0),
                     (ctx.screen_rect().height() - 64.0).max(300.0),
                 )
             } else if self.diagnostics.page {
                 egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 1000.0), (ctx.screen_rect().height() - 80.0).clamp(240.0, 620.0))
             } else if self.workspace_theme_page {
                 egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 1120.0), (ctx.screen_rect().height() - 100.0).clamp(260.0, 620.0))
+            } else if self.font_page {
+                egui::vec2(
+                    (ctx.screen_rect().width() - 56.0).clamp(320.0, 560.0),
+                    (ctx.screen_rect().height() - 80.0).clamp(260.0, 640.0),
+                )
             } else { egui::vec2((ctx.screen_rect().width() - 56.0).clamp(320.0, 460.0), (ctx.screen_rect().height() - 80.0).clamp(180.0, 620.0)) })
             .frame(
                 egui::Frame::new()
@@ -2463,9 +2742,12 @@ impl LiteTextApp {
                     self.diagnostics_ui(ui, pal);
                 } else if self.workspace_theme_page {
                     self.workspace_theme_ui(ui, pal);
+                } else if self.font_page {
+                    self.font_ui(ui, pal);
                 } else {
+                    let footer_height = 34.0;
                     let scroll = egui::ScrollArea::vertical().id_salt("settings_home_scroll")
-                        .max_height(ui.available_height())
+                        .max_height((ui.available_height() - footer_height).max(80.0))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -2484,6 +2766,9 @@ impl LiteTextApp {
                                             self.lang.native_name().to_owned(), options, 160.0,
                                         ) {
                                             self.lang = lang;
+                                            // Redraw immediately with the new strings; popups
+                                            // with fade disabled no longer schedule repaints.
+                                            ui.ctx().request_repaint();
                                         }
                                     });
                                 });
@@ -2497,9 +2782,72 @@ impl LiteTextApp {
                             });
                             ui.add_space(8.0);
                             settings_card(ui, pal, |ui| {
+                                section_header(ui, pal, t.scratch_title);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(t.scratch_desc).size(11.0).color(pal.text_faint),
+                                    )
+                                    .wrap(),
+                                );
+                                if let Some(root) = self.scratch_display_root() {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(root.display().to_string())
+                                                .size(11.0)
+                                                .color(pal.text_main)
+                                                .monospace(),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button(t.scratch_choose).clicked() {
+                                        let mut dialog = rfd::FileDialog::new().set_title(t.scratch_title);
+                                        if let Some(root) = self.scratch_display_root() {
+                                            dialog = dialog.set_directory(root);
+                                        }
+                                        if let Some(directory) = dialog.pick_folder() {
+                                            self.scratch_dir = Some(directory);
+                                            // Move existing mirrors into the new directory.
+                                            self.scratch_flush(None, true);
+                                        }
+                                    }
+                                    let open_folder = ui.button(t.open_folder);
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(
+                                            egui::Id::new("scratch_open_folder_rect"),
+                                            open_folder.rect,
+                                        );
+                                    });
+                                    if open_folder.clicked()
+                                        && let Some(root) = self.scratch_display_root()
+                                        && let Err(error) = open_directory(&root)
+                                    {
+                                        self.io_error = Some(format!(
+                                            "{}: {error}",
+                                            tr(self.lang).open_folder
+                                        ));
+                                    }
+                                    if self.scratch_dir.is_some() && ui.button(t.scratch_reset).clicked() {
+                                        self.scratch_dir = None;
+                                        self.scratch_flush(None, true);
+                                    }
+                                });
+                            });
+                            ui.add_space(8.0);
+                            settings_card(ui, pal, |ui| {
                                 let workspace = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(format!("{}    ›", t.workspace_theme)));
                                 ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_workspace_theme_rect"), workspace.rect));
                                 if workspace.clicked() { self.workspace_theme_page = true; }
+                                ui.add_space(4.0);
+                                let font = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(format!("{}    ›", t.workspace_font)));
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_font_rect"), font.rect));
+                                if font.clicked() {
+                                    self.font_page = true;
+                                    self.font_scan.start();
+                                }
                                 ui.add_space(4.0);
                                 let shortcuts = ui.add_sized(
                                     [ui.available_width(), 30.0],
@@ -2521,6 +2869,7 @@ impl LiteTextApp {
                             });
                         });
                     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("settings_home_scroll_rect"), scroll.inner_rect));
+                    self.settings_footer(ui, pal);
                 }
             });
         if !recording && shortcuts::take_binding(ctx, self.shortcut_keys.binding(shortcuts::Action::Settings)) { done_clicked = true; }
@@ -2528,6 +2877,10 @@ impl LiteTextApp {
             if self.shortcuts_page { self.shortcuts_page = false; }
             else if self.diagnostics.page { self.diagnostics.page = false; }
             else if self.workspace_theme_page { self.workspace_theme_page = false; }
+            else if self.font_page {
+                self.font_page = false;
+                self.font_previews.clear();
+            }
             else { done_clicked = true; }
         }
         self.show_settings = open && !done_clicked;
@@ -2536,6 +2889,245 @@ impl LiteTextApp {
         { self.io_error = Some(format!("Unable to save preferences: {error}")); }
         if !self.show_settings { self.shortcut_recording = None; self.shortcut_error = None; self.diagnostics.reset_clicks(); }
         if self.applied.as_ref() != Some(&self.workspace_theme.palette(ctx.system_theme())) { ctx.request_repaint(); }
+    }
+
+    /// 系统设置 → 工作区字体：默认使用内置等宽字体栈，也可换成系统字体。
+    /// 扫描在后台线程执行，只读取字体文件的 name 表，选中时才加载整份文件。
+    fn font_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let zh = self.lang == Lang::ZhCn;
+        let t = tr(self.lang);
+        let back = ui.button(if zh {
+            "‹ 返回系统设置"
+        } else {
+            "‹ Back to settings"
+        });
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("font_back_rect"), back.rect));
+        if back.clicked() {
+            self.font_page = false;
+            self.font_previews.clear();
+        }
+        ui.add_space(6.0);
+        settings_card(ui, pal, |ui| {
+            section_header(ui, pal, t.workspace_font);
+            ui.label(RichText::new(t.font_desc).size(11.0).color(pal.text_faint));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let current = self
+                    .workspace_font
+                    .as_ref()
+                    .map_or(t.font_builtin.to_owned(), |choice| choice.family.clone());
+                ui.label(RichText::new(current).size(13.0).strong());
+                let reset = ui.button(t.font_reset);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("font_reset_rect"), reset.rect)
+                });
+                if reset.clicked() {
+                    self.workspace_font = None;
+                    crate::fonts::apply(ui.ctx(), None);
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.add_space(8.0);
+            // The same value the zoom shortcuts adjust, exposed here so it is
+            // discoverable and settable without a keyboard chord.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t.font_size).size(13.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let plus = ui.add(
+                        egui::Button::new("+").min_size(egui::vec2(26.0, 22.0)),
+                    );
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("font_size_plus_rect"), plus.rect)
+                    });
+                    let value = ui.add(
+                        egui::DragValue::new(&mut self.workspace_font_size)
+                            .speed(1.0)
+                            .range(MIN_WORKSPACE_FONT_SIZE..=MAX_WORKSPACE_FONT_SIZE)
+                            .fixed_decimals(0),
+                    );
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("font_size_value_rect"), value.rect)
+                    });
+                    let minus = ui.add(
+                        egui::Button::new("\u{2212}").min_size(egui::vec2(26.0, 22.0)),
+                    );
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("font_size_minus_rect"), minus.rect)
+                    });
+                    if plus.clicked() {
+                        self.workspace_font_size = (self.workspace_font_size + 1.0)
+                            .clamp(MIN_WORKSPACE_FONT_SIZE, MAX_WORKSPACE_FONT_SIZE);
+                    }
+                    if minus.clicked() {
+                        self.workspace_font_size = (self.workspace_font_size - 1.0)
+                            .clamp(MIN_WORKSPACE_FONT_SIZE, MAX_WORKSPACE_FONT_SIZE);
+                    }
+                    if plus.clicked() || minus.clicked() || value.changed() {
+                        ui.ctx().request_repaint();
+                    }
+                    let mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
+                    ui.label(
+                        RichText::new(if mac {
+                            "\u{2318} + / \u{2318} \u{2212}"
+                        } else {
+                            "Ctrl + / Ctrl \u{2212}"
+                        })
+                        .size(11.0)
+                        .color(pal.text_faint),
+                    );
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(RichText::new(t.font_size_desc).size(11.0).color(pal.text_faint));
+        });
+        ui.add_space(8.0);
+        self.font_scan.poll();
+        let Some(fonts) = self.font_scan.list() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(t.font_scanning).size(13.0).color(pal.text_faint));
+            });
+            ui.ctx().request_repaint();
+            return;
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("font_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                // A Chinese UI only lists faces that can actually set Chinese
+                // text; the rest would make the document fall back mid-run.
+                let visible: Vec<&crate::fonts::SystemFont> = fonts
+                    .iter()
+                    .filter(|font| !zh || font.chinese)
+                    .collect();
+                let sample_text = if zh { "【中文】[Aa 012]" } else { "[Aa 012]" };
+                for font in visible.iter().copied() {
+                    let selected = self.workspace_font.as_ref().is_some_and(|choice| {
+                        choice.family == font.family && choice.path == font.path
+                    });
+                    // Both the name and the sample are painted with the font
+                    // itself (rasterized once, cached, tinted by theme), so the
+                    // row is a real preview. Fonts that cannot render their own
+                    // name fall back to a plain label.
+                    let (rect, row) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 26.0),
+                        egui::Sense::click(),
+                    );
+                    let row = row
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(font.path.display().to_string());
+                    // Rasterizing reads the font file; only do it for rows
+                    // that are actually on screen.
+                    if ui.is_rect_visible(rect) {
+                        let painter = ui.painter_at(rect);
+                        if selected {
+                            painter.rect_filled(
+                                rect,
+                                4.0,
+                                crate::opaque_tint(pal.bg_panel, pal.accent, 0.28),
+                            );
+                        } else if row.hovered() {
+                            painter.rect_filled(rect, 4.0, pal.bg_elevated);
+                        }
+                        const HEIGHT: f32 = 15.0;
+                        const LEFT: f32 = 10.0;
+                        const GAP: f32 = 14.0;
+                        let max_width = (rect.width() - LEFT * 2.0).max(40.0);
+                        let name = self
+                            .font_previews
+                            .texture(ui.ctx(), &font.family, &font.path, font.index);
+                        let left = rect.left() + LEFT;
+                        let name_width = if let Some(handle) = &name {
+                            let mut size = egui::vec2(handle.aspect_ratio() * HEIGHT, HEIGHT);
+                            if size.x > max_width {
+                                size *= max_width / size.x;
+                            }
+                            let image = egui::Rect::from_min_size(
+                                egui::pos2(left, rect.center().y - size.y * 0.5),
+                                size,
+                            );
+                            painter.image(
+                                handle.id(),
+                                image,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                pal.text_main,
+                            );
+                            size.x
+                        } else {
+                            let galley = painter.layout_no_wrap(
+                                font.family.clone(),
+                                egui::FontId::proportional(13.0),
+                                pal.text_main,
+                            );
+                            let width = galley.size().x.min(max_width);
+                            painter.galley(
+                                egui::pos2(left, rect.center().y - galley.size().y * 0.5),
+                                galley,
+                                pal.text_main,
+                            );
+                            width
+                        };
+                        // The sample sits after the name, in the same font. It is
+                        // dropped only when there is no room or the font lacks the
+                        // sample glyphs (the name alone still identifies the row).
+                        let sample_left = left + name_width + GAP;
+                        let sample_room = rect.right() - LEFT - sample_left;
+                        if sample_room > 30.0
+                            && let Some(handle) = self
+                                .font_previews
+                                .texture(ui.ctx(), sample_text, &font.path, font.index)
+                                .or_else(|| {
+                                    self.font_previews.texture(
+                                        ui.ctx(),
+                                        if zh { "中文" } else { "Aa 012" },
+                                        &font.path,
+                                        font.index,
+                                    )
+                                })
+                        {
+                            let mut size = egui::vec2(handle.aspect_ratio() * HEIGHT, HEIGHT);
+                            if size.x > sample_room {
+                                size *= sample_room / size.x;
+                            }
+                            let image = egui::Rect::from_min_size(
+                                egui::pos2(sample_left, rect.center().y - size.y * 0.5),
+                                size,
+                            );
+                            painter.image(
+                                handle.id(),
+                                image,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                pal.text_faint,
+                            );
+                        }
+                    }
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("font_row", font.family.clone())), rect)
+                    });
+                    if row.clicked() {
+                        self.workspace_font = Some(crate::fonts::Choice {
+                            family: font.family.clone(),
+                            path: font.path.clone(),
+                            index: font.index,
+                        });
+                        crate::fonts::apply(ui.ctx(), self.workspace_font.as_ref());
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if visible.is_empty() {
+                    ui.label(
+                        RichText::new(if zh {
+                            "没有找到支持中文的系统字体"
+                        } else {
+                            "No usable system fonts found"
+                        })
+                        .size(12.0)
+                        .color(pal.text_faint),
+                    );
+                }
+            });
     }
 }
 
@@ -2581,6 +3173,15 @@ fn section_header(ui: &mut egui::Ui, pal: &Palette, title: &str) {
     ui.add_space(2.0);
     ui.label(RichText::new(title).size(11.0).strong().color(pal.text_faint));
     ui.add_space(2.0);
+}
+
+/// Blend two colors and keep the result fully opaque. `Color32::gamma_multiply`
+/// also multiplies alpha, which turns any "tint over text" into a window that
+/// lets the text underneath show through.
+fn opaque_tint(bg: Color32, fg: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let blend = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    Color32::from_rgb(blend(bg.r(), fg.r()), blend(bg.g(), fg.g()), blend(bg.b(), fg.b()))
 }
 
 /// 现代胶囊按钮：primary 为强调色实底，secondary 为安静幽灵样式。
@@ -3050,10 +3651,12 @@ fn dropdown<S: Clone + PartialEq + 'static>(
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter();
+    // `gamma_multiply` also scales alpha; an "open" chip that is 75% transparent
+    // shows the card/document behind it, so use an opaque tint instead.
     p.rect_filled(
         rect,
         6.0,
-        if open { pal.accent.gamma_multiply(0.25) } else { pal.bg_elevated },
+        if open { opaque_tint(pal.bg_elevated, pal.accent, 0.28) } else { pal.bg_elevated },
     );
     p.text(
         egui::pos2(rect.left() + 10.0, rect.center().y),
@@ -3084,6 +3687,10 @@ fn dropdown<S: Clone + PartialEq + 'static>(
             .fixed_pos(egui::pos2(rect.left(), rect.bottom() + 4.0))
             .order(egui::Order::Foreground)
             .default_size([width, 0.0])
+            // The list floats over settings/document text. egui's fade-in
+            // multiplies the frame's opacity, so both texts overlap while it
+            // fades; popups here must be opaque from their first visible frame.
+            .fade_in(false)
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
@@ -3105,7 +3712,7 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                                     r,
                                     4.0,
                                     if is_selected {
-                                        pal.accent.gamma_multiply(0.25)
+                                        opaque_tint(pal.bg_panel, pal.accent, 0.28)
                                     } else {
                                         pal.bg_elevated
                                     },
@@ -3360,6 +3967,22 @@ fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: 
     file.prepare_changes();
     text_tools::find_bar(ui, file, pal, tr(lang));
     if ui.is_enabled() { text_tools::bulk_paste(file, ui.ctx(), focus); }
+    // The rendered modes parse the whole buffer; huge documents keep the
+    // windowed source editor instead of freezing on a full Markdown layout.
+    let large = file.editor_state.large.active
+        || file.draft_text.as_ref().is_some_and(|text| large_editor::needs_windowing(text));
+    if !large && markdown::is_markdown(file) && file.markdown_mode != markdown::Mode::Source {
+        let changed = match file.markdown_mode {
+            markdown::Mode::Live => markdown::live_editor(ui, file, pal, focus, lang),
+            markdown::Mode::Split => markdown::split_editor(ui, file, pal, focus, lang),
+            markdown::Mode::Source => false,
+        };
+        if changed {
+            ui.ctx().request_repaint();
+            file.sync_draft();
+        }
+        return;
+    }
     let requested_focus = std::mem::take(&mut file.editor_state.focus_requested);
     let focus = focus || requested_focus;
     // Folding follows the selected/detected language, not whether Format JSON ran.
@@ -4304,6 +4927,82 @@ mod tests {
     }
 
     #[test]
+    fn tab_close_gestures_follow_the_configured_mode() {
+        use egui::PointerButton;
+        let modes = [
+            (TabCloseMode::DoubleClick, true, false),
+            (TabCloseMode::MiddleClick, false, true),
+            (TabCloseMode::DoubleOrMiddle, true, true),
+        ];
+        for (mode, double_closes, middle_closes) in modes {
+            for middle in [false, true] {
+                let ctx = egui::Context::default();
+                setup_fonts(&ctx);
+                let mut app = LiteTextApp {
+                    tab_close_mode: mode,
+                    ..Default::default()
+                };
+                app.new_document();
+                let id = app.active_id.unwrap();
+                let mut frame = 0;
+                let mut draw = |app: &mut LiteTextApp, events| {
+                    frame += 1;
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(900.0, 600.0),
+                            )),
+                            time: Some(frame as f64 * 0.05),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.top_bar(ctx, &DARK),
+                    );
+                };
+                for _ in 0..3 {
+                    draw(&mut app, vec![]);
+                }
+                let rect = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new(("normal_tab_rect", id)))
+                    })
+                    .expect("the normal tab must be painted");
+                let pos = rect.center();
+                let mut click = |app: &mut LiteTextApp, button| {
+                    for pressed in [true, false] {
+                        draw(
+                            app,
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button,
+                                    pressed,
+                                    modifiers: Default::default(),
+                                },
+                            ],
+                        );
+                    }
+                };
+                if middle {
+                    click(&mut app, PointerButton::Middle);
+                } else {
+                    click(&mut app, PointerButton::Primary);
+                    click(&mut app, PointerButton::Primary);
+                }
+                let closed = !app.files.iter().any(|file| file.id == id);
+                let expected = if middle { middle_closes } else { double_closes };
+                assert_eq!(
+                    closed, expected,
+                    "mode {mode:?} with {} gesture",
+                    if middle { "middle-click" } else { "double-click" }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tab_bar_scrolls_horizontally_with_mouse_wheel_only_when_hovered() {
         let scroll_distance = |pointer: egui::Pos2, delta: egui::Vec2, count: usize| {
             let ctx = egui::Context::default();
@@ -4668,4 +5367,8 @@ mod tests {
         assert_eq!(r_rect.max, egui::pos2(200.0 + r, 38.0));
         assert_eq!(r_circle, egui::pos2(200.0 + r, 38.0 - r));
     }
+
+
+
+
 }

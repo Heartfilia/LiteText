@@ -9,7 +9,16 @@ struct Preferences {
     lang: crate::Lang,
     workspace_theme: crate::workspace_theme::WorkspaceTheme,
     workspace_font_size: f32,
+    /// `None` in files written before this setting existed: keep the mode
+    /// already restored from the application state instead of resetting it.
+    /// The field-level default is important: the container default would
+    /// supply `Some(Source)` and would reset that state.
+    #[serde(default)]
+    markdown_mode: Option<crate::markdown::Mode>,
+    scratch_dir: Option<PathBuf>,
     tab_mode: crate::whitespace::TabMode,
+    tab_close_mode: crate::TabCloseMode,
+    workspace_font: Option<crate::fonts::Choice>,
     terminal: crate::terminal::Settings,
     updates: crate::updater::Settings,
     shortcut_keys: crate::shortcuts::Keymap,
@@ -28,7 +37,12 @@ impl Preferences {
     fn capture(app: &LiteTextApp) -> Self {
         Self {
             lang: app.lang, workspace_theme: app.workspace_theme.clone(),
-            workspace_font_size: app.workspace_font_size, tab_mode: app.tab_mode,
+            workspace_font_size: app.workspace_font_size,
+            markdown_mode: Some(app.markdown_mode),
+            scratch_dir: app.scratch_dir.clone(),
+            tab_mode: app.tab_mode,
+            tab_close_mode: app.tab_close_mode,
+            workspace_font: app.workspace_font.clone(),
             terminal: app.terminal.clone(), updates: app.updates.clone(),
             shortcut_keys: app.shortcut_keys.clone(), hex_case_upper: app.hex_upper,
             dim_zeros: app.dim_zeros, show_ascii: app.show_ascii,
@@ -40,7 +54,13 @@ impl Preferences {
         app.lang = self.lang;
         app.workspace_theme = self.workspace_theme;
         app.workspace_font_size = self.workspace_font_size;
+        if let Some(mode) = self.markdown_mode {
+            app.markdown_mode = mode;
+        }
+        app.scratch_dir = self.scratch_dir;
         app.tab_mode = self.tab_mode;
+        app.tab_close_mode = self.tab_close_mode;
+        app.workspace_font = self.workspace_font;
         app.terminal = self.terminal;
         app.updates = self.updates;
         app.shortcut_keys = self.shortcut_keys;
@@ -167,6 +187,18 @@ mod tests {
             "proxy_enabled": true, "proxy_url": "http://127.0.0.1:7890"
         })).unwrap();
         first.tab_mode = crate::whitespace::TabMode::Spaces4;
+        first.tab_close_mode = crate::TabCloseMode::MiddleClick;
+        first.markdown_mode = crate::markdown::Mode::Split;
+        first.hex_upper = false;
+        first.dim_zeros = true;
+        first.show_ascii = false;
+        first.show_invisible = true;
+        first.inspector_width = 320.0;
+        first.workspace_font = Some(crate::fonts::Choice {
+            family: "HarmonyOS Sans".into(),
+            path: "/tmp/HarmonyOS_Sans_Regular.ttf".into(),
+            index: 2,
+        });
         first.new_document();
         first.active_mut().unwrap().draft_text = Some("private document not a setting".into());
         first.save_preferences(true).unwrap();
@@ -178,12 +210,35 @@ mod tests {
         let mut reinstalled = app(); // no window app.ron / installation files
         reinstalled.load_preferences().unwrap();
         assert_eq!(reinstalled.lang, crate::Lang::En);
+        assert_eq!(reinstalled.workspace_font, first.workspace_font);
         assert_eq!(reinstalled.terminal, first.terminal);
         assert_eq!(reinstalled.workspace_font_size, 18.0);
+        assert_eq!(reinstalled.tab_close_mode, crate::TabCloseMode::MiddleClick);
         assert_eq!(reinstalled.workspace_theme.preset, crate::workspace_theme::Preset::Nord);
+        assert_eq!(reinstalled.markdown_mode, crate::markdown::Mode::Split);
+        assert!(!reinstalled.hex_upper);
+        assert!(reinstalled.dim_zeros);
+        assert!(!reinstalled.show_ascii);
+        assert!(reinstalled.show_invisible);
+        assert_eq!(reinstalled.inspector_width, 320.0);
         assert!(!reinstalled.diagnostics_settings.unlocked && !reinstalled.diagnostics_settings.enabled);
         assert_eq!(serde_json::to_value(Preferences::capture(&reinstalled)).unwrap(), serde_json::to_value(Preferences::capture(&first)).unwrap());
         assert!(reinstalled.files.is_empty());
+    }
+
+    #[test]
+    fn scratch_directory_round_trips_through_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        let mut app = LiteTextApp::default();
+        app.preferences.path_override = Some(path.clone());
+        app.scratch_dir = Some(temp.path().join("my drafts"));
+        app.save_preferences(true).unwrap();
+
+        let mut restored = LiteTextApp::default();
+        restored.preferences.path_override = Some(path);
+        restored.load_preferences().unwrap();
+        assert_eq!(restored.scratch_dir, app.scratch_dir);
     }
 
     #[test]
@@ -217,10 +272,13 @@ mod tests {
         std::fs::write(&path, br#"{"lang":"en","terminal":{"show_toolbar_button":true},"updates":{"proxy_enabled":true,"proxy_url":"http://127.0.0.1:7890"}}"#).unwrap();
         let mut app = LiteTextApp::default();
         app.preferences.path_override = Some(path.clone());
+        app.markdown_mode = crate::markdown::Mode::Split;
         app.load_preferences().unwrap();
         assert_eq!(app.lang, crate::Lang::En);
         assert!(!app.diagnostics_settings.unlocked && !app.diagnostics_settings.enabled);
         assert!(app.terminal.show_toolbar_button);
+        // Legacy files have no Markdown mode; the per-window state wins.
+        assert_eq!(app.markdown_mode, crate::markdown::Mode::Split);
         app.save_preferences(true).unwrap();
         let restored: Preferences = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(restored.updates).unwrap()["proxy_url"], "http://127.0.0.1:7890");

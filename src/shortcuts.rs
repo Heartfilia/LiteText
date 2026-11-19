@@ -364,7 +364,10 @@ pub(crate) fn take_binding(
 
 impl LiteTextApp {
     fn zoom_workspace(&mut self, delta: f32, ctx: &egui::Context) {
-        self.workspace_font_size = (self.workspace_font_size + delta).clamp(10.0, 32.0);
+        self.workspace_font_size = (self.workspace_font_size + delta).round().clamp(
+            crate::MIN_WORKSPACE_FONT_SIZE,
+            crate::MAX_WORKSPACE_FONT_SIZE,
+        );
         ctx.request_repaint();
     }
 
@@ -493,6 +496,25 @@ impl LiteTextApp {
             || self.pending_save.is_some()
             || self.files.iter().any(|file| file.disk.pending.is_some())
             || self.inspector_popup.is_some()
+    }
+
+    /// Status-bar menus only change highlighting, input mode or a reversible
+    /// conversion. A read-only background search or the floating value popup
+    /// must not silently make them unclickable; dialogs and in-flight file
+    /// operations still do.
+    pub(crate) fn status_controls_blocked(&self) -> bool {
+        self.show_settings
+            || self.restoring()
+            || !self.open_errors.is_empty() && !self.opening_files()
+            || self.pending_batch.is_some()
+            || self.encoding_task.is_some()
+            || self.reload_task.is_some()
+            || self.save_failure.is_some()
+            || self.plugin_error.is_some()
+            || self.pending_close.is_some()
+            || self.pending_window_close
+            || self.pending_save.is_some()
+            || self.files.iter().any(|file| file.disk.pending.is_some())
     }
 
     /// Returns a deferred save flag so input in this frame is included in the save.
@@ -694,6 +716,7 @@ impl LiteTextApp {
 
     pub(crate) fn shortcuts_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let zh = self.lang == Lang::ZhCn;
+        let t = tr(self.lang);
         let back = ui.button(if zh {
             "‹ 返回系统设置"
         } else {
@@ -706,6 +729,27 @@ impl LiteTextApp {
             self.shortcut_recording = None;
             self.shortcut_error = None;
         }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t.close_tab_mode).size(13.0));
+            ui.add_space(10.0);
+            let options = vec![
+                (t.close_tab_double.to_owned(), crate::TabCloseMode::DoubleClick),
+                (t.close_tab_middle.to_owned(), crate::TabCloseMode::MiddleClick),
+                (t.close_tab_both.to_owned(), crate::TabCloseMode::DoubleOrMiddle),
+            ];
+            if let Some(mode) = crate::dropdown(
+                ui,
+                pal,
+                egui::Id::new("settings_tab_close_mode"),
+                self.tab_close_mode.label(self.lang).to_owned(),
+                options,
+                190.0,
+            ) {
+                self.tab_close_mode = mode;
+                ui.ctx().request_repaint();
+            }
+        });
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(tr(self.lang).shortcuts_desc)
@@ -749,13 +793,9 @@ impl LiteTextApp {
         } else {
             ["Files & tabs", "Editing", "Find & replace"]
         };
-        let columns = if ui.available_width() >= 940.0 {
-            3
-        } else if ui.available_width() >= 680.0 {
-            2
-        } else {
-            1
-        };
+        // Two cards per row at most: three columns made the page (and every
+        // label/control pair inside a card) unnecessarily wide on large screens.
+        let columns = if ui.available_width() >= 660.0 { 2 } else { 1 };
         let scroll = egui::ScrollArea::vertical()
             .id_salt("shortcuts_scroll")
             .auto_shrink([false, true])

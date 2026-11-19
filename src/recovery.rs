@@ -179,28 +179,162 @@ struct Record {
     pinned: bool,
     id: u64,
     path: PathBuf,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     source_path: Option<PathBuf>,
     name: String,
     view: ViewMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     language_override: Option<String>,
     encoding: Encoding,
     #[serde(default)]
     saved_encoding: Option<Encoding>,
     /// Only modified / untitled buffers need a recovery copy of their content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(default, with = "base64_option", skip_serializing_if = "Option::is_none")]
     baseline: Option<Vec<u8>>,
-    #[serde(default)]
+    #[serde(default, with = "base64_option", skip_serializing_if = "Option::is_none")]
     raw: Option<Vec<u8>>,
     #[serde(default)]
     line_ending: crate::line_endings::LineEnding,
+    /// Per-tab Markdown view (source / live / split). Older snapshots omit it
+    /// and fall back to the source view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    markdown_mode: Option<crate::markdown::Mode>,
+    /// Copy of the unsaved text in the scratch directory. When present it is
+    /// authoritative and the session stores no inline body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mirror: Option<PathBuf>,
+}
+
+/// Binary buffers are stored as base64 strings instead of JSON number arrays.
+/// A modified document's baseline can be hundreds of kilobytes; as numbers it
+/// expanded several times and made session restore spend most of its time in
+/// `serde_json`. The deserializer still accepts the old array form so existing
+/// recovery files keep working.
+mod base64_option {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{
+        Deserializer, Serializer,
+        de::{self, SeqAccess, Visitor},
+    };
+    use std::fmt;
+
+    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptVisitor;
+        impl<'de> Visitor<'de> for OptVisitor {
+            type Value = Option<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("base64 bytes, a byte array, or null")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(BytesVisitor).map(Some)
+            }
+        }
+
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("base64 text or a byte array")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                STANDARD.decode(value).map_err(de::Error::custom)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_option(OptVisitor)
+    }
+}
+
+/// The streaming writer borrows its buffers instead of cloning them, so it
+/// needs the same compact representation as `base64_option`.
+mod base64_borrowed_option {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::Serializer;
+
+    pub(super) fn serialize<S>(value: &Option<&[u8]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+/// Version-1 session metadata for one untitled draft whose content lives in a
+/// scratch mirror. Version 2 stores every tab as a record instead; this type is
+/// kept so older snapshots still restore pinned/language/Markdown state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ScratchMeta {
+    pub(crate) file_name: String,
+    #[serde(default)]
+    pub(crate) pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
+    /// Per-tab Markdown view for a mirrored draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) markdown_mode: Option<crate::markdown::Mode>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Session {
     version: u32,
     pub(crate) active_id: Option<u64>,
+    /// File name of the active untitled draft when its content lives in a
+    /// scratch mirror rather than in this session.
+    #[serde(default)]
+    scratch_active: Option<String>,
+    /// Pin flag and manual language choice for mirrored drafts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scratch_meta: Vec<ScratchMeta>,
+    /// Pin-only list written by an earlier build; merged when reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scratch_pinned: Vec<String>,
     files: Vec<Record>,
 }
 
@@ -208,27 +342,53 @@ pub(crate) struct Session {
 /// the complete document/version key before every step and before publication.
 pub(crate) struct Capture {
     session: Session,
+    /// One index per record. Every tab has a record; mirrored tabs keep their
+    /// body in the scratch directory and only stream the small metadata here.
+    included: Vec<usize>,
     record: usize,
     field: usize,
 }
 
+fn included_indices(files: &[LoadedFile]) -> Vec<usize> {
+    (0..files.len()).collect()
+}
+
 impl Capture {
     pub(crate) fn new(files: &[LoadedFile], active_id: Option<u64>) -> Self {
+        let included = included_indices(files);
+        let records: Vec<Record> = included.iter().map(|&index| {
+            let file = &files[index];
+            let modified = file.is_modified();
+            // A scratch mirror owns the text. Storing it in the session too
+            // would double the snapshot size for every unsaved edit.
+            let mirror = file.scratch_path.clone();
+            let inline = mirror.is_none();
+            Record {
+                pinned: file.pinned,
+                id: file.id, path: file.path.clone(), source_path: file.source_path.clone(),
+                name: file.name.clone(), view: file.view, language_override: file.language_override.clone(),
+                encoding: file.encoding, saved_encoding: Some(file.saved_encoding),
+                text: (inline
+                    && (modified || (file.pinned && file.is_untitled()))
+                    && file.draft_text.is_some())
+                .then(String::new),
+                baseline: (inline && modified).then(Vec::new),
+                raw: (file.is_binary && file.path.as_os_str().is_empty()).then(Vec::new),
+                line_ending: file.line_ending,
+                markdown_mode: Some(file.markdown_mode),
+                mirror,
+            }
+        }).collect();
         Self {
-            record: 0, field: 0,
-            session: Session { version: 1, active_id, files: files.iter().map(|file| {
-                let modified = file.is_modified();
-                Record {
-                    pinned: file.pinned,
-                    id: file.id, path: file.path.clone(), source_path: file.source_path.clone(),
-                    name: file.name.clone(), view: file.view, language_override: file.language_override.clone(),
-                    encoding: file.encoding, saved_encoding: Some(file.saved_encoding),
-                    text: (modified && file.draft_text.is_some()).then(String::new),
-                    baseline: modified.then(Vec::new),
-                    raw: (file.is_binary && file.path.as_os_str().is_empty()).then(Vec::new),
-                    line_ending: file.line_ending,
-                }
-            }).collect() },
+            record: 0, field: 0, included,
+            session: Session {
+                version: 2,
+                active_id,
+                scratch_active: None,
+                scratch_meta: Vec::new(),
+                scratch_pinned: Vec::new(),
+                files: records,
+            },
         }
     }
 
@@ -236,7 +396,7 @@ impl Capture {
         let _timing = crate::timing::phase("recovery.snapshot_slice");
         while self.record < self.session.files.len() && budget > 0 {
             let record = &mut self.session.files[self.record];
-            let file = &files[self.record];
+            let file = &files[self.included[self.record]];
             let copied = match self.field {
                 0 => if let Some(target) = &mut record.text {
                     let source = file.draft_text.as_deref().unwrap();
@@ -271,29 +431,76 @@ impl Capture {
 }
 
 impl Session {
-    pub(crate) fn has_files(&self) -> bool { !self.files.is_empty() }
+    pub(crate) fn has_files(&self) -> bool {
+        !self.files.is_empty()
+            || self.scratch_active.is_some()
+            || !self.scratch_meta.is_empty()
+            || !self.scratch_pinned.is_empty()
+    }
+
+    pub(crate) fn scratch_active(&self) -> Option<&str> {
+        self.scratch_active.as_deref()
+    }
+
+    /// Metadata for mirrored drafts, including the pin-only list written by an
+    /// earlier build.
+    pub(crate) fn scratch_meta(&self) -> Vec<ScratchMeta> {
+        let mut meta = self.scratch_meta.clone();
+        for file_name in &self.scratch_pinned {
+            if !meta.iter().any(|entry| &entry.file_name == file_name) {
+                meta.push(ScratchMeta {
+                    file_name: file_name.clone(),
+                    pinned: true,
+                    language: None,
+                    markdown_mode: None,
+                });
+            }
+        }
+        meta
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_count_for_testing(&self) -> usize {
+        self.files.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn capture(files: &[LoadedFile], active_id: Option<u64>) -> Self {
         let _timing = crate::timing::phase("recovery.snapshot");
+        let included = included_indices(files);
         Self {
-            version: 1,
+            version: 2,
             active_id,
-            files: files
+            scratch_active: None,
+            scratch_meta: Vec::new(),
+            scratch_pinned: Vec::new(),
+            files: included
                 .iter()
-                .map(|f| Record {
-                    pinned: f.pinned,
-                    id: f.id,
-                    path: f.path.clone(),
-                    source_path: f.source_path.clone(),
-                    name: f.name.clone(),
-                    view: f.view,
-                    language_override: f.language_override.clone(),
-                    encoding: f.encoding,
-                    saved_encoding: Some(f.saved_encoding),
-                    text: f.is_modified().then(|| f.draft_text.clone()).flatten(),
-                    baseline: f.is_modified().then(|| f.saved_bytes.clone()),
-                    raw: (f.is_binary && f.path.as_os_str().is_empty()).then(|| f.bytes.clone()),
-                    line_ending: f.line_ending,
+                .map(|&index| {
+                    let f = &files[index];
+                    let mirror = f.scratch_path.clone();
+                    let inline = mirror.is_none();
+                    Record {
+                        pinned: f.pinned,
+                        id: f.id,
+                        path: f.path.clone(),
+                        source_path: f.source_path.clone(),
+                        name: f.name.clone(),
+                        view: f.view,
+                        language_override: f.language_override.clone(),
+                        encoding: f.encoding,
+                        saved_encoding: Some(f.saved_encoding),
+                        text: (inline && f.is_modified())
+                            .then(|| f.draft_text.clone())
+                            .flatten(),
+                        baseline: (inline && f.is_modified())
+                            .then(|| f.saved_bytes.clone()),
+                        raw: (f.is_binary && f.path.as_os_str().is_empty())
+                            .then(|| f.bytes.clone()),
+                        line_ending: f.line_ending,
+                        markdown_mode: Some(f.markdown_mode),
+                        mirror,
+                    }
                 })
                 .collect(),
         }
@@ -326,10 +533,36 @@ impl Session {
                         content_revision: 0,
                         disk: crate::linkage::DiskState::default(),
                         line_ending: record.line_ending,
+                        markdown_mode: record.markdown_mode.unwrap_or_default(),
+                        markdown: crate::markdown::State::default(),
+                        scratch_path: record.mirror.clone(),
                         saved_generation: 0,
                     });
                 }
-                if let Some(text) = &record.text {
+                // The scratch mirror is authoritative for unsaved text. Read
+                // it with the document encoding so Save writes identical bytes.
+                let mirrored = record.mirror.as_deref().and_then(|path| {
+                    let bytes = std::fs::read(path).ok()?;
+                    Some(if record.path.as_os_str().is_empty() {
+                        Encoding::decode(&bytes).1
+                    } else {
+                        record
+                            .encoding
+                            .decode_as(&bytes)
+                            .unwrap_or_else(|| Encoding::decode(&bytes).1)
+                    })
+                });
+                let text = record.text.clone().or(mirrored);
+                if let Some(text) = text {
+                    let saved_bytes = record.baseline.clone().unwrap_or_else(|| {
+                        if record.path.as_os_str().is_empty() {
+                            Vec::new()
+                        } else {
+                            // The original file still holds the saved bytes; a
+                            // missing file leaves them empty so Save can recreate it.
+                            std::fs::read(&record.path).unwrap_or_default()
+                        }
+                    });
                     let mut file = LoadedFile {
                         pinned: record.pinned,
                         id: record.id,
@@ -340,10 +573,10 @@ impl Session {
                         lines: Vec::new(),
                         view: record.view,
                         language_override: record.language_override.clone(),
-                        draft_text: Some(text.clone()),
+                        draft_text: Some(text),
                         editor_state: editor::EditorState::default(),
                         encoding: record.encoding,
-                        saved_bytes: record.baseline.clone().unwrap_or_default(),
+                        saved_bytes,
                         character_count: 0,
                         saved_large_revision: None,
                         bytes_dirty: false,
@@ -352,58 +585,186 @@ impl Session {
                         source_path: record.source_path.clone(),
                         disk: crate::linkage::DiskState::default(),
                         line_ending: record.line_ending,
+                        markdown_mode: record.markdown_mode.unwrap_or_default(),
+                        markdown: crate::markdown::State::default(),
+                        scratch_path: record.mirror.clone(),
                         saved_generation: 0,
                     };
                     file.sync_draft();
-                    Some(file)
-                } else {
-                    let bytes = std::fs::read(&record.path).ok()?;
-                    let is_binary = detect_binary(&bytes);
-                    let (encoding, text) = if is_binary {
-                        (Encoding::default(), String::new())
-                    } else {
-                        record.encoding.decode_as(&bytes).map_or_else(
-                            || Encoding::decode(&bytes),
-                            |text| (record.encoding, text),
-                        )
-                    };
-                    let character_count = text.chars().count();
-                    Some(LoadedFile {
+                    return Some(file);
+                }
+                if record.path.as_os_str().is_empty() {
+                    // A missing mirror must not silently drop an untitled tab.
+                    let mut file = LoadedFile {
                         pinned: record.pinned,
                         id: record.id,
-                        path: record.path.clone(),
+                        path: PathBuf::new(),
                         name: record.name.clone(),
-                        saved_bytes: bytes.clone(),
-                        bytes,
-                        is_binary,
-                        lines: if is_binary || text.len() >= crate::large_editor::THRESHOLD {
-                            Vec::new()
-                        } else {
-                            text.split('\n').map(str::to_owned).collect()
-                        },
-                        view: if is_binary {
-                            ViewMode::Hex
-                        } else {
-                            record.view
-                        },
-                        draft_text: (!is_binary).then_some(text),
+                        bytes: Vec::new(),
+                        is_binary: false,
+                        lines: Vec::new(),
+                        view: record.view,
                         language_override: record.language_override.clone(),
+                        draft_text: Some(String::new()),
                         editor_state: editor::EditorState::default(),
-                        encoding,
-                        character_count,
+                        encoding: record.encoding,
+                        saved_bytes: Vec::new(),
+                        character_count: 0,
                         saved_large_revision: None,
                         bytes_dirty: false,
                         content_revision: 0,
-                        saved_encoding: encoding,
+                        saved_encoding: record.saved_encoding.unwrap_or(record.encoding),
                         source_path: record.source_path.clone(),
                         disk: crate::linkage::DiskState::default(),
                         line_ending: record.line_ending,
+                        markdown_mode: record.markdown_mode.unwrap_or_default(),
+                        markdown: crate::markdown::State::default(),
+                        scratch_path: None,
                         saved_generation: 0,
-                    })
+                    };
+                    file.sync_draft();
+                    return Some(file);
                 }
+                let bytes = std::fs::read(&record.path).ok()?;
+                let is_binary = detect_binary(&bytes);
+                let (encoding, text) = if is_binary {
+                    (Encoding::default(), String::new())
+                } else {
+                    record.encoding.decode_as(&bytes).map_or_else(
+                        || Encoding::decode(&bytes),
+                        |text| (record.encoding, text),
+                    )
+                };
+                let character_count = text.chars().count();
+                Some(LoadedFile {
+                    pinned: record.pinned,
+                    id: record.id,
+                    path: record.path.clone(),
+                    name: record.name.clone(),
+                    saved_bytes: bytes.clone(),
+                    bytes,
+                    is_binary,
+                    lines: if is_binary || text.len() >= crate::large_editor::THRESHOLD {
+                        Vec::new()
+                    } else {
+                        text.split('\n').map(str::to_owned).collect()
+                    },
+                    view: if is_binary {
+                        ViewMode::Hex
+                    } else {
+                        record.view
+                    },
+                    draft_text: (!is_binary).then_some(text),
+                    language_override: record.language_override.clone(),
+                    editor_state: editor::EditorState::default(),
+                    encoding,
+                    character_count,
+                    saved_large_revision: None,
+                    bytes_dirty: false,
+                    content_revision: 0,
+                    saved_encoding: encoding,
+                    source_path: record.source_path.clone(),
+                    disk: crate::linkage::DiskState::default(),
+                    line_ending: record.line_ending,
+                    markdown_mode: record.markdown_mode.unwrap_or_default(),
+                    markdown: crate::markdown::State::default(),
+                    scratch_path: None,
+                    saved_generation: 0,
+                })
             })
             .collect()
     }
+}
+
+/// Identity of a tab across snapshots. Real files are matched by their
+/// resolved path; mirrored drafts by their mirror. An inline draft (no mirror)
+/// is matched by name plus a content hash, so the identical copies written by
+/// two snapshots collapse while two differently edited drafts of the same name
+/// do not.
+fn tab_key(record: &Record) -> (PathBuf, PathBuf) {
+    if !record.path.as_os_str().is_empty() {
+        return (crate::linkage::resolved(&record.path), PathBuf::new());
+    }
+    if let Some(mirror) = &record.mirror {
+        return (PathBuf::new(), mirror.clone());
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let text = record.text.as_deref().unwrap_or_default();
+    for byte in record.name.bytes().chain([0]).chain(text.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (PathBuf::from(format!("#{hash:016x}")), PathBuf::from(&record.name))
+}
+
+/// Combine the snapshots of every window from the previous run into a single
+/// tab list. A normal close keeps each window's own snapshot, so the last
+/// window is no longer the only one that can be restored. Earlier sources win
+/// duplicates and supply the active tab; ids are reassigned so records from
+/// different windows cannot collide.
+pub(crate) fn merge(sources: impl IntoIterator<Item = Session>) -> Option<Session> {
+    let mut merged = Session {
+        version: 2,
+        active_id: None,
+        scratch_active: None,
+        scratch_meta: Vec::new(),
+        scratch_pinned: Vec::new(),
+        files: Vec::new(),
+    };
+    let mut keys: std::collections::HashSet<(PathBuf, PathBuf)> = std::collections::HashSet::new();
+    let mut active_key = None;
+    let mut next_id = 1;
+    for session in sources {
+        let meta = session.scratch_meta();
+        let Session { active_id, scratch_active, files, .. } = session;
+        let source_active = active_id
+            .and_then(|id| files.iter().find(|file| file.id == id))
+            .map(tab_key);
+        for mut record in files {
+            let key = tab_key(&record);
+            if !keys.insert(key.clone()) {
+                continue;
+            }
+            if active_key.is_none() && source_active.as_ref() == Some(&key) {
+                active_key = Some(key);
+            }
+            record.id = next_id;
+            next_id += 1;
+            merged.files.push(record);
+        }
+        if merged.scratch_active.is_none() {
+            merged.scratch_active = scratch_active;
+        }
+        for entry in meta {
+            if !merged
+                .scratch_meta
+                .iter()
+                .any(|known| known.file_name == entry.file_name)
+            {
+                merged.scratch_meta.push(entry);
+            }
+        }
+    }
+    if merged.files.is_empty() && merged.scratch_meta.is_empty() {
+        return None;
+    }
+    merged.active_id = active_key
+        .and_then(|key| {
+            merged
+                .files
+                .iter()
+                .find(|file| tab_key(file) == key)
+                .map(|file| file.id)
+        })
+        .or_else(|| merged.files.first().map(|file| file.id));
+    Some(merged)
+}
+
+/// Write an already merged snapshot without borrowing live buffers.
+pub(crate) fn write_session(path: &Path, session: &Session) -> io::Result<()> {
+    atomic_write_with(path, |writer| {
+        serde_json::to_writer(writer, session).map_err(io::Error::other)
+    })
 }
 
 /// A worker may serialize/fsync, but only the UI may publish a current snapshot.
@@ -491,7 +852,9 @@ pub(crate) fn store(path: &Path, session: &Session) -> io::Result<()> {
 }
 
 /// Borrow buffers and stream directly into the atomic temporary file: no full snapshot clones
-/// and no extra JSON-sized allocation. Version 1 remains readable by earlier builds.
+/// and no extra JSON-sized allocation. Version 2 stores every tab as a record
+/// and points at scratch mirrors instead of inlining unsaved bodies; version 1
+/// snapshots remain readable.
 pub(crate) fn store_buffers(
     path: &Path,
     files: &[LoadedFile],
@@ -522,16 +885,25 @@ fn store_buffers_inner(
         pinned: bool,
         id: u64,
         path: &'a Path,
+        #[serde(skip_serializing_if = "Option::is_none")]
         source_path: &'a Option<PathBuf>,
         name: &'a str,
         view: ViewMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
         language_override: &'a Option<String>,
         encoding: Encoding,
         saved_encoding: Encoding,
+        #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<&'a str>,
+        #[serde(with = "base64_borrowed_option", skip_serializing_if = "Option::is_none")]
         baseline: Option<&'a [u8]>,
+        #[serde(with = "base64_borrowed_option", skip_serializing_if = "Option::is_none")]
         raw: Option<&'a [u8]>,
         line_ending: crate::line_endings::LineEnding,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        markdown_mode: Option<crate::markdown::Mode>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mirror: Option<&'a Path>,
     }
     #[derive(Serialize)]
     struct BorrowedSession<'a> {
@@ -543,12 +915,16 @@ fn store_buffers_inner(
         preserve_invalid(path)?;
     }
     let snapshot = BorrowedSession {
-        version: 1,
+        version: 2,
         active_id,
         files: files
             .iter()
             .map(|f| {
                 let dirty = f.is_modified() || archive;
+                // Archives deliberately keep a full copy: a mirror may be
+                // deleted or rewritten after the archive is written.
+                let mirror = (!archive).then_some(f.scratch_path.as_deref()).flatten();
+                let inline = mirror.is_none();
                 BorrowedRecord {
                     pinned: f.pinned,
                     id: f.id,
@@ -559,11 +935,17 @@ fn store_buffers_inner(
                     language_override: &f.language_override,
                     encoding: f.encoding,
                     saved_encoding: f.saved_encoding,
-                    text: if dirty { f.draft_text.as_deref() } else { None },
-                    baseline: dirty.then_some(f.saved_bytes.as_slice()),
+                    text: if inline && (dirty || (f.pinned && f.is_untitled())) {
+                        f.draft_text.as_deref()
+                    } else {
+                        None
+                    },
+                    baseline: (inline && dirty).then_some(f.saved_bytes.as_slice()),
                     raw: (f.is_binary && (f.path.as_os_str().is_empty() || archive))
                         .then_some(f.bytes.as_slice()),
                     line_ending: f.line_ending,
+                    markdown_mode: Some(f.markdown_mode),
+                    mirror,
                 }
             })
             .collect(),
@@ -605,7 +987,7 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<Session>> {
         Err(error) => return Err(error),
     };
     let session: Session = serde_json::from_slice(&bytes)?;
-    if session.version != 1 {
+    if !matches!(session.version, 1 | 2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Unsupported recovery version",
@@ -1197,6 +1579,87 @@ mod tests {
     }
 
     #[test]
+    fn real_files_restore_with_pins_and_per_tab_markdown_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let notes = root.join("notes.md");
+        let plain = root.join("plain.txt");
+        std::fs::write(&notes, "# Notes\n\nbody\n").unwrap();
+        std::fs::write(&plain, "plain\n").unwrap();
+        let snapshot = dir.path().join("session.json");
+        let mut app = LiteTextApp {
+            recovery_path_override: Some(snapshot.clone()),
+            scratch_dir: Some(root.join("drafts")),
+            ..Default::default()
+        };
+        app.open_paths(vec![notes.clone(), plain.clone()]);
+        let notes_id = app
+            .files
+            .iter()
+            .find(|file| file.path == notes)
+            .unwrap()
+            .id;
+        app.files
+            .iter_mut()
+            .find(|file| file.id == notes_id)
+            .unwrap()
+            .markdown_mode = crate::markdown::Mode::Live;
+        app.toggle_pin(notes_id);
+        app.active_id = Some(notes_id);
+        app.write_recovery().unwrap();
+
+        let mut restored = LiteTextApp {
+            recovery_path_override: Some(snapshot),
+            scratch_dir: Some(root.join("drafts")),
+            ..Default::default()
+        };
+        restored.restore_session();
+        assert_eq!(restored.files.len(), 2, "both real files must come back");
+        let notes_file = restored
+            .files
+            .iter()
+            .find(|file| file.path == notes)
+            .expect("the pinned Markdown file must be restored");
+        assert_eq!(notes_file.draft_text.as_deref(), Some("# Notes\n\nbody\n"));
+        assert!(notes_file.pinned, "pin state belongs to the tab");
+        assert_eq!(
+            notes_file.markdown_mode,
+            crate::markdown::Mode::Live,
+            "each tab keeps its own Markdown view"
+        );
+        assert_eq!(restored.active_id, Some(notes_id));
+        assert!(
+            restored.files.iter().any(|file| file.path == plain),
+            "unrelated real files are not dropped"
+        );
+    }
+
+    #[test]
+    fn pinned_blank_untitled_tabs_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("session.json");
+        let mut app = LiteTextApp {
+            recovery_path_override: Some(snapshot.clone()),
+            scratch_dir: Some(dir.path().join("drafts")),
+            ..Default::default()
+        };
+        app.new_document();
+        let blank = app.active_id.unwrap();
+        app.toggle_pin(blank);
+        app.write_recovery().unwrap();
+
+        let mut restored = LiteTextApp {
+            recovery_path_override: Some(snapshot),
+            scratch_dir: Some(dir.path().join("drafts")),
+            ..Default::default()
+        };
+        restored.restore_session();
+        assert_eq!(restored.files.len(), 1);
+        assert!(restored.files[0].pinned);
+        assert!(restored.files[0].is_untitled());
+    }
+
+    #[test]
     fn empty_scratch_tabs_close_silently_even_after_edits_and_large_buffer_clear() {
         for large in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1360,4 +1823,204 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&original).unwrap(), "pending edits");
         assert!(!app.active().unwrap().is_modified());
     }
+
+
+
+    #[test]
+    fn recovery_snapshot_writes_base64_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let original = "a".repeat(700);
+        std::fs::write(&source, &original).unwrap();
+        let snapshot = dir.path().join("session.json");
+        let mut app = LiteTextApp {
+            recovery_path_override: Some(snapshot.clone()),
+            ..Default::default()
+        };
+        app.open_paths(vec![source]);
+        app.active_mut().unwrap().draft_text = Some("edited text".into());
+        app.active_mut().unwrap().sync_draft();
+        app.write_recovery().unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+        let baseline = value["files"][0]["baseline"]
+            .as_str()
+            .expect("the streaming writer must store a base64 string");
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(baseline)
+                .unwrap(),
+            original.as_bytes()
+        );
+        let restored = load(&snapshot).unwrap().unwrap().restore();
+        assert_eq!(restored[0].draft_text.as_deref(), Some("edited text"));
+    }
+
+    #[test]
+    fn merged_snapshots_keep_tabs_from_every_window_without_id_clashes() {
+        let first: Session = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "active_id": 2,
+            "files": [
+                { "id": 1, "path": "/tmp/a.txt", "name": "a.txt", "view": "Text", "encoding": "Utf8" },
+                { "id": 2, "path": "", "name": "未命名 1", "view": "Text", "encoding": "Utf8",
+                  "mirror": "/tmp/scratch/未命名 1.txt" }
+            ]
+        }))
+        .unwrap();
+        let second: Session = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "active_id": 5,
+            "files": [
+                { "id": 4, "path": "/tmp/a.txt", "name": "a.txt", "view": "Text", "encoding": "Utf8" },
+                { "id": 5, "path": "/tmp/b.txt", "name": "b.txt", "view": "Text", "encoding": "Utf8" }
+            ]
+        }))
+        .unwrap();
+        let merged = merge([first, second]).expect("merged session");
+        assert_eq!(merged.files.len(), 3, "the duplicate file is kept once");
+        let ids: Vec<u64> = merged.files.iter().map(|file| file.id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "ids are unique across windows");
+        assert_eq!(merged.files[0].path, PathBuf::from("/tmp/a.txt"));
+        assert_eq!(merged.files[1].path, PathBuf::from(""));
+        assert_eq!(merged.files[2].path, PathBuf::from("/tmp/b.txt"));
+        assert_eq!(merged.active_id, Some(2), "the newest source's active tab wins");
+    }
+
+    #[test]
+    fn merge_keeps_differently_edited_inline_drafts_of_the_same_name() {
+        let first: Session = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "active_id": 1,
+            "files": [{ "id": 1, "path": "", "name": "未命名 1", "view": "Text", "encoding": "Utf8", "text": "A" }]
+        }))
+        .unwrap();
+        let second: Session = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "active_id": 9,
+            "files": [{ "id": 9, "path": "", "name": "未命名 1", "view": "Text", "encoding": "Utf8", "text": "B" }]
+        }))
+        .unwrap();
+        let merged = merge([first, second]).expect("merged session");
+        assert_eq!(merged.files.len(), 2, "same title but different content is not one tab");
+    }
+
+    #[test]
+    fn legacy_scratch_pinned_entries_merge_into_scratch_meta() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "active_id": null,
+            "scratch_active": null,
+            "scratch_meta": [
+                { "file_name": "未命名 1.txt", "pinned": true, "language": "JSON" }
+            ],
+            "scratch_pinned": ["未命名 1.txt", "未命名 2.md"],
+            "files": []
+        }))
+        .unwrap();
+        let meta = session.scratch_meta();
+        assert_eq!(meta.len(), 2, "a legacy pin must not duplicate an existing entry");
+        assert_eq!(meta[0].file_name, "未命名 1.txt");
+        assert_eq!(meta[0].language.as_deref(), Some("JSON"));
+        assert_eq!(meta[1].file_name, "未命名 2.md");
+        assert!(meta[1].pinned);
+        assert!(meta[1].language.is_none());
+        assert!(session.has_files(), "a drafts-only session must stay restorable");
+    }
+
+    #[test]
+    fn version_one_inline_records_still_restore_with_their_baseline() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.txt");
+        std::fs::write(&original, "original\n").unwrap();
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "active_id": 7,
+            "scratch_active": null,
+            "scratch_meta": [],
+            "scratch_pinned": [],
+            "files": [{
+                "pinned": false,
+                "id": 7,
+                "path": original,
+                "source_path": null,
+                "name": "original.txt",
+                "view": "Text",
+                "language_override": null,
+                "encoding": "Utf8",
+                "saved_encoding": "Utf8",
+                "text": "edited\n",
+                "baseline": base64::engine::general_purpose::STANDARD.encode(b"original\n"),
+                "raw": null,
+                "line_ending": "Lf",
+                "markdown_mode": "Live"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(session.version, 1);
+        let mut files = session.restore();
+        assert_eq!(files[0].draft_text.as_deref(), Some("edited\n"));
+        assert_eq!(files[0].saved_bytes, b"original\n");
+        assert!(files[0].is_modified());
+        assert_eq!(files[0].markdown_mode, crate::markdown::Mode::Live);
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
+        // The old inline baseline still guards external changes on Save.
+        std::fs::write(&original, "external\n").unwrap();
+        assert!(save_document(&mut files[0], &original).is_err());
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "external\n");
+    }
+
+    #[test]
+    fn session_stores_binary_buffers_as_base64_and_accepts_legacy_arrays() {
+        let baseline: Vec<u8> = (0..=255).collect();
+        let session = Session {
+            version: 1,
+            active_id: Some(1),
+            scratch_active: None,
+            scratch_meta: Vec::new(),
+            scratch_pinned: Vec::new(),
+            files: vec![Record {
+                pinned: false,
+                id: 1,
+                path: PathBuf::from("/tmp/a.bin"),
+                source_path: None,
+                name: "a.bin".to_owned(),
+                view: ViewMode::Hex,
+                language_override: None,
+                encoding: Encoding::Utf8,
+                saved_encoding: Some(Encoding::Utf8),
+                text: None,
+                baseline: Some(baseline.clone()),
+                raw: None,
+                line_ending: crate::line_endings::LineEnding::Lf,
+                markdown_mode: None,
+                mirror: None,
+            }],
+        };
+        let bytes = serde_json::to_vec(&session).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value["files"][0]["baseline"].is_string(),
+            "binary baseline must not expand into a JSON number array"
+        );
+        let back: Session = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.files[0].baseline.as_deref(), Some(baseline.as_slice()));
+
+        // Sessions written before the base64 change used a numeric array.
+        let mut legacy = value;
+        legacy["files"][0]["baseline"] = serde_json::Value::Array(
+            baseline.iter().map(|byte| (*byte).into()).collect(),
+        );
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let legacy_back: Session = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(
+            legacy_back.files[0].baseline.as_deref(),
+            Some(baseline.as_slice()),
+            "legacy numeric-array sessions must keep loading"
+        );
+    }
+
 }

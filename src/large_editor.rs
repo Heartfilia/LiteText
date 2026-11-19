@@ -1033,7 +1033,7 @@ pub(crate) fn show(
             let pointer_extends = ui.input(|input| input.modifiers.shift || input.pointer.primary_down() && !input.pointer.any_pressed());
             let previous =
                 egui::TextEdit::load_state(ui.ctx(), id).and_then(|edit| edit.cursor.char_range());
-            let output = ui
+            let mut output = ui
                 .allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.set_clip_rect(ui.clip_rect().intersect(egui::Rect::from_min_max(
                         egui::pos2(gutter.right() + 1.0, bounds.top()),
@@ -1059,6 +1059,32 @@ pub(crate) fn show(
                     output
                 })
                 .inner;
+            // egui collapses a selection on any pointer press, including the
+            // right-click that opens the context menu. Restore it when the
+            // right-click lands inside the selection so the highlight stays
+            // visible and copy/cut still target the selected text.
+            if ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary))
+                && let Some(saved) = previous
+                && saved.primary.index != saved.secondary.index
+                && let Some(clicked) = output.state.cursor.char_range()
+            {
+                let start = saved.primary.index.min(saved.secondary.index);
+                let end = saved.primary.index.max(saved.secondary.index);
+                if start <= clicked.primary.index && clicked.primary.index <= end {
+                    output.state.cursor.set_char_range(Some(saved));
+                    output.state.clone().store(ui.ctx(), id);
+                    // Keep the document-level cursor in sync immediately: the
+                    // normal focus/click update below only runs on the press
+                    // frame and would otherwise use the collapsed range.
+                    let global = if projected {
+                        project_cursor(saved, &state.large.projection, true)
+                    } else {
+                        shift_cursor(saved, char_start as isize)
+                    };
+                    state.large.cursor = Some(global);
+                    ui.ctx().request_repaint();
+                }
+            }
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
             }
@@ -1283,21 +1309,144 @@ pub(crate) fn show(
                     } else {
                         t.copy_lines
                     };
-                editor::line_menu_style(ui, label, t.clear_content);
-                if editor::line_menu_button(ui, label).clicked() {
-                    let copied = state.large.ranges[selection.0..=selection.1]
+                editor::line_menu_style(ui, t.select_all, t.clear_content);
+                let copied = || {
+                    state.large.ranges[selection.0..=selection.1]
                         .iter()
                         .map(|r| &text[r.clone()])
                         .collect::<Vec<_>>()
-                        .join("\n");
-                    ui.ctx().copy_text(copied);
+                        .join("\n")
+                };
+                if editor::line_menu_button(ui, label).clicked() {
+                    ui.ctx().copy_text(copied());
                     ui.close_menu();
                 }
+                if editor::line_menu_button(ui, t.cut).clicked() {
+                    ui.ctx().copy_text(copied());
+                    line_action = Some(selection);
+                    ui.close_menu();
+                }
+                if editor::line_menu_button(ui, t.paste).clicked() {
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    ui.close_menu();
+                }
+                if editor::line_menu_button(ui, t.select_all).clicked() {
+                    state.large.cursor = Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(state.large.characters),
+                    ));
+                    state.large.invalidate_window();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if editor::line_menu_button(ui, t.clear_content).clicked() {
                     line_action = Some(selection);
                     ui.close_menu();
                 }
             }); }
+            output.response.context_menu(|ui| {
+                let cursor = state.large.cursor.unwrap_or_default();
+                let start = cursor.primary.index.min(cursor.secondary.index);
+                let end = cursor.primary.index.max(cursor.secondary.index);
+                let has_selection = start < end;
+                let line = state.large.line_for_char(start);
+                let copied = || {
+                    if has_selection {
+                        let range = state.large.byte_for_char(text, start)
+                            ..state.large.byte_for_char(text, end);
+                        text[range].to_owned()
+                    } else {
+                        state.large.ranges.get(line)
+                            .map_or_else(String::new, |range| text[range.clone()].to_owned())
+                    }
+                };
+                editor::line_menu_style(ui, t.select_all, t.cut);
+                if editor::line_menu_button(
+                    ui,
+                    if has_selection { t.copy_lines } else { t.copy_line },
+                )
+                .clicked()
+                {
+                    ui.ctx().copy_text(copied());
+                    ui.close_menu();
+                }
+                if editor::line_menu_button(ui, t.cut).clicked() {
+                    ui.ctx().copy_text(copied());
+                    if has_selection {
+                        let range = state.large.byte_for_char(text, start)
+                            ..state.large.byte_for_char(text, end);
+                        let after = Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(start),
+                        ));
+                        state.large.record(text, range, String::new(), Some(cursor), after);
+                        state.large.cursor = after;
+                        changed = true;
+                    } else {
+                        line_action = Some((line, line));
+                    }
+                    ui.close_menu();
+                }
+                if editor::line_menu_button(ui, t.paste).clicked() {
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    ui.close_menu();
+                }
+                if editor::line_menu_button(ui, t.select_all).clicked() {
+                    state.large.cursor = Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(state.large.characters),
+                    ));
+                    state.large.invalidate_window();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if let Some(stamp) = crate::insert_time::submenu(ui, t.insert_time, t.unix_timestamp) {
+                    // Insert the local time at the caret, replacing any
+                    // selection, as one undoable edit of the large buffer.
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                    let start_byte = state.large.byte_for_char(text, start);
+                    let end_byte = state.large.byte_for_char(text, end);
+                    let after = Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(start + stamp.chars().count()),
+                    ));
+                    state.large.record(text, start_byte..end_byte, stamp, Some(cursor), after);
+                    state.large.cursor = after;
+                    changed = true;
+                    ui.close_menu();
+                }
+                let jump_range = if has_selection {
+                    Some(
+                        state.large.byte_for_char(text, start)
+                            ..state.large.byte_for_char(text, end),
+                    )
+                } else {
+                    editor::word_bytes_at(text, start)
+                };
+                let next_jump = jump_range.as_ref().and_then(|range| {
+                    editor::next_occurrence(text, &text[range.clone()], range.clone())
+                });
+                let jump = ui.add_enabled(
+                    next_jump.is_some(),
+                    egui::Button::new(egui::RichText::new(t.jump_next).size(13.0))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+                if jump.clicked() && let Some(next) = next_jump {
+                    // The menu owns focus; give it back so the caret is drawn
+                    // at the end of the new match.
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                    state.large.cursor = Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(next.start),
+                        egui::text::CCursor::new(next.end),
+                    ));
+                    state.pending_selection = Some(next);
+                    state.selection = None;
+                    ui.ctx().request_repaint();
+                    ui.close_menu();
+                }
+            });
             if let Some(line) = depth_action {
                 let before = state.large.visual_starts[line];
                 state.folds.toggle_depth(line);

@@ -1013,6 +1013,11 @@ impl LiteTextApp {
                 .color(pal.text_faint),
             );
         }
+    }
+
+    /// Always-visible footer below the scrollable settings page. Keeping it
+    /// outside the scroll area means adding settings never hides the version.
+    pub(crate) fn settings_footer(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let response = github_icon(ui, pal);
@@ -1585,10 +1590,27 @@ mod tests {
                 let mut app = LiteTextApp { lang, show_settings: true, terminal_installed: Some(Vec::new()), ..Default::default() };
                 let raw = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))), ..Default::default() };
                 for _ in 0..5 { let _ = ctx.run(raw(), |ctx| app.settings_window(ctx, pal)); }
-                for id in ["show_terminal_toolbar_rect", "update_proxy_checkbox_rect"] {
+                // The home page grew with the workspace-font entry, so the
+                // terminal and update cards no longer fit one viewport:
+                // scroll each region into view before asserting on it.
+                let view = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("settings_home_scroll_rect"))).unwrap();
+                let wheel = |app: &mut LiteTextApp, delta: f32| {
+                    let mut input = raw();
+                    input.events = vec![egui::Event::PointerMoved(view.center()), egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta), modifiers: Default::default(),
+                    }];
+                    let _ = ctx.run(input, |ctx| app.settings_window(ctx, pal));
+                };
+                for (id, to_bottom) in [
+                    ("show_terminal_toolbar_rect", false),
+                    ("update_proxy_checkbox_rect", true),
+                ] {
+                    for _ in 0..12 {
+                        wheel(&mut app, if to_bottom { -500.0 } else { 500.0 });
+                    }
                     let checkbox = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id))).unwrap();
-                    let output = ctx.run(raw(), |ctx| app.settings_window(ctx, pal));
-                    let outline = output.shapes.iter().find_map(|s| match &s.shape {
+                    let shapes = ctx.run(raw(), |ctx| app.settings_window(ctx, pal)).shapes;
+                    let outline = shapes.iter().find_map(|s| match &s.shape {
                         egui::Shape::Rect(r) if checkbox.contains(r.rect.center()) && (r.rect.width() - 14.0).abs() < 1.0 => Some(r),
                         _ => None,
                     }).expect("unchecked checkbox must paint its box");
@@ -1604,19 +1626,17 @@ mod tests {
                         }];
                         let _ = ctx.run(input, |ctx| app.settings_window(ctx, pal));
                     }
+                    // The checkmark is asserted while the card is still in view.
+                    let shapes = ctx.run(raw(), |ctx| app.settings_window(ctx, pal)).shapes;
+                    assert!(shapes.iter().any(|s| match &s.shape {
+                        egui::Shape::Path(path) => path.stroke.width >= 1.0 && path.points.iter().all(|p| checkbox.contains(*p)),
+                        _ => false,
+                    }), "checked checkbox must paint a checkmark");
                 }
                 assert!(app.terminal.show_toolbar_button);
                 assert!(app.updates.proxy_enabled);
                 let refresh = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("terminal_refresh_rect"))).unwrap();
                 assert!(refresh.width() < 200.0 && refresh.height() <= 28.0, "Refresh must be content-sized: {refresh:?}");
-                let output = ctx.run(raw(), |ctx| app.settings_window(ctx, pal));
-                for id in ["show_terminal_toolbar_rect", "update_proxy_checkbox_rect"] {
-                    let checkbox = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id))).unwrap();
-                    assert!(output.shapes.iter().any(|s| match &s.shape {
-                        egui::Shape::Path(path) => path.stroke.width >= 1.0 && path.points.iter().all(|p| checkbox.contains(*p)),
-                        _ => false,
-                    }), "checked checkbox must paint a checkmark");
-                }
                 // The scoped settings styling must not leak to toolbar buttons.
                 assert_eq!(ctx.style().visuals.widgets.inactive.bg_stroke, egui::Stroke::NONE);
             }
@@ -1635,9 +1655,8 @@ mod tests {
             };
             app.updates.proxy_enabled = true;
             app.updates.proxy_url = "http://127.0.0.1:7890".into();
-            let mut output = None;
             for _ in 0..5 {
-                output = Some(ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1646,11 +1665,42 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| app.settings_window(ctx, &crate::DARK),
-                ));
+                );
             }
+            // The proxy row lives in the update card, below the fold of the
+            // settings home scroll area since the font entry was added.
+            let view = ctx
+                .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("settings_home_scroll_rect")))
+                .unwrap();
+            for _ in 0..12 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080.0, 720.0),
+                    )),
+                    ..Default::default()
+                };
+                input.events = vec![
+                    egui::Event::PointerMoved(view.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -1000.0),
+                        modifiers: Default::default(),
+                    },
+                ];
+                let _ = ctx.run(input, |ctx| app.settings_window(ctx, &crate::DARK));
+            }
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.settings_window(ctx, &crate::DARK),
+            );
             let labels: Vec<_> = output
-                .as_ref()
-                .unwrap()
                 .shapes
                 .iter()
                 .filter_map(|s| match &s.shape {

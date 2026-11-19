@@ -41,7 +41,7 @@ fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
         serde_json::from_str::<LiteTextApp>("{}")
             .unwrap()
             .workspace_font_size,
-        13.5
+        14.0
     );
     let custom = KeyboardShortcut::new(Modifiers::ALT, Key::F8);
     app.shortcut_keys.set(Action::ZoomIn, custom).unwrap();
@@ -459,9 +459,17 @@ fn shortcut_search_is_on_demand_and_replacement_uses_current_result_in_both_edit
                 .unwrap()
                 .starts_with("hit middle NEW\n")
         );
-        let after = app.active().unwrap().draft_text.clone();
+        // Replacing selects the next hit, so the second replace wraps to the
+        // remaining "hit" at the top instead of doing nothing.
         run(&mut app, vec![key(Action::Replace)]);
-        assert_eq!(app.active().unwrap().draft_text, after);
+        assert!(
+            app.active()
+                .unwrap()
+                .draft_text
+                .as_deref()
+                .unwrap()
+                .starts_with("NEW middle NEW\n")
+        );
         run(&mut app, vec![key(Action::Count)]);
         assert!(app.active().unwrap().editor_state.tools.current.is_none());
         run(&mut app, vec![key(Action::ReplaceAll)]);
@@ -528,7 +536,7 @@ fn settings_shortcuts_entry_opens_secondary_page_and_back_preserves_settings() {
 }
 
 #[test]
-fn shortcuts_page_fits_all_groups_and_separates_labels_and_keycaps() {
+fn shortcuts_page_uses_at_most_two_columns_and_keeps_labels_next_to_controls() {
     for lang in Lang::ALL {
         for size in [
             egui::vec2(1080.0, 720.0),
@@ -543,15 +551,17 @@ fn shortcuts_page_fits_all_groups_and_separates_labels_and_keycaps() {
                 shortcuts_page: true,
                 ..Default::default()
             };
+            let mut output = None;
             for _ in 0..3 {
-                let _ = ctx.run(
+                output = Some(ctx.run(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                         ..Default::default()
                     },
                     |ctx| app.settings_window(ctx, &crate::DARK),
-                );
+                ));
             }
+            let output = output.unwrap();
             let (viewport, content) = ctx
                 .data(|d| {
                     d.get_temp::<(egui::Rect, egui::Vec2)>(egui::Id::new(
@@ -559,23 +569,73 @@ fn shortcuts_page_fits_all_groups_and_separates_labels_and_keycaps() {
                     ))
                 })
                 .unwrap();
-            if size.x >= 1080.0 {
+            let cards: Vec<egui::Rect> = (0..3)
+                .map(|group| {
+                    ctx.data(|d| {
+                        d.get_temp::<egui::Rect>(egui::Id::new(("shortcut_card", group)))
+                    })
+                    .unwrap()
+                })
+                .collect();
+            let two_columns = viewport.width() >= 660.0;
+            assert!(
+                content.x <= viewport.width() + 1.0,
+                "lang={lang:?}, size={size:?} must not scroll horizontally: {content:?} in {viewport:?}"
+            );
+            for card in &cards {
                 assert!(
-                    content.y <= viewport.height() + 1.0,
-                    "lang={lang:?}, size={size:?}, content={content:?}, viewport={viewport:?}"
+                    card.left() >= viewport.left() - 1.0 && card.right() <= viewport.right() + 1.0,
+                    "card clipped horizontally: {card:?}, viewport={viewport:?}"
                 );
-                for group in 0..3usize {
-                    let card = ctx
-                        .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("shortcut_card", group))))
-                        .unwrap();
+                assert!(card.width() >= 240.0, "card too narrow: {card:?}");
+                if two_columns {
                     assert!(
-                        viewport.expand(1.0).contains_rect(card),
-                        "clipped group: {group}, {card:?}, viewport={viewport:?}"
+                        card.width() <= 460.0,
+                        "two-column cards must stay compact: {card:?}, viewport={viewport:?}"
                     );
                 }
-            } else {
-                assert!(content.y > viewport.height());
             }
+            if two_columns {
+                assert!((cards[0].top() - cards[1].top()).abs() < 1.0);
+                assert!(cards[1].left() >= cards[0].right());
+                assert!(cards[2].top() > cards[0].top(), "third card starts a new row");
+                assert!((cards[2].left() - cards[0].left()).abs() < 1.0);
+            } else {
+                for pair in cards.windows(2) {
+                    assert!(pair[1].top() > pair[0].top(), "one card per row");
+                }
+            }
+
+            // The tab-close label and its dropdown must sit next to each other.
+            let label_right = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == tr(lang).close_tab_mode => {
+                        Some(text.pos.x + text.galley.size().x)
+                    }
+                    _ => None,
+                })
+                .expect("tab-close label must be painted");
+            let chip = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.width() - 190.0).abs() < 1.0
+                            && (rect.rect.height() - 26.0).abs() < 1.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("tab-close chip must be painted");
+            assert!(
+                chip.left() - label_right <= 40.0,
+                "close-tab label and options drifted apart: {label_right} vs {}",
+                chip.left()
+            );
+
             assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("shortcut_card", 3usize)))).is_none());
             for action in ACTIONS.iter().filter(|action| action.group() == 3) {
                 assert!(ctx.data(|d| d.get_temp::<(egui::Rect, egui::Rect, f32)>(egui::Id::new(("shortcut_row", *action as usize)))).is_none());

@@ -12,7 +12,18 @@ use std::{
     },
 };
 
-type RestoredSession = io::Result<(Vec<LoadedFile>, Option<u64>)>;
+type RestoredSession = io::Result<Restored>;
+
+/// Session tabs plus the untitled drafts mirrored in the scratch directory.
+pub(crate) struct Restored {
+    pub(crate) files: Vec<LoadedFile>,
+    pub(crate) active: Option<u64>,
+    pub(crate) scratch_active: Option<String>,
+    /// Pin flag and language choice for drafts whose content lives in the
+    /// scratch directory.
+    pub(crate) scratch_meta: Vec<recovery::ScratchMeta>,
+    pub(crate) drafts: Vec<crate::scratch::Draft>,
+}
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -188,6 +199,9 @@ fn load_inner(
         bytes_dirty: false,
         content_revision: 0,
         source_path: None,
+        markdown_mode: crate::markdown::Mode::Source,
+        markdown: crate::markdown::State::default(),
+        scratch_path: None,
         saved_generation: 0,
         disk: linkage::DiskState {
             checked: false,
@@ -222,47 +236,91 @@ impl LiteTextApp {
         self.background_io.restoring.is_some()
     }
 
-    pub(crate) fn start_restore(&mut self, path: PathBuf) {
+    pub(crate) fn start_restore(&mut self, path: PathBuf, scratch_root: Option<PathBuf>) {
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let _timing = crate::timing::phase("restore.load_decode_index");
-            let result = recovery::load(&path).map(|session| {
-                let Some(session) = session else {
-                    return (Vec::new(), None);
-                };
-                let active = session.active_id;
-                let mut files = session.restore();
-                for file in &mut files {
-                    let modified = file.is_modified();
-                    if let Some(text) = &file.draft_text
-                        && crate::large_editor::needs_windowing(text)
-                    {
-                        file.editor_state.large.prepare_loaded(text);
-                        file.editor_state.large.set_encoding(text, file.encoding);
-                        file.saved_large_revision = (!modified).then_some(0);
+            let loaded = {
+                let _t = crate::timing::phase("restore.read_json");
+                recovery::load(&path)
+            };
+            let result = loaded.map(|session| {
+                let (active, scratch_active, scratch_meta, mut files) = match session {
+                    Some(session) => {
+                        let active = session.active_id;
+                        let scratch_active = session.scratch_active().map(str::to_owned);
+                        let scratch_meta = session.scratch_meta();
+                        let files = {
+                            let _t = crate::timing::phase("restore.build_files");
+                            session.restore()
+                        };
+                        (active, scratch_active, scratch_meta, files)
                     }
-                    file.prepare_changes();
+                    None => (None, None, Vec::new(), Vec::new()),
+                };
+                {
+                    let _t = crate::timing::phase("restore.index_files");
+                    // Only the tab that will be drawn needs its large-buffer
+                    // index and line baseline now. Indexing every inactive
+                    // tab made restore wait on hundreds of kilobytes of text
+                    // that nobody is looking at; activation prepares it on
+                    // demand in `draft_editor`.
+                    let visible = active
+                        .filter(|id| files.iter().any(|file| file.id == *id))
+                        .or_else(|| files.first().map(|file| file.id));
+                    for file in &mut files {
+                        if visible != Some(file.id) {
+                            continue;
+                        }
+                        let modified = file.is_modified();
+                        if let Some(text) = &file.draft_text
+                            && crate::large_editor::needs_windowing(text)
+                        {
+                            file.editor_state.large.prepare_loaded(text);
+                            file.editor_state.large.set_encoding(text, file.encoding);
+                            file.saved_large_revision = (!modified).then_some(0);
+                        }
+                        file.prepare_changes();
+                    }
                 }
-                (files, active)
+                let drafts = crate::scratch::scan(scratch_root.as_deref());
+                Restored { files, active, scratch_active, scratch_meta, drafts }
             });
             let _ = sender.send(result);
         });
         self.background_io.restoring = Some(receiver);
     }
 
-    fn apply_restored(&mut self, result: RestoredSession) {
+    pub(crate) fn apply_restored(&mut self, result: RestoredSession) {
         match result {
-            Ok((files, active)) => {
-                self.files = files;
-                self.active_id = active
-                    .filter(|id| self.files.iter().any(|file| file.id == *id))
-                    .or_else(|| self.files.first().map(|file| file.id));
+            Ok(restored) => {
+                self.files = restored.files;
                 self.next_file_id = self.files.iter().map(|file| file.id).max().unwrap_or(0) + 1;
+                self.add_scratch_drafts(restored.drafts);
+                self.restore_scratch_meta(&restored.scratch_meta);
+                // Restored tabs keep the Markdown view recorded with them;
+                // only newly opened files follow the global last-used mode.
+                let active = restored.active
+                    .filter(|id| self.files.iter().any(|file| file.id == *id))
+                    .or_else(|| restored.scratch_active.and_then(|name| {
+                        self.files.iter().find(|file| {
+                            file.scratch_path
+                                .as_ref()
+                                .and_then(|path| path.file_name())
+                                .is_some_and(|file_name| file_name.to_string_lossy() == name)
+                        }).map(|file| file.id)
+                    }));
+                self.active_id = active.or_else(|| self.files.first().map(|file| file.id));
                 self.remember_recovered_versions();
                 self.last_recovery = Some(std::time::Instant::now());
+                self.scratch_maintenance();
             }
             Err(error) => {
-                self.io_error = Some(format!("{}: {error}", tr(self.lang).recovery_failed))
+                self.io_error = Some(format!("{}: {error}", tr(self.lang).recovery_failed));
+                // A damaged session must not hide drafts that are safely on disk.
+                self.open_scratch_files();
+                self.active_id = self.active_id.or_else(|| self.files.first().map(|file| file.id));
+                self.scratch_maintenance();
             }
         }
     }
@@ -349,6 +407,8 @@ impl LiteTextApp {
                         file.editor_state.large.revision,
                         file.language_override.clone(),
                         file.pinned,
+                        file.scratch_path.clone(),
+                        file.markdown_mode,
                     )
                 })
                 .collect(),
@@ -361,6 +421,11 @@ impl LiteTextApp {
             || self.background_io.recovery.is_some()
             || crate::new_window::finished()
         {
+            return;
+        }
+        // Never publish a snapshot that points at a mirror which is still
+        // waiting for the debounce; keep the previous snapshot one more frame.
+        if self.scratch_stale() {
             return;
         }
         self.last_recovery = Some(std::time::Instant::now());
@@ -392,7 +457,10 @@ impl LiteTextApp {
                 Ok(result) => self.apply_restored(result),
                 Err(mpsc::TryRecvError::Empty) => {
                     self.background_io.restoring = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                    // Restore usually finishes in a few tens of milliseconds;
+                    // a 30 ms poll made the tabs appear a whole frame or two
+                    // later than necessary. Poll tightly only while restoring.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(5));
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -493,9 +561,28 @@ impl LiteTextApp {
                     match result {
                         Ok(mut file) => {
                             // Recheck identity: another operation may have opened/saved this target meanwhile.
-                            if !self.files.iter().any(|other| other.path == file.path) {
+                            // A scratch draft may already represent the same file.
+                            let existing = self.files.iter().find(|other| {
+                                other.path == file.path
+                                    || other.scratch_path.as_deref().is_some_and(|scratch| {
+                                        linkage::resolved(scratch) == file.path
+                                    })
+                            }).map(|other| other.id);
+                            if let Some(existing) = existing {
+                                if job.activate && self.active_id == job.active_at_start {
+                                    self.active_id = Some(existing);
+                                    self.background_io.focus_owner = Some(existing);
+                                    self.selection = None;
+                                    self.drag_anchor = None;
+                                    self.inspector_popup = None;
+                                    self.focus_editor = Some(existing);
+                                }
+                            } else {
                                 file.id = self.next_file_id;
                                 self.next_file_id += 1;
+                                if crate::markdown::is_markdown(&file) {
+                                    file.markdown_mode = self.markdown_mode;
+                                }
                                 if job.activate && self.active_id == job.active_at_start {
                                     self.active_id = Some(file.id);
                                     self.background_io.focus_owner = Some(file.id);
@@ -542,10 +629,15 @@ impl LiteTextApp {
                 total.clone(),
             );
             let stage = phase.clone();
+            let wake = ctx.clone();
             std::thread::spawn(move || {
                 let _ = sender.send(load_with_progress(
                     &target, &cancelled, &read, &size, &stage, None,
                 ));
+                // The poller only runs on a frame. Wake it as soon as the file
+                // is ready instead of waiting for the 30 ms fallback repaint;
+                // small files then become visible almost immediately.
+                wake.request_repaint();
             });
             self.background_io.opening = Some(Opening {
                 path,

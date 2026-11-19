@@ -21,6 +21,9 @@ enum Output {
     Replace(
         Vec<(Range<usize>, usize)>,
         Box<crate::large_editor::PreparedReplacement>,
+        /// Byte and character range of the next hit after a single replace;
+        /// `None` for replace-all.
+        Option<(Range<usize>, Range<usize>)>,
     ),
     Empty,
 }
@@ -123,6 +126,11 @@ pub(crate) fn start(file: &mut crate::LoadedFile, ctx: &egui::Context, action: u
                 let Some(first) = edits.first() else {
                     return Ok(Output::Empty);
                 };
+                let advance = if action == 3 {
+                    worker.find_one_after_edit(&source, &first.0, &first.1)
+                } else {
+                    None
+                };
                 let range = first.0.start..edits.last().unwrap().0.end;
                 let mut inserted = String::new();
                 let mut at = range.start;
@@ -152,6 +160,7 @@ pub(crate) fn start(file: &mut crate::LoadedFile, ctx: &egui::Context, action: u
                         .map(|(range, value)| (range, value.len()))
                         .collect(),
                     Box::new(prepared),
+                    advance,
                 ));
             }
             let found = worker.find_one(
@@ -223,7 +232,7 @@ impl crate::LiteTextApp {
                             file.editor_state.tools.count_result = Some(count);
                             file.editor_state.tools.search_error = None;
                         }
-                        Ok(Output::Replace(edits, prepared)) => {
+                        Ok(Output::Replace(edits, prepared, advance)) => {
                             if !file.editor_state.large.active {
                                 file.activate_large(ctx);
                             }
@@ -243,6 +252,18 @@ impl crate::LiteTextApp {
                                 .editor_state
                                 .cursor
                                 .map(|cursor| cursor.secondary.index..cursor.primary.index);
+                            // A single replace lands on the next hit so
+                            // repeated replaces need no extra "next".
+                            if let Some((found, characters)) = advance {
+                                file.editor_state.tools.current = Some(found);
+                                file.editor_state.tools.not_found = false;
+                                file.editor_state.pending_selection = Some(characters);
+                                // The edit bumped the revision; re-anchor so
+                                // the advanced match is not dropped as stale.
+                                let revision =
+                                    (file.content_revision, file.editor_state.large.revision);
+                                file.editor_state.tools.reanchor(revision);
+                            }
                             if self.active_id == Some(file.id) {
                                 self.focus_editor = Some(file.id);
                                 file.editor_state.focus_requested = true;

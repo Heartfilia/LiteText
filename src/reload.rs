@@ -144,6 +144,11 @@ impl LiteTextApp {
                             let line = file.editor_state.cursor_line;
                             loaded.id = file.id;
                             loaded.pinned = file.pinned;
+                            // A reload replaces the working copy; the old edit
+                            // mirror no longer describes this tab.
+                            if let Some(mirror) = file.scratch_path.take() {
+                                let _ = crate::scratch::remove(&mirror);
+                            }
                             loaded.content_revision = file.content_revision + 1;
                             loaded.saved_generation = file.saved_generation + 1;
                             loaded.editor_state.tools.wrap = file.editor_state.tools.wrap;

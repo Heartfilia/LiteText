@@ -10,7 +10,14 @@ pub(crate) fn toolbar(
     file: &mut crate::LoadedFile,
     pal: &Palette,
     t: &crate::i18n::Strings,
+    rendered: bool,
 ) {
+    // Wrap, whitespace and the marker pen only affect the source TextEdit.
+    // Rendered Markdown (live / split) keeps their icons visible but disabled;
+    // find & replace stays available in every mode.
+    if rendered {
+        file.editor_state.tools.pen_menu = false;
+    }
     // Parent layout runs right-to-left; these are inserted next to the view toggle.
     for (hint, active, action) in [
         (t.find_replace, file.editor_state.tools.find_open, 0),
@@ -18,29 +25,50 @@ pub(crate) fn toolbar(
         (t.whitespace, file.editor_state.tools.whitespace, 2),
         (t.word_wrap, file.editor_state.tools.wrap, 3),
     ] {
-        let response = crate::toolbar_toggle(ui, active, hint, pal, |p, rect, color| {
-            let color = if action == 1 {
-                file.editor_state.tools.pen.map(pen_color).unwrap_or(color)
-            } else {
-                color
-            };
-            paint_icon(p, rect, color, action);
-        });
+        let disabled = rendered && action != 0;
+        let response = if disabled {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+            // Visible but dimmed: the icon stays, the control cannot be used.
+            paint_icon(
+                ui.painter(),
+                rect,
+                pal.text_faint.gamma_multiply(0.35),
+                action,
+            );
+            response
+        } else {
+            crate::toolbar_toggle(ui, active, hint, pal, |p, rect, color| {
+                let color = if action == 1 {
+                    file.editor_state.tools.pen.map(pen_color).unwrap_or(color)
+                } else {
+                    color
+                };
+                paint_icon(p, rect, color, action);
+            })
+        };
         ui.ctx().data_mut(|d| {
             d.insert_temp(
                 egui::Id::new(("text_tool_rect", file.id, action)),
                 response.rect,
             )
         });
-        if response.clicked() {
+        if response.clicked() && !disabled {
             match action {
-                0 => file.editor_state.tools.find_open = !file.editor_state.tools.find_open,
+                0 => {
+                    let tools = &mut file.editor_state.tools;
+                    tools.find_open = !tools.find_open;
+                    // Reopening starts from the compact find-only layout.
+                    if !tools.find_open {
+                        tools.replace_open = false;
+                    }
+                },
                 1 => file.editor_state.tools.pen_menu = !file.editor_state.tools.pen_menu,
                 2 => file.editor_state.tools.whitespace = !file.editor_state.tools.whitespace,
                 _ => file.editor_state.tools.wrap = !file.editor_state.tools.wrap,
             }
         }
-        if action == 1 && file.editor_state.tools.pen_menu {
+        if action == 1 && !disabled && file.editor_state.tools.pen_menu {
             let popup = egui::Area::new(egui::Id::new(("pen_menu", file.id)))
                 .order(egui::Order::Foreground)
                 .pivot(egui::Align2::RIGHT_TOP)
@@ -513,6 +541,69 @@ pub(crate) fn replace_range_with_cursor(
     file.editor_state.tools.current = None;
 }
 
+/// Small chevron that unfolds or folds the replace row. It is intentionally
+/// shorter than a normal button (14 px) so it reads as a handle attached to
+/// the find field rather than another toolbar action.
+fn find_replace_toggle(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    expanded: bool,
+    pal: &Palette,
+    file_id: u64,
+    t: &crate::i18n::Strings,
+) -> bool {
+    let response = ui
+        .interact(
+            rect,
+            egui::Id::new(("find_replace_toggle", file_id)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(t.find_replace);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        4.0,
+        if response.hovered() {
+            crate::opaque_tint(pal.bg_panel, pal.text_faint, 0.20)
+        } else {
+            crate::opaque_tint(pal.bg_panel, pal.text_faint, 0.08)
+        },
+    );
+    let color = if response.hovered() {
+        pal.text_main
+    } else {
+        pal.text_faint
+    };
+    let center = rect.center();
+    let half_width = 4.0;
+    // Collapsed points down (more content below); expanded points up (fold it
+    // away again).
+    let tip = if expanded { -2.0 } else { 2.0 };
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - half_width, center.y - tip),
+            egui::pos2(center.x, center.y + tip),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y + tip),
+            egui::pos2(center.x + half_width, center.y - tip),
+        ],
+        stroke,
+    );
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(("find_replace_toggle_rect", file_id)),
+            rect,
+        )
+    });
+    response.clicked()
+}
+
 pub(crate) fn find_bar(
     ui: &mut egui::Ui,
     file: &mut crate::LoadedFile,
@@ -540,6 +631,11 @@ pub(crate) fn find_bar(
         .tools
         .invalidate_search_if_changed((file.content_revision, file.editor_state.large.revision));
     let mut action = file.editor_state.tools.pending_action.take().unwrap_or(0);
+    // `Focus replace` and the replace shortcuts act on the replacement field,
+    // so they must unfold the hidden replace row first.
+    if focus == Some(true) || matches!(action, 3 | 4) {
+        file.editor_state.tools.replace_open = true;
+    }
     let mut jump = false;
     let bounds = ui.available_rect_before_wrap();
     let width = (bounds.width() - 16.0).min(500.0);
@@ -624,7 +720,11 @@ pub(crate) fn find_bar(
                                 if next.clicked() {
                                     action = 2;
                                 }
-                                if response.has_focus()
+                                // A singleline TextEdit surrenders focus on Enter,
+                                // so `has_focus` is already false in the Enter
+                                // frame; accept the just-lost focus as well and
+                                // keep the field focused for repeated stepping.
+                                if (response.has_focus() || response.lost_focus())
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 {
                                     action = if ui.input(|i| i.modifiers.shift) {
@@ -632,109 +732,168 @@ pub(crate) fn find_bar(
                                     } else {
                                         2
                                     };
-                                }
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 32.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let tools = &mut file.editor_state.tools;
-                                let (response, [single, all], field) = input_with_actions(
-                                    ui,
-                                    egui::Id::new(("find_replacement", file.id)),
-                                    &mut tools.replacement,
-                                    t.replace,
-                                    (ui.available_width() - 2.0).max(140.0),
-                                    &mut [],
-                                    [(4, t.replace), (5, t.replace_all)],
-                                    pal,
-                                );
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(
-                                        egui::Id::new(("replace_rect", file.id)),
-                                        single.rect,
-                                    );
-                                    d.insert_temp(
-                                        egui::Id::new(("replace_all_rect", file.id)),
-                                        all.rect,
-                                    );
-                                    d.insert_temp(
-                                        egui::Id::new(("replace_field_rect", file.id)),
-                                        field,
-                                    );
-                                    d.insert_temp(
-                                        egui::Id::new(("replace_input_rect", file.id)),
-                                        response.rect,
-                                    );
-                                });
-                                if focus == Some(true) {
                                     response.request_focus();
                                 }
-                                if single.clicked() {
-                                    action = 3;
-                                }
-                                if all.clicked() {
-                                    action = 4;
-                                }
                             },
                         );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 24.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let tools = &mut file.editor_state.tools;
-                                let count = ui
-                                    .add(egui::Button::new(t.count_label).selected(tools.count))
-                                    .on_hover_text(t.count_matches);
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(
-                                        egui::Id::new(("find_count_rect", file.id)),
-                                        count.rect,
-                                    )
-                                });
-                                if count.clicked() {
-                                    action = 5;
-                                }
-                                if (tools.count_result.is_some() || tools.not_found)
-                                    && tools.search_error.is_none()
-                                {
-                                    let total = tools.count_result.unwrap_or(0);
-                                    let result = if total == 0 {
-                                        t.count_not_found.to_owned()
-                                    } else {
-                                        total.to_string()
-                                    };
-                                    let style = if total == 0 {
-                                        egui::RichText::new(result).small().color(pal.text_faint)
-                                    } else {
-                                        egui::RichText::new(result)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(pal.accent)
-                                    };
-                                    let response = ui.label(style);
+                        if file.editor_state.tools.replace_open {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 32.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let tools = &mut file.editor_state.tools;
+                                    let (response, [single, all], field) = input_with_actions(
+                                        ui,
+                                        egui::Id::new(("find_replacement", file.id)),
+                                        &mut tools.replacement,
+                                        t.replace,
+                                        (ui.available_width() - 2.0).max(140.0),
+                                        &mut [],
+                                        [(4, t.replace), (5, t.replace_all)],
+                                        pal,
+                                    );
                                     ui.ctx().data_mut(|d| {
                                         d.insert_temp(
-                                            egui::Id::new(("find_count_result_rect", file.id)),
+                                            egui::Id::new(("replace_rect", file.id)),
+                                            single.rect,
+                                        );
+                                        d.insert_temp(
+                                            egui::Id::new(("replace_all_rect", file.id)),
+                                            all.rect,
+                                        );
+                                        d.insert_temp(
+                                            egui::Id::new(("replace_field_rect", file.id)),
+                                            field,
+                                        );
+                                        d.insert_temp(
+                                            egui::Id::new(("replace_input_rect", file.id)),
                                             response.rect,
+                                        );
+                                    });
+                                    if focus == Some(true) {
+                                        response.request_focus();
+                                    }
+                                    if single.clicked() {
+                                        action = 3;
+                                    }
+                                    if all.clicked() {
+                                        action = 4;
+                                    }
+                                },
+                            );
+                            // Collapse handle: a slim chevron in its own strip,
+                            // deliberately shorter than a regular button.
+                            let (strip, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 16.0),
+                                egui::Sense::hover(),
+                            );
+                            let toggle = egui::Rect::from_center_size(
+                                strip.center(),
+                                egui::vec2(30.0, 14.0),
+                            );
+                            if find_replace_toggle(ui, toggle, true, pal, file.id, t) {
+                                file.editor_state.tools.replace_open = false;
+                            }
+                        } else {
+                            let row = ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let tools = &mut file.editor_state.tools;
+                                    let count = ui
+                                        .add(egui::Button::new(t.count_label).selected(tools.count))
+                                        .on_hover_text(t.count_matches);
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(
+                                            egui::Id::new(("find_count_rect", file.id)),
+                                            count.rect,
                                         )
                                     });
-                                }
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let button = ui.button(t.go_to_line);
-                                    let input = ui.add(egui::TextEdit::singleline(&mut tools.jump_line)
-                                        .id(egui::Id::new(("jump_line", file.id)))
-                                        .desired_width(72.0).char_limit(20));
-                                    tools.jump_line.retain(|c| c.is_ascii_digit());
-                                    ui.ctx().data_mut(|d| {
-                                        d.insert_temp(egui::Id::new(("jump_line_input_rect", file.id)), input.rect);
-                                        d.insert_temp(egui::Id::new(("jump_line_button_rect", file.id)), button.rect);
+                                    if count.clicked() {
+                                        action = 5;
+                                    }
+                                    if (tools.count_result.is_some() || tools.not_found)
+                                        && tools.search_error.is_none()
+                                    {
+                                        let total = tools.count_result.unwrap_or(0);
+                                        let result = if total == 0 {
+                                            t.count_not_found.to_owned()
+                                        } else {
+                                            total.to_string()
+                                        };
+                                        let style = if total == 0 {
+                                            egui::RichText::new(result).small().color(pal.text_faint)
+                                        } else {
+                                            egui::RichText::new(result)
+                                                .size(16.0)
+                                                .strong()
+                                                .color(pal.accent)
+                                        };
+                                        let response = ui.label(style);
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(
+                                                egui::Id::new(("find_count_result_rect", file.id)),
+                                                response.rect,
+                                            )
+                                        });
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let button = ui.button(t.go_to_line);
+                                        let input = ui.add(egui::TextEdit::singleline(&mut tools.jump_line)
+                                            .id(egui::Id::new(("jump_line", file.id)))
+                                            .desired_width(72.0).char_limit(20));
+                                        tools.jump_line.retain(|c| c.is_ascii_digit());
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(egui::Id::new(("jump_line_input_rect", file.id)), input.rect);
+                                            d.insert_temp(egui::Id::new(("jump_line_button_rect", file.id)), button.rect);
+                                        });
+                                        if button.clicked() || ((input.has_focus() || input.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter))) { jump = true; }
                                     });
-                                    if button.clicked() || ((input.has_focus() || input.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter))) { jump = true; }
-                                });
-                            },
-                        );
+                                },
+                            );
+                            // Expand handle sits in the middle of the count/jump
+                            // row, right underneath the find field. On narrow
+                            // panels the count and jump clusters can meet in
+                            // the middle, so the handle moves into its own
+                            // slim strip instead of covering an input.
+                            let row_rect = row.response.rect;
+                            let cluster = |key: &str| {
+                                ui.ctx().data(|d| {
+                                    d.get_temp::<egui::Rect>(egui::Id::new((key, file.id)))
+                                })
+                            };
+                            let gap = cluster("find_count_rect")
+                                .zip(cluster("jump_line_input_rect"))
+                                .map(|(left, right)| (left.right(), right.left()));
+                            let toggle = match gap {
+                                Some((left_edge, right_edge))
+                                    if right_edge - left_edge >= 46.0 =>
+                                {
+                                    let center_x = row_rect.center().x;
+                                    // Prefer the panel middle, clamped into the
+                                    // free gap between the two clusters.
+                                    let center_x =
+                                        center_x.clamp(left_edge + 23.0, right_edge - 23.0);
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(center_x, row_rect.center().y),
+                                        egui::vec2(30.0, 16.0),
+                                    )
+                                }
+                                _ => {
+                                    let (strip, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    egui::Rect::from_center_size(
+                                        strip.center(),
+                                        egui::vec2(30.0, 14.0),
+                                    )
+                                }
+                            };
+                            if find_replace_toggle(ui, toggle, false, pal, file.id, t) {
+                                file.editor_state.tools.replace_open = true;
+                            }
+                        }
                         let tools = &mut file.editor_state.tools;
                         if let Some(error) = &tools.search_error {
                             ui.label(egui::RichText::new(error).small().color(pal.danger));
@@ -750,6 +909,7 @@ pub(crate) fn find_bar(
     });
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         file.editor_state.tools.find_open = false;
+        file.editor_state.tools.replace_open = false;
     }
     if action != 0 {
         if file.draft_text.as_ref().is_some_and(|text| text.len() >= crate::large_editor::THRESHOLD) {
@@ -833,12 +993,19 @@ fn search_action(file: &mut crate::LoadedFile, ctx: &egui::Context, action: usiz
         byte_at(text, c.primary.index.min(c.secondary.index))
             ..byte_at(text, c.primary.index.max(c.secondary.index))
     });
+    // In the rendered modes the preview owns the highlight and there is no
+    // text selection to compare against. Keeping the current match there is
+    // what lets Enter / "next" advance instead of restarting at the first hit.
+    let rendered = crate::markdown::is_markdown(file)
+        && file.markdown_mode != crate::markdown::Mode::Source
+        && !file.editor_state.large.active
+        && !crate::large_editor::needs_windowing(text);
     let current = file
         .editor_state
         .tools
         .current
         .clone()
-        .filter(|r| Some(r) == selected.as_ref());
+        .filter(|r| rendered || Some(r) == selected.as_ref());
     if action == 3 {
         // Never replace an unlocated query or an unrelated manual selection.
         if let Some(range) = current
@@ -851,7 +1018,30 @@ fn search_action(file: &mut crate::LoadedFile, ctx: &egui::Context, action: usiz
                 .is_some_and(|m| m.range() == range)
         {
             let replacement = file.editor_state.tools.replacement_for(text, &range);
+            // Replacing selects the next hit right away, like the mainstream
+            // editors: each press replaces the current match and lands on the
+            // following one, so repeated replaces need no extra "next".
+            let advance = file
+                .editor_state
+                .tools
+                .find_one_after_edit(text, &range, &replacement);
             replace_range(file, ctx, range, replacement);
+            // The edit bumped the revision; re-anchor so the advanced
+            // `current` is not dropped as stale by the next action.
+            let revision = (file.content_revision, file.editor_state.large.revision);
+            file.editor_state.tools.reanchor(revision);
+            match advance {
+                Some((found, characters)) => {
+                    file.editor_state.selection = None;
+                    file.editor_state.pending_selection = Some(characters);
+                    file.editor_state.tools.current = Some(found);
+                    file.editor_state.tools.not_found = false;
+                }
+                None => {
+                    file.editor_state.tools.current = None;
+                    file.editor_state.tools.not_found = true;
+                }
+            }
         }
         return;
     }
@@ -894,6 +1084,9 @@ pub(crate) struct Tools {
     count_result: Option<usize>,
     pub regex: bool,
     pub find_open: bool,
+    /// Whether the replace row is unfolded below the find field. Collapsed by
+    /// default so the panel only shows the query and the count/jump row.
+    pub replace_open: bool,
     pub query: String,
     pub replacement: String,
     pub jump_line: String,
@@ -1081,6 +1274,19 @@ impl Tools {
         self.not_found = false;
     }
 
+    /// Re-anchor the search state to the current revision after a
+    /// programmatic edit, so a freshly located `current` survives the next
+    /// action's staleness check. The matcher is text-independent and stays.
+    pub(crate) fn reanchor(&mut self, revision: (u64, u64)) {
+        self.search_key = Some((
+            self.query.clone(),
+            self.ignore_case,
+            self.regex,
+            revision.0,
+            revision.1,
+        ));
+    }
+
     fn prepare_matcher(&mut self, revision: (u64, u64)) -> bool {
         self.invalidate_search_if_changed(revision);
         if self.query.is_empty() {
@@ -1130,14 +1336,62 @@ impl Tools {
         }
     }
 
+    /// The next match after a single replacement, evaluated on the text the
+    /// replacement is about to be applied to. Positions after the edit shift
+    /// by the length delta; the search wraps to the top when the tail holds
+    /// no further hit. Returns the byte range in the *new* coordinates plus
+    /// the matching character range for the editor selection.
+    pub(crate) fn find_one_after_edit(
+        &self,
+        text: &str,
+        replaced: &Range<usize>,
+        insertion: &str,
+    ) -> Option<(Range<usize>, Range<usize>)> {
+        let delta = insertion.len() as isize - replaced.len() as isize;
+        let removed_chars = text[replaced.clone()].chars().count();
+        let inserted_chars = insertion.chars().count();
+        let (old_start, len, in_tail) = if !self.regex && !self.ignore_case {
+            let query = self.query.as_str();
+            let tail = &text[replaced.end..];
+            if let Some(at) = tail.find(query) {
+                (replaced.end + at, query.len(), true)
+            } else {
+                let head = &text[..replaced.start];
+                let at = head.find(query)?;
+                (at, query.len(), false)
+            }
+        } else {
+            let matcher = self.matcher.as_ref()?;
+            let after = matcher.find_iter(text).find(|m| m.start() >= replaced.end);
+            if let Some(found) = after {
+                (found.start(), found.end() - found.start(), true)
+            } else {
+                let found = matcher.find_iter(text).find(|m| m.end() <= replaced.start)?;
+                (found.start(), found.end() - found.start(), false)
+            }
+        };
+        let start = if in_tail {
+            (old_start as isize + delta) as usize
+        } else {
+            old_start
+        };
+        let bytes = start..start + len;
+        let matched_chars = text[old_start..old_start + len].chars().count();
+        let prefix = if in_tail {
+            text[..old_start].chars().count() - removed_chars + inserted_chars
+        } else {
+            text[..old_start].chars().count()
+        };
+        Some((bytes, prefix..prefix + matched_chars))
+    }
+
     fn find_one(
         &self,
         text: &str,
         from: usize,
         backwards: bool,
         skip_empty: bool,
-    ) -> Option<Range<usize>> {
-        if !self.regex && !self.ignore_case {
+    ) -> Option<Range<usize>> {        if !self.regex && !self.ignore_case {
             let start = if backwards {
                 text[..from]
                     .rfind(&self.query)
@@ -2100,7 +2354,67 @@ mod tests {
     }
 
     #[test]
-    fn find_panel_is_right_aligned_stacked_with_option_buttons_and_icon_actions() {
+    fn find_panel_toggle_never_overlaps_the_count_or_jump_controls() {
+        for width in [320.0, 400.0, 1080.0] {
+            let ctx = egui::Context::default();
+            crate::setup_fonts(&ctx);
+            let mut app = crate::LiteTextApp::default();
+            app.new_document();
+            let file = app.active_mut().unwrap();
+            file.draft_text = Some("A a A".to_owned());
+            file.sync_draft();
+            file.editor_state.tools.find_open = true;
+            file.editor_state.tools.query = "a".to_owned();
+            file.editor_state.tools.count = true;
+            file.editor_state.tools.count_all(
+                file.draft_text.as_deref().unwrap(),
+                (file.content_revision, 0),
+            );
+            let mut run = || {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            find_bar(ui, app.active_mut().unwrap(), &crate::DARK, crate::tr(crate::Lang::En))
+                        });
+                    },
+                )
+            };
+            run();
+            run();
+            let id = app.active_id.unwrap();
+            let rect = |key: &str| {
+                ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new((key, id))))
+                    .unwrap()
+            };
+            let toggle = rect("find_replace_toggle_rect");
+            assert!(!toggle.intersects(rect("jump_line_input_rect")), "width={width}: {toggle:?}");
+            assert!(!toggle.intersects(rect("jump_line_button_rect")), "width={width}: {toggle:?}");
+            assert!(!toggle.intersects(rect("find_count_rect")), "width={width}: {toggle:?}");
+            if let Some(result) = ctx.data(|d| {
+                d.get_temp::<egui::Rect>(egui::Id::new(("find_count_result_rect", id)))
+            }) {
+                assert!(!toggle.intersects(result), "width={width}: {toggle:?} vs {result:?}");
+            }
+            assert!(
+                rect("find_overlay_rect").contains_rect(toggle),
+                "width={width}: the toggle must stay inside the panel"
+            );
+            assert!(
+                !app.active().unwrap().editor_state.tools.replace_open,
+                "the toggle must not be clickable through another widget"
+            );
+        }
+    }
+
+    #[test]
+    fn find_panel_starts_compact_and_the_chevron_unfolds_the_replace_row() {
         let ctx = egui::Context::default();
         let mut app = crate::LiteTextApp::default();
         app.new_document();
@@ -2119,54 +2433,52 @@ mod tests {
             file.draft_text.as_deref().unwrap(),
             (file.content_revision, 0),
         );
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1080.0, 720.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    find_bar(ui, file, &crate::DARK, crate::tr(crate::Lang::En))
-                });
-            },
-        );
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1080.0, 720.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    find_bar(ui, file, &crate::DARK, crate::tr(crate::Lang::En))
-                });
-            },
-        );
-        let positions: std::collections::HashMap<_, _> = output
-            .shapes
-            .into_iter()
-            .filter_map(|s| {
-                if let egui::Shape::Text(t) = s.shape {
-                    Some((t.galley.text().to_owned(), t.pos))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(positions["a"].x > 500.0);
-        assert!(positions["new"].y > positions["a"].y);
-        assert!((positions["new"].x - positions["a"].x).abs() < 1.0);
-        for label in ["Aa", "Count", ".*", "3"] {
-            assert!(positions.contains_key(label));
-        }
-        for label in ["×", "Replace", "Replace all", "↑", "↓", "CNT"] {
-            assert!(!positions.contains_key(label));
-        }
+        let run = |file: &mut crate::LoadedFile, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        find_bar(ui, file, &crate::DARK, crate::tr(crate::Lang::En))
+                    });
+                },
+            )
+        };
+        let click = |file: &mut crate::LoadedFile, pos: egui::Pos2| {
+            for pressed in [true, false] {
+                run(
+                    file,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        let texts = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some((t.galley.text().to_owned(), t.pos))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
         let id = file.id;
         let rect = |key: &str| {
             ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new((key, id))))
@@ -2176,78 +2488,130 @@ mod tests {
             ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("find_query", id)).with(label)))
                 .unwrap()
         };
+
+        // Default state: find field plus count/jump row, replace row folded.
+        assert!(!file.editor_state.tools.replace_open);
+        run(file, vec![]);
+        let output = run(file, vec![]);
+        let positions = texts(&output);
+        assert!(positions["a"].x > 500.0);
+        for label in ["Aa", "Count", ".*", "3"] {
+            assert!(positions.contains_key(label), "missing {label}");
+        }
+        for label in ["new", "Replace", "Replace all"] {
+            assert!(!positions.contains_key(label), "unexpected {label}");
+        }
+        let find_field = rect("find_field_rect");
+        let find_input = rect("find_input_rect");
         let aa = option_rect("Aa");
         let reg = option_rect(".*");
-        assert!(rect("find_field_rect").contains_rect(aa));
-        assert!(rect("find_field_rect").contains_rect(reg));
-        assert!(rect("find_input_rect").right() + 10.0 <= aa.left());
+        assert!(find_field.contains_rect(aa));
+        assert!(find_field.contains_rect(reg));
+        assert!(find_input.right() + 10.0 <= aa.left());
         assert!(aa.right() < reg.left() && reg.right() < rect("find_previous_rect").left());
         let count = rect("find_count_rect");
         let result = rect("find_count_result_rect");
-        assert!(count.top() > rect("replace_field_rect").bottom());
         assert!(result.left() > count.right());
         assert!((result.center().y - count.center().y).abs() < 2.0);
-        for (field, input, first, second) in [
+        let jump_input = rect("jump_line_input_rect");
+        let jump_button = rect("jump_line_button_rect");
+        assert!(jump_input.left() > count.right());
+        assert!(jump_button.left() > jump_input.right());
+        assert!(rect("find_overlay_rect").contains_rect(jump_button));
+        assert!((jump_button.center().y - count.center().y).abs() < 3.0);
+
+        // The expand handle is a slim chevron in the middle of that row, not a
+        // full-height button.
+        let overlay = rect("find_overlay_rect");
+        let toggle = rect("find_replace_toggle_rect");
+        assert!(toggle.height() < 24.0, "toggle must be slim: {toggle:?}");
+        assert!(toggle.width() <= 40.0, "toggle must be small: {toggle:?}");
+        assert!(
+            (toggle.center().x - overlay.center().x).abs() < 2.5,
+            "toggle must be centered: {toggle:?}, overlay={overlay:?}"
+        );
+        assert!(
+            (toggle.center().y - count.center().y).abs() < 3.0,
+            "toggle must sit in the count/jump row: {toggle:?}"
+        );
+        let compact_height = overlay.height();
+
+        // Expanding reveals the replace row and hides count/jump.
+        click(file, toggle.center());
+        assert!(file.editor_state.tools.replace_open);
+        let output = run(file, vec![]);
+        let positions = texts(&output);
+        assert!(positions.contains_key("new"));
+        assert!(positions["new"].y > positions["a"].y);
+        assert!((positions["new"].x - positions["a"].x).abs() < 1.0);
+        for label in ["Count", "3"] {
+            assert!(!positions.contains_key(label), "count row must hide: {label}");
+        }
+        let replace_field = rect("replace_field_rect");
+        let replace_input = rect("replace_input_rect");
+        for (name, input, first, second) in [
             (
-                "find_field_rect",
-                "find_input_rect",
-                "find_previous_rect",
-                "find_next_rect",
+                "find",
+                find_input,
+                rect("find_previous_rect"),
+                rect("find_next_rect"),
             ),
             (
-                "replace_field_rect",
-                "replace_input_rect",
-                "replace_rect",
-                "replace_all_rect",
+                "replace",
+                replace_input,
+                rect("replace_rect"),
+                rect("replace_all_rect"),
             ),
         ] {
-            let field = rect(field);
-            let input = rect(input);
-            let a = rect(first);
-            let b = rect(second);
+            let field = if name == "find" { find_field } else { replace_field };
+            let a = first;
+            let b = second;
             assert!(field.contains_rect(input) && field.contains_rect(a) && field.contains_rect(b));
             assert!(
                 a.left() >= input.right() + 10.0,
-                "actions need a separated trailing region: input={input:?}, action={a:?}"
+                "{name} actions need a separated trailing region"
             );
             assert!(b.left() >= a.right());
             assert!((a.center().y - input.center().y).abs() < 2.0);
         }
         assert!(
-            (rect("find_field_rect").right() - rect("replace_field_rect").right()).abs() < 1.0,
-            "find={:?}, replace={:?}",
-            rect("find_field_rect"),
-            rect("replace_field_rect")
+            (find_field.right() - replace_field.right()).abs() < 1.0,
+            "the two fields must share their right edge"
         );
-        let overlay = rect("find_overlay_rect");
-        for key in ["find_field_rect", "replace_field_rect"] {
-            let field = rect(key);
+        for field in [find_field, replace_field] {
+            let overlay = rect("find_overlay_rect");
             assert!(
                 overlay.right() - field.right() < 16.0,
                 "unused right-side space: overlay={overlay:?}, field={field:?}"
             );
             assert!(field.width() > overlay.width() - 24.0);
         }
+        let overlay = rect("find_overlay_rect");
         assert!(
-            rect("replace_field_rect").bottom() < 110.0,
-            "the two rows must stay compact"
+            overlay.height() > compact_height + 10.0,
+            "the expanded panel must be taller"
         );
+        let collapse = rect("find_replace_toggle_rect");
+        assert!(collapse.height() < 24.0);
+        assert!(
+            collapse.top() > replace_input.bottom(),
+            "the collapse handle belongs under the replace field"
+        );
+        assert!(
+            (collapse.center().x - overlay.center().x).abs() < 2.5,
+            "the collapse handle must stay centered"
+        );
+
+        // Toggling again folds it back to the default layout.
+        click(file, collapse.center());
+        assert!(!file.editor_state.tools.replace_open);
+        let positions = texts(&run(file, vec![]));
+        assert!(!positions.contains_key("new"));
+        assert!(positions.contains_key("Count"));
+
         // Long text is clipped to the editable region, not drawn beneath actions.
         file.editor_state.tools.query = "long input ".repeat(100);
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1080.0, 720.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    find_bar(ui, file, &crate::DARK, crate::tr(crate::Lang::En))
-                });
-            },
-        );
+        let output = run(file, vec![]);
         let first_action = rect("find_previous_rect");
         let text_shape = output.shapes.iter().find(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().starts_with("long input"))).unwrap();
         assert!(text_shape.clip_rect.right() < first_action.left() - 5.0);
@@ -2425,17 +2789,28 @@ mod tests {
                     .unwrap()
                     .starts_with("hit middle NEW end hit")
             );
-            assert!(file.editor_state.tools.current.is_none());
-            // A second replacement cannot touch another occurrence without navigation.
-            let after = file.draft_text.clone();
+            // Replacing selects the next hit right away, so the pending
+            // selection points at the remaining "hit" behind "end".
+            assert_eq!(file.editor_state.tools.current, Some(19..22));
+            let pending = file.editor_state.pending_selection.clone().unwrap();
+            assert_eq!((pending.start, pending.end), (19, 22));
+            // The second replace consumes that hit without extra navigation.
+            file.editor_state.cursor = cursor(19, 22);
+            file.editor_state.pending_selection = None;
             run(&mut app, 3);
             let file = app.active_mut().unwrap();
-            assert_eq!(file.draft_text, after);
+            assert!(
+                file.draft_text.as_deref().unwrap().starts_with("hit middle NEW end NEW"),
+                "the second replace must advance: {:?}",
+                file.draft_text
+            );
+            // Wrapping lands back on the first hit.
+            assert_eq!(file.editor_state.tools.current, Some(0..3));
             let revision = (file.content_revision, file.editor_state.large.revision);
             file.editor_state
                 .tools
                 .count_all(file.draft_text.as_deref().unwrap(), revision);
-            assert_eq!(file.editor_state.tools.count_result, Some(2));
+            assert_eq!(file.editor_state.tools.count_result, Some(1));
             assert!(file.editor_state.tools.matches.is_empty());
             file.editor_state.tools.query = "middle".to_owned();
             file.editor_state
@@ -2677,6 +3052,7 @@ mod tests {
         file.draft_text = Some("中文🙂 中文🙂".to_owned());
         file.sync_draft();
         file.editor_state.tools.find_open = true;
+        file.editor_state.tools.replace_open = true;
         file.editor_state.tools.query = "中文".to_owned();
         file.editor_state.tools.replacement = "替换".to_owned();
         let mut next = None;
@@ -2899,5 +3275,115 @@ mod tests {
             assert_eq!(file.draft_text.as_deref(), Some(original.as_str()));
             assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
         }
+    }
+    #[test]
+    fn rendered_markdown_disables_source_only_toolbar_buttons() {
+        let ctx = egui::Context::default();
+        let mut app = crate::LiteTextApp::default();
+        app.new_document();
+        {
+            let file = app.active_mut().unwrap();
+            file.path = std::path::PathBuf::from("toolbar.md");
+            file.name = "toolbar.md".to_owned();
+            file.draft_text = Some("# Title\n\nBody\n".to_owned());
+            file.sync_draft();
+            crate::workspace_theme::configure(
+                file,
+                &crate::workspace_theme::WorkspaceTheme::default(),
+                true,
+            );
+            file.markdown_mode = crate::markdown::Mode::Live;
+        }
+        let draw = |app: &mut crate::LiteTextApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.top_bar(ctx, &crate::DARK),
+            )
+        };
+        let click = |app: &mut crate::LiteTextApp, pos: egui::Pos2| {
+            for pressed in [true, false] {
+                draw(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+        };
+        let file_id = app.active_id.unwrap();
+        let rect = |action: i32| {
+            ctx.data(|d| {
+                d.get_temp::<egui::Rect>(egui::Id::new(("text_tool_rect", file_id, action)))
+            })
+            .unwrap()
+        };
+        // Dimmest line stroke alpha of the icon inside its button rect.
+        let icon_alpha = |output: egui::FullOutput, button: egui::Rect| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if button.contains(points[0]) && button.contains(points[1]) =>
+                    {
+                        Some(stroke.color.a())
+                    }
+                    _ => None,
+                })
+                .min()
+                .unwrap_or(255)
+        };
+
+        draw(&mut app, vec![]);
+        draw(&mut app, vec![]);
+        let wrap_button = rect(3);
+        let dim = icon_alpha(draw(&mut app, vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))]), wrap_button);
+        assert!(
+            dim < 200,
+            "wrap icon must be dimmed in a rendered Markdown mode, alpha {dim}"
+        );
+
+        let (whitespace_button, pen_button, find_button) =
+            (rect(2), rect(1), rect(0));
+        click(&mut app, wrap_button.center());
+        assert!(
+            !app.active().unwrap().editor_state.tools.wrap,
+            "wrap must not toggle while Markdown is rendered"
+        );
+        click(&mut app, whitespace_button.center());
+        assert!(
+            !app.active().unwrap().editor_state.tools.whitespace,
+            "whitespace must not toggle while Markdown is rendered"
+        );
+        click(&mut app, pen_button.center());
+        assert!(
+            app.active().unwrap().editor_state.tools.pen.is_none()
+                && !app.active().unwrap().editor_state.tools.pen_menu,
+            "the marker pen must stay unavailable while Markdown is rendered"
+        );
+        // Find & replace stays usable.
+        click(&mut app, find_button.center());
+        assert!(app.active().unwrap().editor_state.tools.find_open);
+
+        app.active_mut().unwrap().markdown_mode = crate::markdown::Mode::Source;
+        draw(&mut app, vec![]);
+        click(&mut app, wrap_button.center());
+        assert!(
+            app.active().unwrap().editor_state.tools.wrap,
+            "source mode must restore the wrap toggle"
+        );
     }
 }

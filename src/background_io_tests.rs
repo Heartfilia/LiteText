@@ -205,7 +205,7 @@ fn startup_restore_prepares_large_indices_and_close_barrier_keeps_session() {
     original.write_recovery().unwrap();
     for barrier in [false, true] {
         let mut restored = app(dir.path());
-        restored.start_restore(dir.path().join("session.json"));
+        restored.start_restore(dir.path().join("session.json"), None);
         assert!(restored.restoring());
         assert!(restored.shortcuts_blocked());
         restored.start_background_recovery();
@@ -226,6 +226,76 @@ fn startup_restore_prepares_large_indices_and_close_barrier_keeps_session() {
         assert!(file.is_modified());
         assert_eq!(file.editor_state.large.characters, text.chars().count());
     }
+}
+
+#[test]
+fn restore_indexes_only_the_active_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "中文 line\r\n".repeat(40_000);
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    std::fs::write(&first, &source).unwrap();
+    std::fs::write(&second, &source).unwrap();
+    let mut original = app(dir.path());
+    original.open_paths(vec![first, second]);
+    original.active_id = Some(original.files[0].id);
+    original.write_recovery().unwrap();
+
+    let mut restored = app(dir.path());
+    restored.start_restore(dir.path().join("session.json"), None);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while restored.restoring() {
+        restored.poll_background_io(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(restored.files.len(), 2);
+    let active = restored.active_id.unwrap();
+    for file in &restored.files {
+        if file.id == active {
+            assert!(
+                file.editor_state.large.active,
+                "the visible tab must be indexed before the first frame"
+            );
+            assert!(file.editor_state.changes.baseline.is_some());
+        } else {
+            assert!(
+                !file.editor_state.large.active,
+                "inactive tabs must not pay for their large-buffer index at startup"
+            );
+            assert!(
+                file.editor_state.changes.baseline.is_none(),
+                "inactive tabs must not build a line baseline at startup"
+            );
+        }
+    }
+}
+
+#[test]
+fn background_open_wakes_the_ui_before_the_fallback_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wake.txt");
+    std::fs::write(&path, "hello").unwrap();
+    let ctx = egui::Context::default();
+    let immediate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = immediate.clone();
+    ctx.set_request_repaint_callback(move |info| {
+        if info.delay.is_zero() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let mut app = app(dir.path());
+    app.queue_open(vec![path]);
+    app.poll_background_io(&ctx); // starts the worker; fallback poll is delayed 30 ms
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !immediate.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(std::time::Instant::now() < deadline, "worker never woke the UI");
+        std::thread::yield_now();
+    }
+    app.poll_background_io(&ctx);
+    assert_eq!(app.files.len(), 1);
+    assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("hello"));
 }
 
 #[test]
@@ -511,4 +581,41 @@ fn loading_progress_cancel_button_clears_pending_queue_without_touching_workspac
     assert_eq!(app.active_id, id);
     assert_eq!(app.files.len(), 1);
     drop(sender);
+}
+
+#[test]
+fn background_restore_keeps_scratch_pin_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let drafts = dir.path().join("drafts");
+    let mut original = LiteTextApp {
+        recovery_path_override: Some(dir.path().join("session.json")),
+        scratch_dir: Some(drafts.clone()),
+        ..Default::default()
+    };
+    original.new_document();
+    original.active_mut().unwrap().draft_text = Some("pinned draft".into());
+    original.active_mut().unwrap().sync_draft();
+    original.scratch_flush(None, true);
+    original.toggle_pin(original.active_id.unwrap());
+    original.write_recovery().unwrap();
+
+    let mut restored = LiteTextApp {
+        recovery_path_override: Some(dir.path().join("session.json")),
+        scratch_dir: Some(drafts.clone()),
+        ..Default::default()
+    };
+    restored.start_restore(dir.path().join("session.json"), Some(drafts));
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while restored.restoring() {
+        restored.poll_background_io(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(restored.files.len(), 1);
+    assert!(
+        restored.files[0].pinned,
+        "the background restore path must re-apply the draft's pin flag"
+    );
+    assert!(restored.files[0].is_scratch_mirror());
 }
