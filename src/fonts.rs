@@ -713,13 +713,16 @@ mod tests {
     #[test]
     fn system_font_names_scan_cleanly() {
         // Guards the collection (`.ttc`) handling and the name preference
-        // order; silently skips platforms without this directory.
+        // order; silently skips platforms or CI images without fonts.
         let dirs = font_dirs();
         if dirs.is_empty() {
             return;
         }
         let fonts = scan(&dirs);
-        assert!(fonts.len() > 50, "the system must yield fonts");
+        if fonts.is_empty() {
+            // A headless CI image may ship no fonts at all; nothing to check.
+            return;
+        }
         for font in &fonts {
             assert!(
                 is_clean_family(&font.family),
@@ -733,23 +736,33 @@ mod tests {
                 font.family
             );
         }
-        // Localized family names exist in these collections; the English
-        // record must win over the localized one.
-        assert!(
-            fonts.iter().any(|font| font.family.starts_with("Hiragino")),
-            "expected the English Hiragino names, got: {:?}",
-            fonts.iter().map(|f| f.family.as_str()).take(5).collect::<Vec<_>>()
-        );
-        // Coverage detection separates CJK faces from Latin-only ones, which
-        // is what the Chinese UI uses to trim the list.
-        assert!(
-            fonts.iter().any(|font| font.chinese),
-            "expected Chinese-capable system fonts"
-        );
-        assert!(
-            fonts.iter().any(|font| !font.chinese),
-            "Latin-only system fonts must stay distinguishable"
-        );
+        // The counts and specific families below only hold on desktop
+        // systems with a full font set; Linux CI images are minimal.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(fonts.len() > 50, "the system must yield fonts");
+            // Localized family names exist in these collections; the English
+            // record must win over the localized one.
+            assert!(
+                fonts.iter().any(|font| font.family.starts_with("Hiragino")),
+                "expected the English Hiragino names, got: {:?}",
+                fonts.iter().map(|f| f.family.as_str()).take(5).collect::<Vec<_>>()
+            );
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(fonts.len() > 20, "a desktop system must yield fonts");
+            // Coverage detection separates CJK faces from Latin-only ones,
+            // which is what the Chinese UI uses to trim the list.
+            assert!(
+                fonts.iter().any(|font| font.chinese),
+                "expected Chinese-capable system fonts"
+            );
+            assert!(
+                fonts.iter().any(|font| !font.chinese),
+                "Latin-only system fonts must stay distinguishable"
+            );
+        }
     }
 
     #[test]
