@@ -17,7 +17,10 @@ use std::{
 
 pub(crate) const VERSION: &str = env!("LITETEXT_VERSION");
 const REPOSITORY: &str = "https://github.com/Heartfilia/LiteText";
-const API: &str = "https://api.github.com/repos/Heartfilia/LiteText/releases";
+/// Release discovery uses the repository's Atom feed instead of the REST API:
+/// it is not subject to the per-IP API quota, so no authentication token is
+/// ever embedded in the distributed binary.
+const FEED: &str = "https://github.com/Heartfilia/LiteText/releases.atom";
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -229,30 +232,137 @@ fn select_release(
 
 fn check(settings: &Settings) -> Result<Option<Release>> {
     let http = client(settings, Duration::from_secs(15))?;
-    let mut releases = Vec::new();
-    // The list endpoint includes prereleases and returns [] for an empty repo.
-    // /latest returns 404 when only beta/rc releases exist.
-    for page in 1..=10 {
-        let response = http
-            .get(API)
-            .query(&[("per_page", 100), ("page", page)])
-            .header("Accept", "application/vnd.github+json")
-            .send()?
-            .error_for_status()?;
-        let has_next = response
-            .headers()
-            .get(reqwest::header::LINK)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("rel=\"next\""));
-        releases.extend(serde_json::from_slice::<Vec<Release>>(&read_limited(
-            response,
-            4 * 1024 * 1024,
-        )?)?);
-        if !has_next {
-            return select_release(releases, VERSION, &[&asset_name()?, &legacy_asset_name()?]);
+    let preferred = asset_name()?;
+    let legacy = legacy_asset_name()?;
+    // The feed lists the newest releases, prereleases included, newest first.
+    // Drafts are private and never appear here.
+    let feed = String::from_utf8(read_limited(
+        http.get(FEED).send()?.error_for_status()?,
+        1024 * 1024,
+    )?)?;
+    let mut candidates = release_tags(&feed);
+    loop {
+        // Candidate tags carry the platform package and checksums until the
+        // probe below decides which release actually published them.
+        let releases: Vec<Release> = candidates
+            .iter()
+            .map(|tag| Release {
+                tag_name: tag.clone(),
+                draft: false,
+                prerelease: version(tag)
+                    .map(|parsed| !parsed.pre.is_empty())
+                    .unwrap_or(false),
+                assets: [preferred.clone(), "SHA256SUMS".to_owned()]
+                    .into_iter()
+                    .map(|name| Asset {
+                        browser_download_url: download_url(tag, &name),
+                        name,
+                        size: 0,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let Some(release) = select_release(releases, VERSION, &[&preferred, &legacy])? else {
+            return Ok(None);
+        };
+        let tag = release.tag_name;
+        let mut package: Option<(String, u64)> = None;
+        for name in [&preferred, &legacy] {
+            if let Some(size) = probe_asset(&http, &tag, name)? {
+                package = Some((name.clone(), size));
+                break;
+            }
+        }
+        let manifest = probe_asset(&http, &tag, "SHA256SUMS")?;
+        if package.is_none() || manifest.is_none() {
+            // A tag whose assets are still uploading (or which never shipped
+            // for this platform) is skipped in favour of the previous release.
+            candidates.retain(|candidate| candidate != &tag);
+            continue;
+        }
+        let (package_name, package_size) = package.expect("checked above");
+        let package_url = download_url(&tag, &package_name);
+        return Ok(Some(Release {
+            prerelease: release.prerelease,
+            tag_name: tag.clone(),
+            draft: false,
+            assets: vec![
+                Asset {
+                    name: package_name,
+                    browser_download_url: package_url,
+                    size: package_size,
+                },
+                Asset {
+                    name: "SHA256SUMS".into(),
+                    browser_download_url: download_url(&tag, "SHA256SUMS"),
+                    size: manifest.unwrap_or(0),
+                },
+            ],
+        }));
+    }
+}
+
+/// Extract the release tags from the Atom feed, in feed order (newest first).
+/// Only the `<link href=".../releases/tag/<tag>">` target is trusted; entry
+/// titles may be arbitrary release names.
+fn release_tags(feed: &str) -> Vec<String> {
+    const MARKER: &str = "/releases/tag/";
+    let mut tags: Vec<String> = Vec::new();
+    let mut rest = feed;
+    while let Some(index) = rest.find(MARKER) {
+        rest = &rest[index + MARKER.len()..];
+        let Some(end) = rest.find('"') else { break };
+        let tag = &rest[..end];
+        rest = &rest[end..];
+        if tag.is_empty() {
+            continue;
+        }
+        let tag = percent_decode(tag);
+        if !tags.contains(&tag) {
+            tags.push(tag);
         }
     }
-    Err("Release list exceeds safety limit; cannot determine latest version".into())
+    tags
+}
+
+/// Minimal percent-decoding for tag names; plain tags pass through unchanged.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            let high = (bytes[index + 1] as char).to_digit(16).unwrap_or(0);
+            let low = (bytes[index + 2] as char).to_digit(16).unwrap_or(0);
+            out.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Release asset URLs are constructed from the tag; the API list that used to
+/// provide them is exactly what this change removes.
+fn download_url(tag: &str, name: &str) -> String {
+    format!("{REPOSITORY}/releases/download/{tag}/{name}")
+}
+
+/// Probe a constructed asset URL with HEAD. `Ok(None)` means the asset is
+/// absent (release still uploading); unexpected statuses are errors.
+fn probe_asset(http: &Client, tag: &str, name: &str) -> Result<Option<u64>> {
+    let response = http.head(download_url(tag, name)).send()?;
+    match response.status() {
+        status if status.is_success() => Ok(Some(response.content_length().unwrap_or(0))),
+        reqwest::StatusCode::NOT_FOUND => Ok(None),
+        status => Err(format!("Unexpected GitHub response: {status}").into()),
+    }
 }
 fn checksum(manifest: &str, name: &str) -> Result<String> {
     let entries: Vec<_> = manifest
@@ -474,10 +584,38 @@ fn validate_bundle_tree(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Persistent scratch directory for updates. A portable Windows executable
+/// may sit on the desktop (or any user folder); the lock and staging files
+/// must not appear next to it. They live under `~/.litetext/` instead.
+fn update_work_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = work_root_override().lock().unwrap().clone() {
+        return Ok(root);
+    }
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    };
+    let root = home
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or("User home directory unavailable")?
+        .join(".litetext");
+    fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+#[cfg(test)]
+fn work_root_override() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    &OVERRIDE
+}
+
 fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) -> Result<Prepared> {
     let target = installed_target(&std::env::current_exe()?.canonicalize()?)?;
-    let parent = target.parent().ok_or("No installation parent")?;
-    let lock_path = parent.join(".litetext-update.lock");
+    let work = update_work_root()?;
+    let lock_path = work.join(".litetext-update.lock");
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -486,10 +624,9 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
         .open(&lock_path)?;
     lock.try_lock_exclusive()
         .map_err(|_| "Another update is in progress")?;
-    // Staging in the installation directory also verifies write access, without elevation.
     let stage = tempfile::Builder::new()
         .prefix(".litetext-stage-")
-        .tempdir_in(parent)?;
+        .tempdir_in(&work)?;
     let root = tempfile::Builder::new()
         .prefix("litetext-update-")
         .tempdir()?;
@@ -507,7 +644,7 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
     };
     let asset = find(&name)?;
     let manifest = find("SHA256SUMS")?;
-    if asset.size == 0 || asset.size > MAX_PACKAGE {
+    if asset.size > MAX_PACKAGE {
         return Err("Invalid release package size".into());
     }
     let http = client(settings, Duration::from_secs(900))?;
@@ -523,6 +660,11 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
         .get(&asset.browser_download_url)
         .send()?
         .error_for_status()?;
+    // The size comes from the release HEAD probe; fall back to the response
+    // headers when it is unknown, and to the package cap otherwise.
+    let expected_size = (asset.size > 0)
+        .then_some(asset.size)
+        .or_else(|| response.content_length());
     let archive_path = root.path().join(&name);
     let mut output = File::create(&archive_path)?;
     let mut hash = Sha256::new();
@@ -535,21 +677,26 @@ fn prepare(settings: &Settings, release: &Release, progress: impl Fn(String)) ->
             break;
         }
         count += len as u64;
-        if count > asset.size {
+        if count > MAX_PACKAGE || expected_size.is_some_and(|expected| count > expected) {
             return Err("Download exceeds declared size".into());
         }
         output.write_all(&buffer[..len])?;
         hash.update(&buffer[..len]);
         if last.elapsed() > Duration::from_millis(200) {
-            progress(format!(
-                "下载 / Downloading {:.0}%",
-                count as f64 / asset.size as f64 * 100.0
-            ));
+            progress(match expected_size {
+                Some(expected) => format!(
+                    "下载 / Downloading {:.0}%",
+                    count as f64 / expected as f64 * 100.0
+                ),
+                None => format!("下载 / Downloading {} MiB", count / (1024 * 1024)),
+            });
             last = Instant::now();
         }
     }
     output.sync_all()?;
-    if count != asset.size || format!("{:x}", hash.finalize()) != expected {
+    if expected_size.is_some_and(|expected| count != expected)
+        || format!("{:x}", hash.finalize()) != expected
+    {
         return Err("SHA-256 / size verification failed".into());
     }
     progress("校验通过，准备安装 / Verified, preparing installation".into());
@@ -617,6 +764,50 @@ fn launch(target: &Path, ack: Option<&Path>) -> Result<Option<std::process::Chil
     ))
 }
 
+/// Rename within a volume; fall back to a copy next to the destination when
+/// the stage directory in the user profile and the installation live on
+/// different volumes. Handles plain executables and `.app` bundle trees.
+fn move_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if let Err(error) = fs::rename(source, destination) {
+        // ERROR_NOT_SAME_DEVICE (Windows) / EXDEV (Unix).
+        if !matches!(error.raw_os_error(), Some(17) | Some(18)) {
+            return Err(error);
+        }
+        let incoming = destination.with_file_name(".litetext-incoming");
+        let _ = remove_tree(&incoming);
+        copy_tree(source, &incoming)?;
+        if let Err(error) = fs::rename(&incoming, destination) {
+            let _ = remove_tree(&incoming);
+            return Err(error);
+        }
+        // Best effort: the swap already succeeded and the source may be a
+        // file Windows has not fully released yet.
+        let _ = remove_tree(source);
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(source)?.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(source, destination).map(|_| ())
+    }
+}
+
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path).map(|meta| meta.is_dir()).unwrap_or(false) {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 fn install(plan: &Plan) -> Result<()> {
     install_with(plan, launch, Duration::from_secs(45))
 }
@@ -658,13 +849,13 @@ fn install_with(
             std::thread::sleep(Duration::from_millis(200));
         }
     }
-    if let Err(error) = fs::rename(&plan.target, &plan.backup) {
+    if let Err(error) = move_path(&plan.target, &plan.backup) {
         drop(runtime_lock);
         let _ = launch(&plan.target, None);
         return Err(error.into());
     }
-    if let Err(error) = fs::rename(&plan.staged, &plan.target) {
-        fs::rename(&plan.backup, &plan.target)?;
+    if let Err(error) = move_path(&plan.staged, &plan.target) {
+        move_path(&plan.backup, &plan.target)?;
         drop(runtime_lock);
         let _ = launch(&plan.target, None);
         return Err(error.into());
@@ -690,8 +881,8 @@ fn install_with(
     }
     // Keep the failed new binary for diagnosis; never delete a running executable.
     let failed = plan.staged.with_file_name("failed-update");
-    fs::rename(&plan.target, failed)?;
-    fs::rename(&plan.backup, &plan.target)?;
+    move_path(&plan.target, &failed)?;
+    move_path(&plan.backup, &plan.target)?;
     launch(&plan.target, None)?;
     Err("新版本未确认启动，已回退 / Startup not acknowledged; rolled back".into())
 }
@@ -1071,6 +1262,66 @@ fn github_icon(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn release_feed_tags_are_extracted_newest_first_and_decoded() {
+        let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Recent releases</title>
+  <link rel="self" href="https://github.com/Heartfilia/LiteText/releases.atom"/>
+  <entry>
+    <title>v0.2.0-beta.1</title>
+    <link rel="alternate" type="text/html" href="https://github.com/Heartfilia/LiteText/releases/tag/v0.2.0-beta.1"/>
+    <updated>2026-11-20T08:00:00Z</updated>
+  </entry>
+  <entry>
+    <title>Release 1.2 custom name</title>
+    <link rel="alternate" type="text/html" href="https://github.com/Heartfilia/LiteText/releases/tag/v0.1.4"/>
+    <updated>2026-11-19T08:00:00Z</updated>
+  </entry>
+</feed>"#;
+        assert_eq!(release_tags(feed), vec!["v0.2.0-beta.1", "v0.1.4"]);
+        assert_eq!(
+            release_tags(r#"<link href="https://github.com/Heartfilia/LiteText/releases/tag/v0%2E1%2E3"/>"#),
+            vec!["v0.1.3"],
+            "percent-encoded tag characters are decoded"
+        );
+        assert_eq!(release_tags("<feed></feed>"), Vec::<String>::new());
+        // A truncated feed without a closing quote stops instead of panicking.
+        assert_eq!(
+            release_tags(r#"<link href="https://github.com/Heartfilia/LiteText/releases/tag/v0.1"#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn update_scratch_lives_in_the_user_profile_not_the_install_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        *work_root_override().lock().unwrap() = Some(dir.path().to_owned());
+        let root = update_work_root().unwrap();
+        *work_root_override().lock().unwrap() = None;
+        assert_eq!(root, dir.path());
+        assert!(root.is_dir(), "the work root is created on demand");
+
+        // The fallback copy used for cross-volume installs copies trees and
+        // cleans up the source, so nothing is left behind.
+        let source = dir.path().join("source");
+        let nested = source.join("Contents/MacOS");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("litetext"), "binary").unwrap();
+        fs::write(source.join("Info.plist"), "meta").unwrap();
+        let destination = dir.path().join("destination");
+        copy_tree(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(destination.join("Info.plist")).unwrap(), "meta");
+        assert_eq!(
+            fs::read_to_string(destination.join("Contents/MacOS/litetext")).unwrap(),
+            "binary"
+        );
+        remove_tree(&source).unwrap();
+        assert!(!source.exists());
+        move_path(&destination, &dir.path().join("moved")).unwrap();
+        assert!(dir.path().join("moved/Contents/MacOS/litetext").is_file());
+    }
 
     #[test]
     fn package_formats_match_release_artifacts_and_legacy_zips_are_accepted() {

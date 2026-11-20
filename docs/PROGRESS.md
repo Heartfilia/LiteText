@@ -940,6 +940,12 @@ eframe 0.31 不自动持久化窗口大小位置。每帧跟踪 `viewport().oute
 - 修复：末尾间隙不显示、Inspector 宽度拖拽失效、下拉框主题配色、
   中文垂直对齐、HEX 高亮错位等
 
+### 2026-11-20（更新检测与 Windows 更新文件位置）
+
+- 版本发现从 GitHub REST API 列表端点改为仓库 `releases.atom` 订阅：不受按 IP 的 API 限额约束（匿名 60 次/小时），因此**无需在发行二进制中嵌入任何 GitHub token**，也不存在 token 提取与配额滥用风险。标签从条目 `link href` 提取并做百分号解码，预发布状态按语义化版本前缀推导（与原 `select_release` 的过滤语义一致）；资产 URL 由 tag 构造，仍通过严格的 `github.com/Heartfilia/LiteText/releases/download/` 前缀校验，并用 HEAD 探测确认存在（正在上传的 tag 自动跳过并回退上一个发布）。下载进度与大小校验改用 HEAD/响应 Content-Length，包大小上限不变。
+- Windows 更新不再把 `.litetext-update.lock` 与 `.litetext-stage-*` 写进程序所在目录（便携版放在桌面时会在桌面留下两个隐藏文件）：更新锁与暂存目录移到用户主目录 `~/.litetext/`，安装替换改用跨盘安全的移动（同盘重命名，跨盘复制到目标旁再原子重命名，随后清理），旧版本备份 `previous` 与失败诊断也一并位于 `~/.litetext`。
+- 新增回归测试：Atom 订阅解析（最新在前、去重、百分号解码、截断容错）、更新工作目录位于用户主目录、目录树复制/移动清理；全部 441 项测试通过。
+
 ## 已知问题
 
 - 无屏幕录制权限时无法截图自查 UI（开发机限制，与软件无关）
