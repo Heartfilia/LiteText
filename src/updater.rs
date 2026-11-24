@@ -622,11 +622,14 @@ fn claim_update_check(root: &Path, now: u64, cooldown: Option<Duration>) -> Resu
     fs::create_dir_all(root)?;
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
         .open(root.join("update-check.lock"))?;
-    if let Err(error) = lock.try_lock_exclusive() {
-        if cooldown.is_some() && error.kind() == std::io::ErrorKind::WouldBlock {
+    if let Err(error) = FileExt::try_lock_exclusive(&lock) {
+        // Windows reports ERROR_LOCK_VIOLATION rather than Unix EWOULDBLOCK.
+        // Compare fs2's platform-specific lock error instead of ErrorKind;
+        // never turn a failed try-lock into an unbounded blocking wait.
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
             return Ok(false);
         }
-        FileExt::lock_exclusive(&lock)?;
+        return Err(error.into());
     }
     let path = root.join("update-check.json");
     let history = fs::read(&path).ok()
@@ -1419,8 +1422,10 @@ mod tests {
         assert!(claim_update_check(root, 5000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
         // Another window holding the reservation must suppress an automatic check.
         let lock = OpenOptions::new().read(true).write(true).open(root.join("update-check.lock")).unwrap();
-        lock.lock_exclusive().unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
         assert!(!claim_update_check(root, 20000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        // Manual checks must not wait forever behind another window either.
+        assert!(!claim_update_check(root, 20000, None).unwrap());
         FileExt::unlock(&lock).unwrap();
         assert!(claim_update_check(root, 20000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
     }
