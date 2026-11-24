@@ -380,11 +380,11 @@ impl LiteTextApp {
                     self.active_id = Some(file.id);
                 }
             } else if !self.background_io.queue.contains(&path)
-                && !self
+                && self
                     .background_io
                     .opening
                     .as_ref()
-                    .is_some_and(|job| job.path == path)
+                    .is_none_or(|job| job.path != path)
             {
                 self.background_io.queue.push_back(path);
                 self.background_io.queued_total += 1;

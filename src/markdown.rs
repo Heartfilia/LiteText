@@ -1896,26 +1896,26 @@ impl OutlineState {
                     .or_else(|| headings.first()).map(|(at, _)| *at)
             }
         });
-        if forced.is_none() && !at_bottom {
-            if let (Some(previous), Some(next)) = (self.active, candidate) {
-                let old = headings.iter().position(|(at, _)| *at == previous);
-                let new = headings.iter().position(|(at, _)| *at == next);
-                if let (Some(old), Some(new)) = (old, new) {
-                    // Shrink hysteresis for tightly packed headings, rather
-                    // than making a short section impossible to select.
-                    let boundary = if new > old { new } else { old };
-                    let mut gap = if boundary > 0 {
-                        (headings[boundary].1 - headings[boundary - 1].1).abs()
-                    } else { 64.0 };
-                    if boundary + 1 < headings.len() {
-                        gap = gap.min((headings[boundary + 1].1 - headings[boundary].1).abs());
-                    }
-                    let buffer = 16.0_f32.min(gap * 0.25);
-                    if new > old && headings[new].1 > line - buffer
-                        || new < old && headings[old].1 < line + buffer
-                    {
-                        return self.active;
-                    }
+        if forced.is_none() && !at_bottom
+            && let (Some(previous), Some(next)) = (self.active, candidate)
+        {
+            let old = headings.iter().position(|(at, _)| *at == previous);
+            let new = headings.iter().position(|(at, _)| *at == next);
+            if let (Some(old), Some(new)) = (old, new) {
+                // Shrink hysteresis for tightly packed headings, rather
+                // than making a short section impossible to select.
+                let boundary = if new > old { new } else { old };
+                let mut gap = if boundary > 0 {
+                    (headings[boundary].1 - headings[boundary - 1].1).abs()
+                } else { 64.0 };
+                if boundary + 1 < headings.len() {
+                    gap = gap.min((headings[boundary + 1].1 - headings[boundary].1).abs());
+                }
+                let buffer = 16.0_f32.min(gap * 0.25);
+                if new > old && headings[new].1 > line - buffer
+                    || new < old && headings[old].1 < line + buffer
+                {
+                    return self.active;
                 }
             }
         }
@@ -8134,8 +8134,13 @@ mod tests {
                     assert_eq!(preview.0, edit.0);
                     assert!((preview.2 - edit.2).abs() < 0.01,
                         "H{level} {:?} advance jumped: {preview:?} -> {edit:?}", preview.0);
-                    assert!(preview.1.distance(edit.1) < 0.01,
-                        "H{level} {:?} position jumped: {preview:?} -> {edit:?}", preview.0);
+                    // Font fallback and pixel snapping differ between OSes.
+                    // Allow a subpixel displacement, but still catch the old
+                    // half-pixel centering regression at every display scale.
+                    let delta_pixels = preview.1.distance(edit.1) * scale;
+                    assert!(delta_pixels < 0.25,
+                        "H{level} {:?} position jumped by {delta_pixels:.6}px (scale={scale}, size={font_size}): ({:.6}, {:.6}) -> ({:.6}, {:.6})",
+                        preview.0, preview.1.x, preview.1.y, edit.1.x, edit.1.y);
                 }
             }
         }

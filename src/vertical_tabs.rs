@@ -57,19 +57,18 @@ impl LiteTextApp {
                             // Drop before/after the hovered row, constrained to
                             // normal tabs; fixed tabs stay in their own group.
                             let rect = ui.ctx().data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("vertical_tab_rect", id)))).unwrap();
-                            if let Some(drag) = self.tab_drag_id.filter(|drag| normal.contains(drag)) {
-                                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                    if rect.contains(pos) && ui.clip_rect().contains(pos) && drag != id {
-                                        let below = pos.y >= rect.center().y;
-                                        let y = if below { rect.bottom() } else { rect.top() };
-                                        ui.painter().hline(rect.x_range(), y, egui::Stroke::new(2.0, pal.accent));
-                                        if ui.input(|i| i.pointer.any_released()) {
-                                            let mut order: Vec<_> = normal.iter().copied().filter(|item| *item != drag).collect();
-                                            if let Some(at) = order.iter().position(|item| *item == id) {
-                                                order.insert(at + usize::from(below), drag);
-                                                reorder = Some(order);
-                                            }
-                                        }
+                            if let Some(drag) = self.tab_drag_id.filter(|drag| normal.contains(drag))
+                                && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+                                && rect.contains(pos) && ui.clip_rect().contains(pos) && drag != id
+                            {
+                                let below = pos.y >= rect.center().y;
+                                let y = if below { rect.bottom() } else { rect.top() };
+                                ui.painter().hline(rect.x_range(), y, egui::Stroke::new(2.0_f32, pal.accent));
+                                if ui.input(|i| i.pointer.any_released()) {
+                                    let mut order: Vec<_> = normal.iter().copied().filter(|item| *item != drag).collect();
+                                    if let Some(at) = order.iter().position(|item| *item == id) {
+                                        order.insert(at + usize::from(below), drag);
+                                        reorder = Some(order);
                                     }
                                 }
                             }
@@ -82,7 +81,7 @@ impl LiteTextApp {
                 // line-number gutter (including the empty-document screen).
                 let rect = ui.max_rect();
                 ui.painter().vline(rect.right() + 7.0, rect.y_range(),
-                    egui::Stroke::new(1.0, pal.text_faint.gamma_multiply(0.35)));
+                    egui::Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.35)));
             });
         if ctx.input(|i| i.pointer.any_released()) { self.tab_drag_id = None; }
         if let Some(order) = reorder { self.reorder_normal_tabs(&order); }
