@@ -810,7 +810,7 @@ pub(crate) fn show(
     }
     let scroll_output = egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .scroll_bar_rect(egui::Rect::from_min_max(
             egui::pos2(gutter.right() + 1.0, bounds.top()),
             bounds.max,
@@ -1238,7 +1238,7 @@ pub(crate) fn show(
                     );
                 }
                 painter.text(
-                    egui::pos2(number_gutter.right() - 2.0, rect.center().y),
+                    egui::pos2(number_gutter.right() - editor::GUTTER_NUMBER_GAP, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     (line + 1).to_string(),
                     gutter_font.clone(),

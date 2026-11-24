@@ -53,6 +53,10 @@ struct Request {
     method: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
+    /// The body parses as JSON and the request declares a JSON Content-Type,
+    /// so language targets may emit a native JSON payload parameter instead of
+    /// a raw string body.
+    json_body: bool,
     follow: bool,
 }
 
@@ -360,12 +364,21 @@ fn parse(input: &str) -> Result<Request, String> {
     if method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
         return Err("Invalid HTTP method".into());
     }
+    // Mirror requests.json()/fetch JSON conventions: a JSON Content-Type with
+    // a body that parses as JSON lets targets emit a native JSON parameter.
+    let json_body = body.is_some()
+        && headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("json"))
+        && serde_json::from_str::<serde_json::Value>(body.as_deref().unwrap_or("")).is_ok()
+        && !body.as_deref().is_some_and(json_has_duplicate_keys);
     url.set_fragment(None);
     Ok(Request {
         url,
         method,
         headers,
         body,
+        json_body,
         follow,
     })
 }
@@ -380,6 +393,120 @@ fn python_string(value: &str) -> String {
 }
 fn php_string(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// serde_json maps silently keep the last of repeated object keys, which would
+/// change request semantics; such bodies fall back to a raw string payload.
+/// A streaming visitor catches duplicates that `Value` parsing would hide.
+fn json_has_duplicate_keys(body: &str) -> bool {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+    #[derive(Clone, Copy)]
+    struct Scan;
+
+    impl<'de> DeserializeSeed<'de> for Scan {
+        type Value = bool;
+        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<bool, D::Error> {
+            de.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Scan {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            let mut duplicates = false;
+            while let Some(key) = map.next_key::<&'de str>()? {
+                if !seen.insert(key) {
+                    duplicates = true;
+                }
+                if map.next_value_seed(Scan)? {
+                    duplicates = true;
+                }
+            }
+            Ok(duplicates)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+            let mut duplicates = false;
+            while let Some(item) = seq.next_element_seed(Scan)? {
+                duplicates |= item;
+            }
+            Ok(duplicates)
+        }
+        fn visit_bool<A>(self, _: bool) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_i64<A>(self, _: i64) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_u64<A>(self, _: u64) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_i128<A>(self, _: i128) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_u128<A>(self, _: u128) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_f64<A>(self, _: f64) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_str<A>(self, _: &str) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_none<A>(self) -> Result<bool, A> {
+            Ok(false)
+        }
+        fn visit_unit<A>(self) -> Result<bool, A> {
+            Ok(false)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(body);
+    Scan.deserialize(&mut de).unwrap_or(false)
+}
+
+/// Render a JSON value as a Python literal. JSON strings/numbers are valid
+/// Python literals; `true`/`false`/`null` map to `True`/`False`/`None`.
+fn python_json_value(value: &serde_json::Value, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let pad_in = " ".repeat(indent + 4);
+    match value {
+        serde_json::Value::Null => "None".into(),
+        serde_json::Value::Bool(true) => "True".into(),
+        serde_json::Value::Bool(false) => "False".into(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => python_string(s),
+        serde_json::Value::Array(items) if items.is_empty() => "[]".into(),
+        serde_json::Value::Array(items) => {
+            let mut out = String::from("[\n");
+            for item in items {
+                out.push_str(&pad_in);
+                out.push_str(&python_json_value(item, indent + 4));
+                out.push_str(",\n");
+            }
+            out.push_str(&pad);
+            out.push(']');
+            out
+        }
+        serde_json::Value::Object(map) if map.is_empty() => "{}".into(),
+        serde_json::Value::Object(map) => {
+            let mut out = String::from("{\n");
+            for (k, v) in map {
+                out.push_str(&pad_in);
+                out.push_str(&python_string(k));
+                out.push_str(": ");
+                out.push_str(&python_json_value(v, indent + 4));
+                out.push_str(",\n");
+            }
+            out.push_str(&pad);
+            out.push('}');
+            out
+        }
+    }
 }
 
 pub(crate) fn convert(input: &str, target: Target) -> Result<String, String> {
@@ -412,7 +539,15 @@ pub(crate) fn convert(input: &str, target: Target) -> Result<String, String> {
             out.push_str("}\n\nresponse = requests.request(\n");
             writeln!(out, "    {m},\n    {u},\n    headers=headers,").unwrap();
             if let Some(body) = &r.body {
-                writeln!(out, "    data={}.encode(\"utf-8\"),", python_string(body)).unwrap();
+                if r.json_body
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+                    && !value.is_null()
+                {
+                    // `json=None` would drop the body entirely, so keep `data=`.
+                    writeln!(out, "    json={},", python_json_value(&value, 4)).unwrap();
+                } else {
+                    writeln!(out, "    data={}.encode(\"utf-8\"),", python_string(body)).unwrap();
+                }
             }
             writeln!(
                 out,
@@ -739,6 +874,55 @@ mod tests {
     }
 
     #[test]
+    fn json_bodies_use_native_payload_parameters() {
+        let hermes = "curl -X POST 'https://api.hermes.ds-int.cn/newbee/api/biz/v1/data/real-time/douyin-live-info' -H 'accept: application/json' -H 'apikey:test-api-key' -H 'Content-Type: application/json' --data-raw '{\"live_id\":\"505233570304\"}'";
+        let python = convert(hermes, Target::Python).unwrap();
+        assert!(
+            python.contains("    json={\n        \"live_id\": \"505233570304\",\n    },"),
+            "{python}"
+        );
+        assert!(!python.contains("data="));
+        let multiline = "curl -X POST 'https://a/' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"keyword\": \"上海\",\n    \"startDate\": \"2026-09-03\",\n    \"GET_BRAND\":\"true\"\n  }'";
+        let python = convert(multiline, Target::Python).unwrap();
+        assert!(
+            python.contains("    json={\n        \"keyword\": \"上海\",\n        \"startDate\": \"2026-09-03\",\n        \"GET_BRAND\": \"true\",\n    },"),
+            "{python}"
+        );
+        // Nested structures, arrays, booleans and nulls map to Python literals.
+        let nested = "curl https://a/ -H 'Content-Type: application/json' -d '{\"flag\":true,\"list\":[1,\"x\"],\"nested\":{\"z\":1,\"a\":2},\"empty\":{},\"none\":null,\"none_str\":\"null\"}'";
+        let python = convert(nested, Target::Python).unwrap();
+        assert!(
+            python.contains("\"flag\": True") && python.contains("\"none\": None"),
+            "{python}"
+        );
+        // Original key order is preserved, not alphabetically sorted.
+        let a = python.find("\"z\": 1").unwrap();
+        let b = python.find("\"a\": 2").unwrap();
+        assert!(a < b, "{python}");
+        // json=None would drop the body; fall back to data=.
+        let null_body = "curl https://a/ -H 'Content-Type: application/json' -d 'null'";
+        assert!(
+            convert(null_body, Target::Python)
+                .unwrap()
+                .contains("data=")
+        );
+        // No JSON Content-Type: keep the raw string payload.
+        let plain = "curl https://a/ -d '{\"a\":1}'";
+        assert!(convert(plain, Target::Python).unwrap().contains("data="));
+        // Not JSON at all: keep the raw string payload.
+        let text = "curl https://a/ -H 'Content-Type: application/json' -d 'hello'";
+        assert!(convert(text, Target::Python).unwrap().contains("data="));
+        // Duplicate JSON keys would silently change semantics; fall back.
+        let dup = "curl https://a/ -H 'Content-Type: application/json' -d '{\"a\":1,\"a\":2}'";
+        assert!(convert(dup, Target::Python).unwrap().contains("data="));
+        // Non-Python targets keep the literal JSON string body.
+        let js = convert(hermes, Target::JavaScript).unwrap();
+        assert!(js.contains("body:"));
+        let http = convert(hermes, Target::Http).unwrap();
+        assert!(http.contains("{\"live_id\":\"505233570304\"}"));
+    }
+
+    #[test]
     fn generated_code_passes_available_offline_syntax_checkers() {
         // Optional developer tools: no code execution or network, and no build
         // dependency on Python/Node/Go. CI may only have some of these installed.
@@ -780,41 +964,99 @@ mod tests {
     fn target_cards_fit_themes_languages_and_small_windows() {
         for pal in [&crate::DARK, &crate::LIGHT] {
             for lang in [Lang::ZhCn, Lang::En] {
-                for size in [egui::vec2(640.0, 420.0), egui::vec2(1080.0, 720.0), egui::vec2(400.0, 500.0)] {
+                for size in [
+                    egui::vec2(640.0, 420.0),
+                    egui::vec2(1080.0, 720.0),
+                    egui::vec2(400.0, 500.0),
+                ] {
                     let ctx = egui::Context::default();
                     crate::setup_fonts(&ctx);
                     crate::apply_style(&ctx, pal);
-                    let mut app = LiteTextApp { lang, show_curl_menu: true, ..Default::default() };
+                    let mut app = LiteTextApp {
+                        lang,
+                        show_curl_menu: true,
+                        ..Default::default()
+                    };
                     app.new_document();
                     app.active_mut().unwrap().draft_text = Some("curl https://example.com/".into());
-                    let raw = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+                    let raw = || egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
                     let mut output = None;
-                    for _ in 0..5 { output = Some(ctx.run(raw(), |ctx| app.curl_target_menu(ctx, pal))); }
-                    let view = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("curl_scroll_rect"))).unwrap();
+                    for _ in 0..5 {
+                        output = Some(ctx.run(raw(), |ctx| app.curl_target_menu(ctx, pal)));
+                    }
+                    let view = ctx
+                        .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("curl_scroll_rect")))
+                        .unwrap();
                     assert!(view.left() >= 0.0 && view.right() <= size.x);
                     assert!(view.top() >= 0.0 && view.bottom() <= size.y);
                     for target in TARGETS {
-                        let card = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("curl_target", target.name())))).unwrap();
-                        assert!(card.left() >= view.left() - 1.0 && card.right() <= view.right() + 1.0);
-                        let label = format!("{} {}", if lang == Lang::ZhCn { "转成" } else { "Convert to" }, target.name());
+                        let card = ctx
+                            .data(|d| {
+                                d.get_temp::<egui::Rect>(egui::Id::new((
+                                    "curl_target",
+                                    target.name(),
+                                )))
+                            })
+                            .unwrap();
+                        assert!(
+                            card.left() >= view.left() - 1.0 && card.right() <= view.right() + 1.0
+                        );
+                        let label = format!(
+                            "{} {}",
+                            if lang == Lang::ZhCn {
+                                "转成"
+                            } else {
+                                "Convert to"
+                            },
+                            target.name()
+                        );
                         // Fully visible labels must fit their own cards.
                         if view.contains_rect(card) {
-                            let text = output.as_ref().unwrap().shapes.iter().find_map(|s| match &s.shape {
-                                egui::Shape::Text(t) if t.galley.text() == label => Some(egui::Rect::from_min_size(t.pos, t.galley.size())),
-                                _ => None,
-                            }).unwrap();
-                            assert!(card.contains_rect(text), "{label}: {text:?} outside {card:?}");
+                            let text = output
+                                .as_ref()
+                                .unwrap()
+                                .shapes
+                                .iter()
+                                .find_map(|s| match &s.shape {
+                                    egui::Shape::Text(t) if t.galley.text() == label => {
+                                        Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap();
+                            assert!(
+                                card.contains_rect(text),
+                                "{label}: {text:?} outside {card:?}"
+                            );
                         }
                     }
                     for _ in 0..12 {
                         let mut input = raw();
-                        input.events = vec![egui::Event::PointerMoved(view.center()), egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -1000.0), modifiers: Default::default(),
-                        }];
+                        input.events = vec![
+                            egui::Event::PointerMoved(view.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -1000.0),
+                                modifiers: Default::default(),
+                            },
+                        ];
                         let _ = ctx.run(input, |ctx| app.curl_target_menu(ctx, pal));
                     }
-                    let http = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("curl_target", Target::Http.name())))).unwrap();
-                    assert!(view.contains_rect(http), "last target must be reachable: {http:?}, {view:?}");
+                    let http = ctx
+                        .data(|d| {
+                            d.get_temp::<egui::Rect>(egui::Id::new((
+                                "curl_target",
+                                Target::Http.name(),
+                            )))
+                        })
+                        .unwrap();
+                    assert!(
+                        view.contains_rect(http),
+                        "last target must be reachable: {http:?}, {view:?}"
+                    );
                 }
             }
         }

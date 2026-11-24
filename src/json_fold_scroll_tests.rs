@@ -366,7 +366,7 @@ fn massive_depth_fold_keeps_compact_gutter_real_scroll_range_and_line_one_at_top
                     probe.rows[0].glyphs[1].pos.x - probe.rows[0].glyphs[0].pos.x
                 });
                 assert!(
-                    (gutter.width() - (8.0 + digits as f32 * digit_w + FOLD_WIDTH)).abs() < 1.0
+                    (gutter.width() - (6.0 + digits as f32 * digit_w + FOLD_WIDTH)).abs() < 1.0
                 );
                 assert!(
                     size.y <= (24.0 + (siblings + 4) as f32 * 26.0).max(viewport.height() + 4.0),

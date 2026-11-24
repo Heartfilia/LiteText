@@ -186,6 +186,20 @@ fn mirror_file_name(name: &str, markdown: bool) -> String {
     }
 }
 
+/// Recognize both locales and legacy collision suffixes such as `1 (2)`.
+/// Such suffixes still reserve the original untitled number.
+pub(crate) fn untitled_number(name: &str) -> Option<u64> {
+    let stem = draft_stem(name);
+    [crate::tr(crate::Lang::ZhCn).untitled, crate::tr(crate::Lang::En).untitled]
+        .into_iter().find_map(|prefix| {
+            let rest = stem.strip_prefix(&format!("{prefix} "))?;
+            let number = rest.split_once(" (").map_or(rest, |(number, suffix)| {
+                if suffix.strip_suffix(')').is_some_and(|n| n.parse::<u64>().is_ok()) { number } else { rest }
+            });
+            number.parse::<u64>().ok().filter(|number| *number > 0)
+        })
+}
+
 /// Pick a path that does not overwrite another window's draft.
 fn allocate(root: &Path, name: &str, markdown: bool) -> PathBuf {
     let file_name = mirror_file_name(name, markdown);
@@ -361,6 +375,24 @@ fn wants_markdown(file: &LoadedFile) -> bool {
 }
 
 impl LiteTextApp {
+    pub(crate) fn next_untitled_number(&self) -> u64 {
+        let mut used: std::collections::HashSet<u64> = self.files.iter()
+            .filter(|file| file.is_untitled())
+            .filter_map(|file| untitled_number(&file.name)).collect();
+        // A cached draft may belong to another window or still be restoring in
+        // the background. Its name must be reserved even if not in this window.
+        if let Some(root) = self.scratch_root()
+            && let Ok(entries) = std::fs::read_dir(root)
+        {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && let Some(number) = entry.file_name().to_str().and_then(untitled_number)
+                { used.insert(number); }
+            }
+        }
+        (1..).find(|number| !used.contains(number)).unwrap()
+    }
+
     pub(crate) fn scratch_root(&self) -> Option<PathBuf> {
         self.scratch_dir
             .clone()
@@ -524,7 +556,20 @@ impl LiteTextApp {
                     {
                         path
                     }
-                    _ => allocate(&root, &name, markdown),
+                    _ => {
+                        // A different window may have written this number
+                        // since this tab was created. Renumber before mirroring
+                        // instead of quietly creating `未命名 1 (2).txt`.
+                        let target = root.join(mirror_file_name(&name, markdown));
+                        if untitled_number(&name).is_some() && target.exists() {
+                            let number = self.next_untitled_number();
+                            let prefix = if name.starts_with(crate::tr(crate::Lang::En).untitled) {
+                                crate::tr(crate::Lang::En).untitled
+                            } else { crate::tr(crate::Lang::ZhCn).untitled };
+                            let renamed = format!("{prefix} {number}");
+                            allocate(&root, &renamed, markdown)
+                        } else { allocate(&root, &name, markdown) }
+                    },
                 };
                 (path, text.into_bytes())
             } else {
@@ -557,6 +602,13 @@ impl LiteTextApp {
             let previous = self.files[index].scratch_path.clone();
             match recovery::atomic_write(&path, &bytes) {
                 Ok(()) => {
+                    if untitled && untitled_number(&name).is_some()
+                        && let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+                        && draft_stem(file_name) != draft_stem(&name)
+                    {
+                        // Publish a changed title only after its mirror exists.
+                        self.files[index].name = draft_stem(file_name).to_owned();
+                    }
                     self.files[index].scratch_path = Some(path.clone());
                     self.scratch.written.insert(id, revision);
                     // Moving a mirror to a new configured directory.
@@ -835,6 +887,35 @@ mod tests {
             .flatten()
             .map(|entry| entry.path())
             .find(|path| path.file_name().is_some_and(|name| name != "session.json" && name != DRAFT_META_FILE))
+    }
+
+    #[test]
+    fn new_numbers_reserve_cached_and_legacy_collision_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["未命名 1.txt", "未命名 1 (2).txt", "Untitled 2.md", "未命名 3.txt"] {
+            std::fs::write(dir.path().join(name), "preserve").unwrap();
+        }
+        let mut app = test_app(dir.path());
+        app.new_document();
+        assert_eq!(app.active().unwrap().name, "未命名 4");
+        assert_eq!(untitled_number("未命名 1 (2).txt"), Some(1));
+        assert_eq!(untitled_number("Untitled 5.md"), Some(5));
+        assert_eq!(untitled_number("notes 1.txt"), None);
+    }
+
+    #[test]
+    fn late_cache_collision_renumbers_tab_without_overwriting_either_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.new_document();
+        std::fs::write(dir.path().join("未命名 1.txt"), "another window").unwrap();
+        app.active_mut().unwrap().draft_text = Some("new draft".into());
+        app.active_mut().unwrap().sync_draft();
+        app.scratch_flush(None, true);
+        assert_eq!(app.active().unwrap().name, "未命名 2");
+        assert_eq!(std::fs::read_to_string(dir.path().join("未命名 1.txt")).unwrap(), "another window");
+        assert_eq!(std::fs::read_to_string(dir.path().join("未命名 2.txt")).unwrap(), "new draft");
+        assert!(!dir.path().join("未命名 1 (2).txt").exists());
     }
 
     #[test]

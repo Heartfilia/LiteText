@@ -18,6 +18,7 @@ struct Preferences {
     scratch_dir: Option<PathBuf>,
     tab_mode: crate::whitespace::TabMode,
     tab_close_mode: crate::TabCloseMode,
+    vertical_tabs: bool,
     workspace_font: Option<crate::fonts::Choice>,
     terminal: crate::terminal::Settings,
     updates: crate::updater::Settings,
@@ -42,6 +43,7 @@ impl Preferences {
             scratch_dir: app.scratch_dir.clone(),
             tab_mode: app.tab_mode,
             tab_close_mode: app.tab_close_mode,
+            vertical_tabs: app.vertical_tabs,
             workspace_font: app.workspace_font.clone(),
             terminal: app.terminal.clone(), updates: app.updates.clone(),
             shortcut_keys: app.shortcut_keys.clone(), hex_case_upper: app.hex_upper,
@@ -60,6 +62,7 @@ impl Preferences {
         app.scratch_dir = self.scratch_dir;
         app.tab_mode = self.tab_mode;
         app.tab_close_mode = self.tab_close_mode;
+        app.vertical_tabs = self.vertical_tabs;
         app.workspace_font = self.workspace_font;
         app.terminal = self.terminal;
         app.updates = self.updates;
@@ -224,6 +227,43 @@ mod tests {
         assert!(!reinstalled.diagnostics_settings.unlocked && !reinstalled.diagnostics_settings.enabled);
         assert_eq!(serde_json::to_value(Preferences::capture(&reinstalled)).unwrap(), serde_json::to_value(Preferences::capture(&first)).unwrap());
         assert!(reinstalled.files.is_empty());
+    }
+
+    #[test]
+    fn vertical_tabs_round_trip_through_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        let mut app = LiteTextApp::default();
+        app.preferences.path_override = Some(path.clone());
+        assert!(!app.vertical_tabs);
+
+        for enabled in [true, false] {
+            app.vertical_tabs = enabled;
+            app.save_preferences(true).unwrap();
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["vertical_tabs"], enabled);
+
+            let mut restored = LiteTextApp::default();
+            restored.preferences.path_override = Some(path.clone());
+            restored.vertical_tabs = !enabled;
+            restored.load_preferences().unwrap();
+            assert_eq!(restored.vertical_tabs, enabled);
+        }
+    }
+
+    #[test]
+    fn legacy_preferences_default_vertical_tabs_to_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        std::fs::write(&path, br#"{"lang":"en"}"#).unwrap();
+        let mut app = LiteTextApp::default();
+        app.preferences.path_override = Some(path);
+        app.vertical_tabs = true;
+        app.load_preferences().unwrap();
+        assert!(!app.vertical_tabs);
+
+        let legacy_app: LiteTextApp = serde_json::from_str("{}").unwrap();
+        assert!(!legacy_app.vertical_tabs);
     }
 
     #[test]

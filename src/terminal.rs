@@ -372,7 +372,7 @@ impl LiteTextApp {
                     egui::Id::new("settings_terminal"),
                     label,
                     options,
-                    190.0,
+                    crate::SETTINGS_SELECT_WIDTH,
                 ) {
                     self.terminal.custom = custom;
                     self.terminal.program = program;

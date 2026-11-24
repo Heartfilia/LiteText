@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) const VERSION: &str = env!("LITETEXT_VERSION");
@@ -21,6 +21,8 @@ const REPOSITORY: &str = "https://github.com/Heartfilia/LiteText";
 /// it is not subject to the per-IP API quota, so no authentication token is
 /// ever embedded in the distributed binary.
 const FEED: &str = "https://github.com/Heartfilia/LiteText/releases.atom";
+const STARTUP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -47,6 +49,7 @@ struct Release {
 
 enum Event {
     Checked(Option<Release>),
+    CheckSkipped(Duration),
     Progress(String),
     Ready(Box<Prepared>),
     Failed(String),
@@ -63,6 +66,7 @@ pub(crate) struct State {
     exit_lock: Option<File>,
     status_loaded: bool,
     last_status_check: Option<Instant>,
+    next_auto_check: Option<Instant>,
 }
 
 impl State {
@@ -606,6 +610,42 @@ fn update_work_root() -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Record attempts (including failed network requests), not just successes.
+/// A short-lived cross-process lock prevents simultaneous windows from checking
+/// on startup. No disk access happens on the GUI thread or on every frame.
+#[derive(Default, Serialize, Deserialize)]
+struct CheckHistory {
+    last_attempt_unix: u64,
+}
+
+fn claim_update_check(root: &Path, now: u64, cooldown: Option<Duration>) -> Result<bool> {
+    fs::create_dir_all(root)?;
+    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(root.join("update-check.lock"))?;
+    if let Err(error) = lock.try_lock_exclusive() {
+        if cooldown.is_some() && error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        FileExt::lock_exclusive(&lock)?;
+    }
+    let path = root.join("update-check.json");
+    let history = fs::read(&path).ok()
+        .and_then(|bytes| serde_json::from_slice::<CheckHistory>(&bytes).ok());
+    if let (Some(cooldown), Some(history)) = (cooldown, history) {
+        // Treat a future timestamp as clock rollback; don't suppress forever.
+        if now >= history.last_attempt_unix
+            && now - history.last_attempt_unix < cooldown.as_secs()
+        {
+            return Ok(false);
+        }
+    }
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
+    serde_json::to_writer(file.as_file_mut(), &CheckHistory { last_attempt_unix: now })?;
+    file.as_file_mut().sync_all()?;
+    file.persist(path)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 fn work_root_override() -> &'static std::sync::Mutex<Option<PathBuf>> {
     static OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -942,9 +982,39 @@ pub(crate) fn acknowledge_startup() {
 }
 
 impl LiteTextApp {
+    /// Only an Instant comparison per frame. Request one delayed repaint so an
+    /// idle, continuously open app still performs its daily check.
+    pub(crate) fn schedule_update_check(&mut self, ctx: &egui::Context) {
+        // Workers repaint on completion and cancelling a prepared update is a
+        // UI action. Don't wake an otherwise idle window while either is busy.
+        if self.updater.receiver.is_some() || self.updater.prepared.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let startup = self.updater.next_auto_check.is_none();
+        let deadline = *self.updater.next_auto_check.get_or_insert(now);
+        if now >= deadline && self.updater.receiver.is_none() && self.updater.prepared.is_none() {
+            self.start_update_job_with_cooldown(false, ctx, Some(if startup {
+                STARTUP_CHECK_INTERVAL
+            } else {
+                RUNNING_CHECK_INTERVAL
+            }));
+        }
+        if let Some(deadline) = self.updater.next_auto_check {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now).max(Duration::from_secs(1)));
+        }
+    }
+
     fn start_update_job(&mut self, install: bool, ctx: &egui::Context) {
+        self.start_update_job_with_cooldown(install, ctx, None);
+    }
+
+    fn start_update_job_with_cooldown(&mut self, install: bool, ctx: &egui::Context, cooldown: Option<Duration>) {
         if self.updater.receiver.is_some() {
             return;
+        }
+        if !install {
+            self.updater.next_auto_check = Some(Instant::now() + RUNNING_CHECK_INTERVAL);
         }
         let settings = self.updates.clone();
         let release = self.updater.release.clone();
@@ -964,7 +1034,28 @@ impl LiteTextApp {
                         .map(|prepared| Event::Ready(Box::new(prepared)))
                     })
             } else {
-                check(&settings).map(Event::Checked)
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                    .unwrap_or_default().as_secs();
+                let claimed = update_work_root()
+                    .and_then(|root| claim_update_check(&root, now, cooldown));
+                // Persistence failure must not disable manual or automatic checks;
+                // the in-memory deadline still prevents a retry loop.
+                if matches!(claimed, Ok(false)) {
+                    // A different window may have checked more recently. Wake
+                    // when that shared record reaches one day, not a day after
+                    // this skipped attempt. Disk access stays on this worker.
+                    let remaining = update_work_root().ok()
+                        .and_then(|root| fs::read(root.join("update-check.json")).ok())
+                        .and_then(|bytes| serde_json::from_slice::<CheckHistory>(&bytes).ok())
+                        .map(|history| Duration::from_secs(
+                            history.last_attempt_unix.saturating_add(RUNNING_CHECK_INTERVAL.as_secs())
+                                .saturating_sub(now).clamp(60, RUNNING_CHECK_INTERVAL.as_secs())
+                        ))
+                        .unwrap_or(RUNNING_CHECK_INTERVAL);
+                    Ok(Event::CheckSkipped(remaining))
+                } else {
+                    check(&settings).map(Event::Checked)
+                }
             };
             let _ = tx.send(result.unwrap_or_else(|error| Event::Failed(error.to_string())));
             ctx.request_repaint();
@@ -983,6 +1074,11 @@ impl LiteTextApp {
         loop {
             let event = self.updater.receiver.as_ref().map(|rx| rx.try_recv());
             match event {
+                Some(Ok(Event::CheckSkipped(remaining))) => {
+                    self.updater.next_auto_check = Some(Instant::now() + remaining);
+                    self.updater.receiver = None;
+                    self.updater.message.clear();
+                }
                 Some(Ok(Event::Progress(message))) => self.updater.message = message,
                 Some(Ok(Event::Checked(release))) => {
                     self.updater.message = match &release {
@@ -1262,6 +1358,72 @@ fn github_icon(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn skipped_check_reschedules_shared_deadline_without_an_extra_day() {
+        let mut app = LiteTextApp::default();
+        let (tx, rx) = mpsc::channel();
+        app.updater.receiver = Some(rx);
+        app.updater.status_loaded = true;
+        let remaining = Duration::from_secs(2 * 60 * 60);
+        tx.send(Event::CheckSkipped(remaining)).unwrap();
+        let before = Instant::now();
+        app.poll_updates();
+        let next = app.updater.next_auto_check.unwrap();
+        assert!(next >= before + remaining);
+        assert!(next <= Instant::now() + remaining);
+        assert!(app.updater.receiver.is_none());
+    }
+
+    #[test]
+    fn scheduler_is_idle_until_deadline_and_does_not_duplicate_busy_work() {
+        let ctx = egui::Context::default();
+        let mut app = LiteTextApp::default();
+        let deadline = Instant::now() + RUNNING_CHECK_INTERVAL;
+        app.updater.next_auto_check = Some(deadline);
+        app.schedule_update_check(&ctx);
+        assert!(app.updater.receiver.is_none());
+        assert_eq!(app.updater.next_auto_check, Some(deadline));
+        let (_tx, rx) = mpsc::channel();
+        app.updater.receiver = Some(rx);
+        app.updater.next_auto_check = None;
+        app.schedule_update_check(&ctx);
+        assert!(app.updater.next_auto_check.is_none());
+        assert!(app.updater.receiver.is_some());
+    }
+
+    #[test]
+    fn update_history_obeys_startup_daily_and_manual_cooldowns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let now = 1_000_000;
+        assert!(claim_update_check(root, now, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        assert!(!claim_update_check(root, now + 3599, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        assert!(claim_update_check(root, now + 3600, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        assert!(!claim_update_check(root, now + 3600 + 86399, Some(RUNNING_CHECK_INTERVAL)).unwrap());
+        assert!(claim_update_check(root, now + 3600 + 86400, Some(RUNNING_CHECK_INTERVAL)).unwrap());
+        // A manual request bypasses cooldown and resets the persisted timestamp.
+        let manual = now + 3600 + 86401;
+        assert!(claim_update_check(root, manual, None).unwrap());
+        assert!(!claim_update_check(root, manual + 1, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        let history: CheckHistory = serde_json::from_slice(&fs::read(root.join("update-check.json")).unwrap()).unwrap();
+        assert_eq!(history.last_attempt_unix, manual);
+    }
+
+    #[test]
+    fn update_history_recovers_from_corruption_clock_rollback_and_other_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("update-check.json"), b"incomplete").unwrap();
+        assert!(claim_update_check(root, 10000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        assert!(claim_update_check(root, 5000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        // Another window holding the reservation must suppress an automatic check.
+        let lock = OpenOptions::new().read(true).write(true).open(root.join("update-check.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(!claim_update_check(root, 20000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+        FileExt::unlock(&lock).unwrap();
+        assert!(claim_update_check(root, 20000, Some(STARTUP_CHECK_INTERVAL)).unwrap());
+    }
 
     #[test]
     fn release_feed_tags_are_extracted_newest_first_and_decoded() {

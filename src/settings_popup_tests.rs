@@ -2,6 +2,31 @@
 use crate::{DARK, LIGHT, Lang, LiteTextApp, Palette};
 use eframe::egui;
 
+#[test]
+fn general_and_terminal_selectors_share_width_and_centered_values() {
+    for pal in [&DARK, &LIGHT] {
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        let mut app = LiteTextApp { show_settings: true, ..Default::default() };
+        for _ in 0..3 { draw(&ctx, &mut app, pal, vec![]); }
+        let output = draw(&ctx, &mut app, pal, vec![]);
+        for (id, label) in [
+            ("settings_lang", app.lang.native_name()),
+            ("settings_tab_layout", "水平"),
+            ("settings_terminal", "系统默认"),
+        ] {
+            let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id).with("button_rect"))).unwrap();
+            assert_eq!(rect.width(), crate::SETTINGS_SELECT_WIDTH);
+            let text_center = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label =>
+                    Some(text.pos.x + text.galley.size().x * 0.5),
+                _ => None,
+            }).unwrap();
+            assert!((text_center - rect.center().x).abs() < 0.1, "{id}: {text_center} / {rect:?}");
+        }
+    }
+}
+
 fn draw(
     ctx: &egui::Context,
     app: &mut LiteTextApp,
@@ -47,14 +72,14 @@ fn click(
     last
 }
 
-/// The custom language chip always fills 160x26; find its painted background.
+/// Find the language selector's shared-width, 26-point painted background.
 fn chip_rect(output: &egui::FullOutput) -> egui::Rect {
     output
         .shapes
         .iter()
         .find_map(|shape| match &shape.shape {
             egui::Shape::Rect(rect)
-                if (rect.rect.width() - 160.0).abs() < 1.0
+                if (rect.rect.width() - crate::SETTINGS_SELECT_WIDTH).abs() < 1.0
                     && (rect.rect.height() - 26.0).abs() < 1.0 =>
             {
                 Some(rect.rect)

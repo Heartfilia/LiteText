@@ -3,7 +3,7 @@ use eframe::egui;
 use egui::{FontId, Stroke};
 use std::ops::Range;
 
-const GUTTER_NUMBER_GAP: f32 = 2.0;
+pub(crate) const GUTTER_NUMBER_GAP: f32 = 3.0;
 const EDITOR_LEFT_PADDING: f32 = 4.0;
 
 /// Keep the number/fold lane distinct without changing the workspace hue.
@@ -285,7 +285,7 @@ pub(crate) fn gutter_columns(line_count: usize) -> usize {
 /// Reserve digits for original logical line numbers, not the visible row count.
 /// The fold lane is allocated separately and must not also become left padding.
 pub(crate) fn gutter_number_width(line_count: usize, digit_width: f32) -> f32 {
-    let left_padding = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING;
+    let left_padding = GUTTER_NUMBER_GAP;
     left_padding + gutter_columns(line_count) as f32 * digit_width + GUTTER_NUMBER_GAP
 }
 
@@ -481,7 +481,7 @@ fn show_impl(
     let mut depth_offset = None;
     let mut scroll_area = egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .scroll_bar_rect(egui::Rect::from_min_max(
             egui::pos2(gutter.right() + 1.0, bounds.top()),
             bounds.max,
@@ -498,8 +498,8 @@ fn show_impl(
             let editor_rect = egui::Rect::from_min_size(
                 origin + egui::vec2(gutter_w + EDITOR_LEFT_PADDING, 12.0),
                 egui::vec2(
-                    (bounds.width() - gutter_w - EDITOR_LEFT_PADDING - 12.0).max(24.0),
-                    (bounds.height() - 24.0).max(24.0),
+                    (viewport.width() - gutter_w - EDITOR_LEFT_PADDING - 12.0).max(24.0),
+                    (viewport.height() - 24.0).max(24.0),
                 ),
             );
             let editor_id = egui::Id::new("draft_editor").with(file_id);
@@ -1187,6 +1187,28 @@ mod tests {
     }
 
     #[test]
+    fn scrollbars_only_take_space_in_directions_with_overflow() {
+        let viewport = |text: &str| {
+            let mut h = Harness::new(text);
+            h.ctx.style_mut(|s| s.animation_time = 0.0);
+            for _ in 0..5 { h.run(vec![]); }
+            h.ctx.data(|d| d.get_temp::<(egui::Id, egui::Vec2, egui::Rect)>(
+                egui::Id::new(("editor_scroll_geometry", 1u64)))).unwrap().2
+        };
+        let fitting = viewport("hello");
+        let vertical = viewport(&"short\n".repeat(100));
+        let horizontal = viewport(&"long ".repeat(500));
+        let both = viewport(&format!("{}\n", "long ".repeat(500)).repeat(100));
+        assert!((fitting.bottom() - 600.0).abs() < 1.0, "{fitting:?}");
+        assert!((fitting.right() - 800.0).abs() < 1.0, "{fitting:?}");
+        assert!(vertical.right() < fitting.right());
+        assert!((vertical.bottom() - fitting.bottom()).abs() < 1.0);
+        assert!(horizontal.bottom() < fitting.bottom());
+        assert!((horizontal.right() - fitting.right()).abs() < 1.0);
+        assert!(both.right() < fitting.right() && both.bottom() < fitting.bottom());
+    }
+
+    #[test]
     fn scrollbars_stay_muted_and_neutral_in_both_themes() {
         for pal in [&crate::DARK, &crate::LIGHT] {
             let ctx = egui::Context::default();
@@ -1565,14 +1587,16 @@ mod tests {
                 let width = gutter_number_width(count, digit_width);
                 let reserved_digits = gutter_columns(count) as f32 * digit_width;
                 let left = width - GUTTER_NUMBER_GAP - reserved_digits;
-                let right = GUTTER_NUMBER_GAP + EDITOR_LEFT_PADDING;
+                let right = GUTTER_NUMBER_GAP;
+                assert_eq!(left, 3.0);
+                assert_eq!(width, 3.0 + reserved_digits + 3.0);
                 assert!((left - right).abs() < 0.01);
             }
         }
     }
 
     #[test]
-    fn gutter_border_has_two_point_number_gap_and_compact_text_padding() {
+    fn gutter_border_has_three_point_number_gap_and_compact_text_padding() {
         let mut harness = Harness::new("hello");
         let output = harness.run(vec![]);
         let mut number_right = None;
@@ -1595,7 +1619,7 @@ mod tests {
             }
         }
         let border = border_x.expect("行号分隔线应渲染");
-        assert!((border - number_right.unwrap() - 2.0).abs() < 0.01);
+        assert!((border - number_right.unwrap() - 3.0).abs() < 0.01);
         assert!((text_left.unwrap() - border - 4.0).abs() < 0.01);
     }
 

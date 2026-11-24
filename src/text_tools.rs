@@ -18,13 +18,18 @@ pub(crate) fn toolbar(
     if rendered {
         file.editor_state.tools.pen_menu = false;
     }
-    // Parent layout runs right-to-left; these are inserted next to the view toggle.
-    for (hint, active, action) in [
+    // Keep the text-tool group in the same visual order in both layouts:
+    // wrap, whitespace, pen, find. Only the surrounding toolbar is mirrored.
+    let mut tools = [
         (t.find_replace, file.editor_state.tools.find_open, 0),
         (t.mark, file.editor_state.tools.pen.is_some(), 1),
         (t.whitespace, file.editor_state.tools.whitespace, 2),
         (t.word_wrap, file.editor_state.tools.wrap, 3),
-    ] {
+    ];
+    if ui.layout().main_dir() == egui::Direction::LeftToRight {
+        tools.reverse();
+    }
+    for (hint, active, action) in tools {
         let disabled = rendered && action != 0;
         let response = if disabled {
             let (rect, response) =

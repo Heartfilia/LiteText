@@ -41,6 +41,7 @@ mod timing;
 mod encoding_ui;
 mod reload;
 mod pinned_tabs;
+mod vertical_tabs;
 mod diagnostics;
 mod markdown;
 mod scratch;
@@ -472,6 +473,8 @@ struct LiteTextApp {
     tab_mode: whitespace::TabMode,
     /// Pointer gesture that closes a normal tab; pinned tabs stay protected.
     tab_close_mode: TabCloseMode,
+    /// Show document tabs in a vertical sidebar instead of the top bar.
+    vertical_tabs: bool,
     terminal: terminal::Settings,
     updates: updater::Settings,
     #[serde(skip)]
@@ -636,6 +639,7 @@ impl Default for LiteTextApp {
             scratch: scratch::State::default(),
             tab_mode: Default::default(),
             tab_close_mode: Default::default(),
+            vertical_tabs: false,
             terminal: Default::default(),
             updates: Default::default(),
             diagnostics_settings: Default::default(),
@@ -1205,21 +1209,9 @@ impl LiteTextApp {
     fn new_document(&mut self) {
         let id = self.next_file_id;
         self.next_file_id += 1;
-        // Display numbers describe only currently open scratch tabs, not the
-        // monotonic widget identity (which must not be reused after closing).
-        let used: std::collections::HashSet<u64> = self.files.iter()
-            .filter(|f| f.is_untitled())
-            .filter_map(|f| [tr(Lang::ZhCn).untitled, tr(Lang::En).untitled].into_iter()
-                .find_map(|prefix| {
-                    let rest = f.name.strip_prefix(&format!("{prefix} "))?;
-                    let rest = rest
-                        .strip_suffix(".md")
-                        .or_else(|| rest.strip_suffix(".txt"))
-                        .unwrap_or(rest);
-                    rest.parse().ok()
-                }))
-            .collect();
-        let number = (1..).find(|n| !used.contains(n)).unwrap();
+        // Widget identity remains monotonic; display numbers also reserve
+        // cached drafts belonging to restoring or other windows.
+        let number = self.next_untitled_number();
         let mut file = LoadedFile {
             pinned: false,
             id,
@@ -1801,6 +1793,8 @@ impl eframe::App for LiteTextApp {
         } else { 14.0 };
         self.poll_terminal();
         self.poll_updates();
+        #[cfg(not(test))]
+        self.schedule_update_check(ctx);
         self.poll_background_io(ctx);
         self.poll_search(ctx);
         // 跟踪窗口几何（外框），供退出时持久化
@@ -1852,8 +1846,10 @@ impl eframe::App for LiteTextApp {
         self.had_focus = focused;
         self.observe_diagnostics();
 
+        // Reserve the left tab list before capturing the active document so a
+        // sidebar click switches the editor and its tools in this same frame.
+        self.vertical_tab_panel(ctx, pal);
         if let Some(file) = self.active_mut() && file.view == ViewMode::Hex { file.ensure_bytes(); }
-
         let in_hex = self
             .active()
             .is_some_and(|f| f.view == ViewMode::Hex && !f.bytes.is_empty());
@@ -1944,6 +1940,14 @@ impl eframe::App for LiteTextApp {
 
 impl LiteTextApp {
     fn app_menu(&mut self, ctx: &egui::Context, anchor: egui::Rect, pal: &Palette) {
+        ctx.data_mut(|d| {
+            d.remove::<egui::Rect>(egui::Id::new("app_menu_rect"));
+            for name in ["conversion", "whitespace", "plugins", "recent"] {
+                for part in ["row", "submenu", "bridge"] {
+                    d.remove::<egui::Rect>(egui::Id::new(format!("app_{name}_{part}_rect")));
+                }
+            }
+        });
         if !self.show_menu {
             self.menu_recent_open = false;
             self.menu_plugins_open = false;
@@ -1952,20 +1956,39 @@ impl LiteTextApp {
             return;
         }
         let t = tr(self.lang);
+        let opens_right = self.vertical_tabs;
+        let menu_pivot = if opens_right { egui::Align2::LEFT_TOP } else { egui::Align2::RIGHT_TOP };
+        let submenu_label = |label: &str| {
+            if opens_right { format!("{}  ›", label) } else { format!("‹  {}", label) }
+        };
+        let submenu_bridge = |row: egui::Rect, submenu: egui::Rect| {
+            // Include the row, frame padding and gap on the submenu's opening side.
+            if opens_right {
+                egui::Rect::from_min_max(
+                    row.left_top(),
+                    egui::pos2(submenu.left().max(row.right()), row.bottom()),
+                )
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(submenu.right().min(row.left()), row.top()),
+                    row.right_bottom(),
+                )
+            }
+        };
         let mut action = None;
         let mut recent_row = egui::Rect::NOTHING;
         let mut plugins_row = egui::Rect::NOTHING;
         let mut whitespace_row = egui::Rect::NOTHING;
         let mut conversion_row = egui::Rect::NOTHING;
         let new_window_label = if self.lang == Lang::ZhCn { "新窗口" } else { "New window" };
-        let conversion_label = if self.lang == Lang::ZhCn { "‹  文本转换" } else { "‹  Text conversion" };
-        let plugins_label = format!("‹  {}", t.plugins);
-        let whitespace_label = if self.lang == Lang::ZhCn { "‹  空白符处理" } else { "‹  Whitespace" };
-        let recent_label = format!("‹  {}", t.open_recent);
+        let conversion_label = submenu_label(if self.lang == Lang::ZhCn { "文本转换" } else { "Text conversion" });
+        let plugins_label = submenu_label(t.plugins);
+        let whitespace_label = submenu_label(if self.lang == Lang::ZhCn { "空白符处理" } else { "Whitespace" });
+        let recent_label = submenu_label(t.open_recent);
         let menu = egui::Area::new(egui::Id::new("app_menu"))
             .order(egui::Order::Foreground)
-            .pivot(egui::Align2::RIGHT_TOP)
-            .fixed_pos(egui::pos2(anchor.right(), anchor.bottom() + 6.0))
+            .pivot(menu_pivot)
+            .fixed_pos(egui::pos2(if opens_right { anchor.left() } else { anchor.right() }, anchor.bottom() + 6.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(pal.bg_panel)
@@ -1974,7 +1997,7 @@ impl LiteTextApp {
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         // Including the frame, longest label + one character on each side.
-                        let labels = [t.menu_open, t.save_as, new_window_label, &recent_label, &plugins_label, whitespace_label, conversion_label, t.settings];
+                        let labels = [t.menu_open, t.save_as, new_window_label, &recent_label, &plugins_label, &whitespace_label, &conversion_label, t.settings];
                         let width = app_menu_width(ui, &labels, pal);
                         ui.set_width(width);
                         if app_menu_row(ui, t.menu_open, false, pal).on_hover_text(t.open_file).clicked() {
@@ -2008,7 +2031,7 @@ impl LiteTextApp {
                             self.menu_conversion_open = false;
                         }
                         app_menu_separator(ui, pal);
-                        let whitespace = app_menu_row(ui, whitespace_label, self.menu_whitespace_open, pal);
+                        let whitespace = app_menu_row(ui, &whitespace_label, self.menu_whitespace_open, pal);
                         whitespace_row = whitespace.rect;
                         if whitespace.hovered() || whitespace.clicked() {
                             self.menu_whitespace_open = true;
@@ -2017,7 +2040,7 @@ impl LiteTextApp {
                             self.menu_plugins_open = false;
                         }
                         app_menu_separator(ui, pal);
-                        let conversion = app_menu_row(ui, conversion_label, self.menu_conversion_open, pal);
+                        let conversion = app_menu_row(ui, &conversion_label, self.menu_conversion_open, pal);
                         conversion_row = conversion.rect;
                         if conversion.hovered() || conversion.clicked() {
                             self.menu_conversion_open = true;
@@ -2031,11 +2054,18 @@ impl LiteTextApp {
                         }
                     });
             });
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("app_menu_rect"), menu.response.rect);
+            for (name, rect) in [("conversion", conversion_row), ("whitespace", whitespace_row), ("plugins", plugins_row), ("recent", recent_row)] {
+                d.insert_temp(egui::Id::new(format!("app_{name}_row_rect")), rect);
+            }
+        });
+        let submenu_x = if opens_right { menu.response.rect.right() + 4.0 } else { menu.response.rect.left() - 4.0 };
         let mut submenu_rect = None;
         if self.menu_conversion_open {
             let submenu = egui::Area::new(egui::Id::new("app_conversion_submenu"))
-                .order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP)
-                .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, conversion_row.top() - 6.0))
+                .order(egui::Order::Foreground).pivot(menu_pivot)
+                .fixed_pos(egui::pos2(submenu_x, conversion_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
@@ -2054,18 +2084,19 @@ impl LiteTextApp {
                         });
                 });
             submenu_rect = Some(submenu.response.rect);
-            let bridge = egui::Rect::from_min_max(
-                egui::pos2(submenu.response.rect.right().min(conversion_row.left()), conversion_row.top()),
-                conversion_row.right_bottom(),
-            );
+            let bridge = submenu_bridge(conversion_row, submenu.response.rect);
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("app_conversion_submenu_rect"), submenu.response.rect);
+                d.insert_temp(egui::Id::new("app_conversion_bridge_rect"), bridge);
+            });
             if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
                 !conversion_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) { self.menu_conversion_open = false; }
         }
         if self.menu_whitespace_open {
             let submenu = egui::Area::new(egui::Id::new("app_whitespace_submenu"))
-                .order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP)
-                .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, whitespace_row.top() - 6.0))
+                .order(egui::Order::Foreground).pivot(menu_pivot)
+                .fixed_pos(egui::pos2(submenu_x, whitespace_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
@@ -2084,10 +2115,11 @@ impl LiteTextApp {
                         });
                 });
             submenu_rect = Some(submenu.response.rect);
-            let bridge = egui::Rect::from_min_max(
-                egui::pos2(submenu.response.rect.right().min(whitespace_row.left()), whitespace_row.top()),
-                whitespace_row.right_bottom(),
-            );
+            let bridge = submenu_bridge(whitespace_row, submenu.response.rect);
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("app_whitespace_submenu_rect"), submenu.response.rect);
+                d.insert_temp(egui::Id::new("app_whitespace_bridge_rect"), bridge);
+            });
             if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
                 !whitespace_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) { self.menu_whitespace_open = false; }
@@ -2095,8 +2127,8 @@ impl LiteTextApp {
         if self.menu_plugins_open {
             let submenu = egui::Area::new(egui::Id::new("app_plugins_submenu"))
                 .order(egui::Order::Foreground)
-                .pivot(egui::Align2::RIGHT_TOP)
-                .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, plugins_row.top() - 6.0))
+                .pivot(menu_pivot)
+                .fixed_pos(egui::pos2(submenu_x, plugins_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
@@ -2118,10 +2150,11 @@ impl LiteTextApp {
                         });
                 });
             submenu_rect = Some(submenu.response.rect);
-            let bridge = egui::Rect::from_min_max(
-                egui::pos2(submenu.response.rect.right().min(plugins_row.left()), plugins_row.top()),
-                plugins_row.right_bottom(),
-            );
+            let bridge = submenu_bridge(plugins_row, submenu.response.rect);
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("app_plugins_submenu_rect"), submenu.response.rect);
+                d.insert_temp(egui::Id::new("app_plugins_bridge_rect"), bridge);
+            });
             if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
                 !plugins_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) { self.menu_plugins_open = false; }
@@ -2129,8 +2162,8 @@ impl LiteTextApp {
         if self.menu_recent_open {
             let submenu = egui::Area::new(egui::Id::new("app_recent_submenu"))
                 .order(egui::Order::Foreground)
-                .pivot(egui::Align2::RIGHT_TOP)
-                .fixed_pos(egui::pos2(menu.response.rect.left() - 4.0, recent_row.top() - 6.0))
+                .pivot(menu_pivot)
+                .fixed_pos(egui::pos2(submenu_x, recent_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new()
                         .fill(pal.bg_panel)
@@ -2164,10 +2197,11 @@ impl LiteTextApp {
                 });
             submenu_rect = Some(submenu.response.rect);
             // 将两菜单间的空隙纳入安全区，指针横移时不会提前收起子菜单。
-            let bridge = egui::Rect::from_min_max(
-                egui::pos2(submenu.response.rect.right().min(recent_row.left()), recent_row.top()),
-                egui::pos2(recent_row.right(), recent_row.bottom()),
-            );
+            let bridge = submenu_bridge(recent_row, submenu.response.rect);
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("app_recent_submenu_rect"), submenu.response.rect);
+                d.insert_temp(egui::Id::new("app_recent_bridge_rect"), bridge);
+            });
             if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
                 !recent_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) {
@@ -2234,6 +2268,18 @@ impl LiteTextApp {
                 ui.horizontal_centered(|ui| {
                     // ── 左：文件标签页（均分宽度 + 最小宽 + 悬停滚轮查看被遮标签）──
                     let mut area_w = (ui.available_width() - self.right_controls_w - 10.0).max(60.0);
+                    if self.vertical_tabs {
+                        ui.scope(|ui| {
+                            ui.set_width(ui.available_width());
+                            self.top_toolbar(ui, pal);
+                            ui.separator();
+                            let (blank, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+                            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("tab_blank_new_rect"), blank));
+                            if response.double_clicked_by(egui::PointerButton::Primary) && !self.shortcuts_blocked() {
+                                self.new_document();
+                            }
+                        });
+                    } else {
                     let pinned = self.files.iter().filter(|file| file.pinned).count();
                     if pinned > 0 {
                         let width = pinned_tabs::area_width(pinned, area_w);
@@ -2485,110 +2531,121 @@ impl LiteTextApp {
                         });
                     ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("normal_tabs_viewport"), (normal_tabs.inner_rect, normal_tabs.state.offset.x)));
                     });
+                    }
 
-                    ui.separator();
+                    if !self.vertical_tabs {
+                        ui.separator();
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.top_toolbar(ui, pal);
+                            self.right_controls_w = ui.min_rect().width() + 12.0;
+                        });
+                    }
 
-                    // ── 右侧控件（从右到左：菜单 / 新建 / 视图切换）──
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let menu_button = settings_icon_button(ui, &mut self.show_menu, t.menu, pal);
-                        self.app_menu(ui.ctx(), menu_button.rect, pal);
-
-                        if new_file_icon_button(ui, t.new_file, pal).clicked() {
-                            self.new_document();
-                        }
-
-                        // 单状态图标切换：TXT / 010，无背景融入界面。
-                        // 可切换时外圈有强调色描边；二进制固定 010，灰显、无描边、点击无效。
-                        if let Some(file) = self.active() {
-                            let is_binary = file.is_binary;
-                            let enabled = !is_binary;
-                            let show_hex = is_binary || file.view == ViewMode::Hex;
-                            let mut toggled = false;
-
-                            let (rect, mut resp) = ui.allocate_exact_size(
-                                egui::vec2(26.0, 24.0),
-                                egui::Sense::click(),
-                            );
-                            resp = resp.on_hover_text(t.view_toggle);
-                            let hovered = enabled && resp.hovered();
-                            if enabled {
-                                resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                            }
-                            let p = ui.painter();
-                            if enabled {
-                                // 外圈高亮描边
-                                p.rect_stroke(
-                                    rect,
-                                    6.0,
-                                    Stroke::new(
-                                        if hovered { 1.6_f32 } else { 1.2_f32 },
-                                        if hovered { pal.accent_hover } else { pal.accent },
-                                    ),
-                                    egui::StrokeKind::Inside,
-                                );
-                                if hovered {
-                                    p.rect_filled(rect, 6.0, pal.accent.gamma_multiply(0.15));
-                                }
-                            }
-                            let color = if enabled {
-                                if hovered { pal.accent_hover } else { pal.text_main }
-                            } else {
-                                pal.text_faint
-                            };
-                            let label = if show_hex { "010" } else { "TXT" };
-                            p.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                label,
-                                FontId::monospace(10.5),
-                                color,
-                            );
-                            if resp.clicked() && enabled {
-                                toggled = true;
-                            }
-
-                            if toggled {
-                                if let Some(f) = self.active_mut() {
-                                    f.view = if f.view == ViewMode::Text {
-                                        ViewMode::Hex
-                                    } else {
-                                        ViewMode::Text
-                                    };
-                                }
-                                self.selection = None;
-                                self.drag_anchor = None;
-                            }
-                        }
-
-                        if self.terminal.show_toolbar_button && self.active().is_some() && terminal::button(ui, pal, self.lang).clicked() {
-                            self.open_terminal(ui.ctx());
-                        }
-
-                        if let Some(file) = self.active_mut()
-                            && file.view == ViewMode::Text && file.draft_text.is_some()
-                        {
-                            // Rendered Markdown has no source TextEdit to wrap,
-                            // reveal whitespace in or paint marks on. Huge
-                            // documents fall back to the source editor even in
-                            // rendered modes, so the controls stay usable then.
-                            let rendered = markdown::is_markdown(file)
-                                && file.markdown_mode != markdown::Mode::Source
-                                && !(file.editor_state.large.active
-                                    || file.draft_text.as_ref().is_some_and(|text| {
-                                        large_editor::needs_windowing(text)
-                                    }));
-                            text_tools::toolbar(ui, file, pal, t, rendered);
-                        }
-
-                        // 实测右侧控件总宽（下一帧供标签区自适应）
-                        self.right_controls_w = ui.min_rect().width() + 12.0;
-                    });
                 });
             });
         if let Some(action) = pending_tab_action {
             self.request_tab_action(action);
             ctx.request_repaint();
         }
+    }
+
+    /// Inherits direction: horizontal mode is right-to-left, vertical mode
+    /// mirrors the same tools left-to-right before the empty new-tab strip.
+    fn top_toolbar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let t = tr(self.lang);
+        let menu_button = settings_icon_button(ui, &mut self.show_menu, t.menu, pal);
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("toolbar_menu_rect"), menu_button.rect));
+        self.app_menu(ui.ctx(), menu_button.rect, pal);
+
+        if new_file_icon_button(ui, t.new_file, pal).clicked() {
+            self.new_document();
+        }
+
+        // 单状态图标切换：TXT / 010，无背景融入界面。
+        // 可切换时外圈有强调色描边；二进制固定 010，灰显、无描边、点击无效。
+        if let Some(file) = self.active() {
+            let is_binary = file.is_binary;
+            let enabled = !is_binary;
+            let show_hex = is_binary || file.view == ViewMode::Hex;
+            let mut toggled = false;
+
+            let (rect, mut resp) = ui.allocate_exact_size(
+                egui::vec2(26.0, 24.0),
+                egui::Sense::click(),
+            );
+            resp = resp.on_hover_text(t.view_toggle);
+            let hovered = enabled && resp.hovered();
+            if enabled {
+                resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            let p = ui.painter();
+            if enabled {
+                // 外圈高亮描边
+                p.rect_stroke(
+                    rect,
+                    6.0,
+                    Stroke::new(
+                        if hovered { 1.6_f32 } else { 1.2_f32 },
+                        if hovered { pal.accent_hover } else { pal.accent },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                if hovered {
+                    p.rect_filled(rect, 6.0, pal.accent.gamma_multiply(0.15));
+                }
+            }
+            let color = if enabled {
+                if hovered { pal.accent_hover } else { pal.text_main }
+            } else {
+                pal.text_faint
+            };
+            let label = if show_hex { "010" } else { "TXT" };
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                FontId::monospace(10.5),
+                color,
+            );
+            if resp.clicked() && enabled {
+                toggled = true;
+            }
+
+            if toggled {
+                if let Some(f) = self.active_mut() {
+                    f.view = if f.view == ViewMode::Text {
+                        ViewMode::Hex
+                    } else {
+                        ViewMode::Text
+                    };
+                }
+                self.selection = None;
+                self.drag_anchor = None;
+            }
+        }
+
+        if self.terminal.show_toolbar_button && self.active().is_some() && terminal::button(ui, pal, self.lang).clicked() {
+            self.open_terminal(ui.ctx());
+        }
+
+        if let Some(file) = self.active_mut()
+            && file.view == ViewMode::Text && file.draft_text.is_some()
+        {
+            // Rendered Markdown has no source TextEdit to wrap,
+            // reveal whitespace in or paint marks on. Huge
+            // documents fall back to the source editor even in
+            // rendered modes, so the controls stay usable then.
+            let rendered = markdown::is_markdown(file)
+                && file.markdown_mode != markdown::Mode::Source
+                && !(file.editor_state.large.active
+                    || file.draft_text.as_ref().is_some_and(|text| {
+                        large_editor::needs_windowing(text)
+                    }));
+            text_tools::toolbar(ui, file, pal, t, rendered);
+        }
+
+
+
     }
 
     fn status_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -2763,7 +2820,7 @@ impl LiteTextApp {
                                             .map(|l| (l.native_name().to_owned(), *l)).collect();
                                         if let Some(lang) = dropdown(
                                             ui, pal, egui::Id::new("settings_lang"),
-                                            self.lang.native_name().to_owned(), options, 160.0,
+                                            self.lang.native_name().to_owned(), options, SETTINGS_SELECT_WIDTH,
                                         ) {
                                             self.lang = lang;
                                             // Redraw immediately with the new strings; popups
@@ -2772,8 +2829,26 @@ impl LiteTextApp {
                                         }
                                     });
                                 });
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(t.language_desc).size(11.0).color(pal.text_faint));
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    let zh = self.lang == Lang::ZhCn;
+                                    ui.label(RichText::new(if zh { "标签栏排布" } else { "Tab bar layout" }).size(13.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let horizontal = if zh { "水平" } else { "Horizontal" };
+                                        let vertical = if zh { "垂直" } else { "Vertical" };
+                                        if let Some(value) = dropdown(
+                                            ui, pal, egui::Id::new("settings_tab_layout"),
+                                            if self.vertical_tabs { vertical } else { horizontal }.to_owned(),
+                                            vec![(horizontal.to_owned(), false), (vertical.to_owned(), true)], SETTINGS_SELECT_WIDTH,
+                                        ) {
+                                            self.vertical_tabs = value;
+                                            self.tab_drag_id = None;
+                                            self.reveal_tab = self.active_id;
+                                            ui.ctx().request_repaint();
+                                        }
+                                    });
+                                });
                             });
                             ui.add_space(8.0);
                             settings_card(ui, pal, |ui| {
@@ -3636,6 +3711,8 @@ fn inspector_value_row(
 
 /// 自研下拉选择框：芯片按钮 + 自绘弹层，颜色全部取自调色板（明暗主题一致）。
 /// 返回用户点选的新值。
+pub(crate) const SETTINGS_SELECT_WIDTH: f32 = 190.0;
+
 fn dropdown<S: Clone + PartialEq + 'static>(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -3650,6 +3727,7 @@ fn dropdown<S: Clone + PartialEq + 'static>(
     // 芯片按钮：选中值 + 下拉三角
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.ctx().data_mut(|d| d.insert_temp(id.with("button_rect"), rect));
     let p = ui.painter();
     // `gamma_multiply` also scales alpha; an "open" chip that is 75% transparent
     // shows the card/document behind it, so use an opaque tint instead.
@@ -3659,8 +3737,8 @@ fn dropdown<S: Clone + PartialEq + 'static>(
         if open { opaque_tint(pal.bg_elevated, pal.accent, 0.28) } else { pal.bg_elevated },
     );
     p.text(
-        egui::pos2(rect.left() + 10.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
         &selected,
         FontId::proportional(13.0),
         pal.text_main,
@@ -3706,6 +3784,7 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                                 egui::Sense::click(),
                             );
                             let rresp = rresp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            ui.ctx().data_mut(|d| d.insert_temp(id.with(("option_rect", name)), r));
                             let pr = ui.painter_at(r);
                             if is_selected || rresp.hovered() {
                                 pr.rect_filled(
@@ -3719,8 +3798,8 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                                 );
                             }
                             pr.text(
-                                egui::pos2(r.left() + 6.0, r.center().y),
-                                egui::Align2::LEFT_CENTER,
+                                r.center(),
+                                egui::Align2::CENTER_CENTER,
                                 name,
                                 FontId::proportional(12.5),
                                 if is_selected { pal.accent } else { pal.text_main },
@@ -4147,7 +4226,7 @@ fn hex_view(
         })
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, total_rows, |ui, range| {
                     egui::Frame::new()

@@ -42,6 +42,7 @@ pub(crate) struct State {
     pub(crate) table_picker: Option<TablePicker>,
     /// Heading byte offset requested by the right-hand outline.
     pub(crate) toc_target: Option<usize>,
+    outline: OutlineState,
     /// Byte offset waiting for the platform's paste event after the rendered
     /// right-click menu asked for the clipboard.
     pub(crate) paste_at: Option<usize>,
@@ -606,6 +607,7 @@ pub(crate) fn live_editor(
     let mut table_picker = file.markdown.table_picker.take();
     let mut lang_change: Option<(usize, String)> = None;
     let mut toc_target = file.markdown.toc_target.take();
+    let mut outline = file.markdown.outline.clone();
     let mut insert_action: Option<(usize, InsertAction)> = None;
     // Set when a typed fence opener was completed; the caret moves into the
     // freshly created code block after the document text is replaced.
@@ -634,6 +636,7 @@ pub(crate) fn live_editor(
 
     let panel_height = ui.available_height();
     let mut toc_click = None;
+    let mut heading_positions = Vec::with_capacity(headings.len());
     let live_scroll = ui
         .horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -662,7 +665,7 @@ pub(crate) fn live_editor(
                         let is_editing = editing_range.as_ref().is_some_and(|range| {
                             block.range.start == range.start
                                 || block.range.start <= range.start
-                                    && range.start <= block.range.end
+                                    && range.start < block.range.end
                         });
                         let inside_edit = editing_range
                             .as_ref()
@@ -677,6 +680,10 @@ pub(crate) fn live_editor(
                                 file_id,
                                 edit.range.start,
                             ));
+                            let code = edit.code;
+                            let code_body = code.then(|| CodeBodyEdit::new(&edit.text));
+                            let mut body_text = code_body.as_ref().map(|body| body.text.clone());
+                            let language = fence_info_raw(edit.text.lines().next().unwrap_or(""));
                             // Place the caret at the clicked character before
                             // the first frame; the state is read by TextEdit.
                             if edit.focus
@@ -685,14 +692,14 @@ pub(crate) fn live_editor(
                                 let mut state =
                                     egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
                                 state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                                    egui::text::CCursor::new(cursor),
+                                    egui::text::CCursor::new(code_body.as_ref().map_or(cursor, |body| body.body_cursor(&edit.text, cursor))),
                                 )));
                                 state.store(ui.ctx(), edit_id);
                             }
                             // Continue a list or quote on Enter. Only consume the key when the
                             // current line actually has a prefix to continue, so ordinary
                             // paragraphs keep the default TextEdit behaviour.
-                            if ui.memory(|memory| memory.has_focus(edit_id))
+                            if !code && ui.memory(|memory| memory.has_focus(edit_id))
                                 && !ui.input(|input| {
                                     input.events.iter().any(|event| {
                                         matches!(event, egui::Event::Ime(_))
@@ -745,16 +752,17 @@ pub(crate) fn live_editor(
                                     changed = true;
                                 }
                             }
-                            let code = matches!(block.kind, Kind::Code(_));
                             let mut layouter = |ui: &egui::Ui, text: &str, width: f32| {
-                                let job = editing_job_for(
+                                let job = if code {
+                                    code_body_edit_job(text, &language, body, width, pal)
+                                } else { editing_job_for(
                                     text,
                                     &FontId::proportional(body),
                                     pal.text_main,
                                     pal,
                                     width,
-                                    code,
-                                );
+                                    false,
+                                ) };
                                 #[cfg(test)]
                                 ui.ctx().data_mut(|data| {
                                     data.insert_temp(
@@ -797,7 +805,7 @@ pub(crate) fn live_editor(
                                         bottom: frame_bottom,
                                     })
                                     .show(ui, |ui| {
-                                        egui::TextEdit::multiline(&mut edit.text)
+                                        egui::TextEdit::multiline(body_text.as_mut().unwrap_or(&mut edit.text))
                                             .id(edit_id)
                                             .font(edit_font)
                                             .text_color(pal.text_main)
@@ -848,6 +856,9 @@ pub(crate) fn live_editor(
                                     .show(ui);
                                 (output, None)
                             };
+                            if let (Some(body), Some(edited)) = (&code_body, &body_text) {
+                                body.commit(&mut edit.text, edited);
+                            }
                             #[cfg(not(test))]
                             let _ = frame_rect;
                             if code {
@@ -879,6 +890,9 @@ pub(crate) fn live_editor(
                                 }
                             }
                             let response = output.response;
+                            if matches!(block.kind, Kind::Heading(_)) {
+                                heading_positions.push((block.range.start, response.rect.top()));
+                            }
                             if toc_target == Some(block.range.start) {
                                 ui.scroll_to_rect_animation(
                                     response.rect,
@@ -894,17 +908,13 @@ pub(crate) fn live_editor(
                                     response.rect,
                                 )
                             });
-                            let edit_cursor = output
-                                .state
-                                .cursor
-                                .char_range()
-                                .and_then(|range| {
-                                    edit.text
-                                        .char_indices()
-                                        .nth(range.primary.index)
-                                        .map(|(index, _)| index)
-                                })
-                                .unwrap_or(edit.text.len());
+                            let edit_cursor_chars = output.state.cursor.char_range()
+                                .map_or(0, |range| range.primary.index);
+                            let edit_cursor = if code {
+                                CodeBodyEdit::new(&edit.text).raw_byte(&edit.text, edit_cursor_chars)
+                            } else {
+                                char_to_byte(&edit.text, edit_cursor_chars)
+                            };
                             let edit_at = edit.range.start + edit_cursor;
                             // Insert relative to the whole block, not the
                             // source line under the caret: a code block stays
@@ -942,11 +952,7 @@ pub(crate) fn live_editor(
                             edit.fresh = false;
                             if let Some(range) = output.state.cursor.char_range() {
                                 // CCursor indices are character offsets, not bytes.
-                                let byte = edit
-                                    .text
-                                    .char_indices()
-                                    .nth(range.primary.index)
-                                    .map_or(edit.text.len(), |(index, _)| index);
+                                let byte = edit_cursor;
                                 cursor_line = block.line_start
                                     + edit.text[..byte].bytes().filter(|byte| *byte == b'\n').count();
                                 selected = range.primary.index.abs_diff(range.secondary.index);
@@ -1006,6 +1012,9 @@ pub(crate) fn live_editor(
                                 );
                             if lang_row.changed.is_some() {
                                 lang_change = lang_row.changed;
+                            }
+                            if matches!(block.kind, Kind::Heading(_)) {
+                                heading_positions.push((block.range.start, response.rect.top()));
                             }
                             if toc_target == Some(block.range.start) {
                                 ui.scroll_to_rect_animation(
@@ -1083,7 +1092,28 @@ pub(crate) fn live_editor(
                     .allocate_ui_with_layout(
                         egui::vec2(toc_width, panel_height),
                         egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| heading_outline(ui, &headings, pal, body, lang),
+                        |ui| {
+                            let editing_heading = editing.as_ref().and_then(|edit| {
+                                headings.iter().find(|(at, _, _)| *at == edit.range.start)
+                                    .filter(|(at, _, _)| ui.memory(|m| m.has_focus(
+                                        egui::Id::new(("markdown_edit", file_id, *at)))))
+                                    .map(|(at, _, _)| *at)
+                            });
+                            let at_bottom = scroll.state.offset.y > 0.0
+                                && scroll.state.offset.y + scroll.inner_rect.height()
+                                    >= scroll.content_size.y - 1.0;
+                            let manual_scroll = ui.input(|input| {
+                                let over_body = input.pointer.hover_pos().is_some_and(|pos| scroll.inner_rect.contains(pos));
+                                over_body && (input.raw_scroll_delta.y != 0.0 || input.pointer.primary_down())
+                                    || input.key_pressed(egui::Key::PageDown)
+                                    || input.key_pressed(egui::Key::PageUp)
+                            });
+                            let active = outline.update(
+                                &heading_positions, scroll.inner_rect, at_bottom,
+                                editing_heading, manual_scroll,
+                            );
+                            heading_outline(ui, &headings, active, pal, body)
+                        },
                     )
                     .inner;
             }
@@ -1092,6 +1122,8 @@ pub(crate) fn live_editor(
         .inner;
     if let Some(at) = toc_click {
         toc_target = Some(at);
+        outline.clicked = Some(at);
+        outline.active = Some(at);
         ui.ctx().request_repaint();
     }
     #[cfg(test)]
@@ -1274,6 +1306,7 @@ pub(crate) fn live_editor(
     file.markdown.editing = editing;
     file.markdown.table_picker = table_picker;
     file.markdown.toc_target = toc_target;
+    file.markdown.outline = outline;
     file.markdown.paste_at = paste_at;
     file.draft_text = Some(text);
     changed || paste_changed
@@ -1840,26 +1873,103 @@ fn heading_text(raw: &str) -> String {
         .to_owned()
 }
 
+#[derive(Clone, Default)]
+struct OutlineState {
+    active: Option<usize>,
+    clicked: Option<usize>,
+}
+
+impl OutlineState {
+    fn update(&mut self, headings: &[(usize, f32)], viewport: egui::Rect,
+        at_bottom: bool, editing: Option<usize>, manual_scroll: bool,
+    ) -> Option<usize> {
+        if manual_scroll { self.clicked = None; }
+        let valid = |at: &usize| headings.iter().any(|(id, _)| id == at);
+        self.clicked = self.clicked.filter(valid);
+        let forced = editing.filter(valid).or(self.clicked);
+        let line = viewport.top() + viewport.height() * 0.2;
+        let candidate = forced.or_else(|| {
+            if at_bottom {
+                headings.iter().rev().find(|(_, top)| *top < viewport.bottom()).map(|(at, _)| *at)
+            } else {
+                headings.iter().rev().find(|(_, top)| *top <= line)
+                    .or_else(|| headings.first()).map(|(at, _)| *at)
+            }
+        });
+        if forced.is_none() && !at_bottom {
+            if let (Some(previous), Some(next)) = (self.active, candidate) {
+                let old = headings.iter().position(|(at, _)| *at == previous);
+                let new = headings.iter().position(|(at, _)| *at == next);
+                if let (Some(old), Some(new)) = (old, new) {
+                    // Shrink hysteresis for tightly packed headings, rather
+                    // than making a short section impossible to select.
+                    let boundary = if new > old { new } else { old };
+                    let mut gap = if boundary > 0 {
+                        (headings[boundary].1 - headings[boundary - 1].1).abs()
+                    } else { 64.0 };
+                    if boundary + 1 < headings.len() {
+                        gap = gap.min((headings[boundary + 1].1 - headings[boundary].1).abs());
+                    }
+                    let buffer = 16.0_f32.min(gap * 0.25);
+                    if new > old && headings[new].1 > line - buffer
+                        || new < old && headings[old].1 < line + buffer
+                    {
+                        return self.active;
+                    }
+                }
+            }
+        }
+        self.active = candidate;
+        candidate
+    }
+}
+
+/// The last heading above the reading line owns the current section, including
+/// its paragraphs. Before the first heading enters that line, select it anyway.
+/// Positions come from this frame's layout, so scrolling, resizing and inline
+/// editing all update the outline without relying on a previous click.
+#[cfg(test)]
+fn active_outline_heading(headings: &[(usize, f32)], viewport_top: f32) -> Option<usize> {
+    let reading_line = viewport_top + 18.0;
+    headings
+        .iter()
+        .rev()
+        .find(|(_, top)| *top <= reading_line)
+        .or_else(|| headings.first())
+        .map(|(at, _)| *at)
+}
+
+/// Any heading level may own the current section. A focused heading wins;
+/// at the document bottom, later visible headings cannot reach the top reading
+/// line, so use the last visible heading instead of leaving its parent lit.
+#[cfg(test)]
+fn outline_heading_for_view(
+    headings: &[(usize, f32)], viewport: egui::Rect, at_bottom: bool,
+    editing_heading: Option<usize>,
+) -> Option<usize> {
+    editing_heading.or_else(|| {
+        if at_bottom {
+            headings.iter().rev().find(|(_, top)| *top < viewport.bottom()).map(|(at, _)| *at)
+        } else {
+            active_outline_heading(headings, viewport.top())
+        }
+    })
+}
+
 /// Right-hand document outline for the live render. Headings are indented by
 /// level and clicking one returns its block byte offset.
 fn heading_outline(
     ui: &mut egui::Ui,
     headings: &[(usize, u8, String)],
+    active: Option<usize>,
     pal: &Palette,
     body: f32,
-    lang: Lang,
 ) -> Option<usize> {
     let mut clicked = None;
     let width = ui.available_width();
     ui.vertical(|ui| {
         ui.set_width(width);
         ui.add_space(18.0);
-        ui.label(
-            egui::RichText::new(if lang == Lang::ZhCn { "目录" } else { "Outline" })
-                .size(body * 0.8)
-                .color(pal.text_faint),
-        );
-        ui.add_space(8.0);
         egui::ScrollArea::vertical()
             .id_salt("markdown_outline")
             .auto_shrink([false, false])
@@ -1868,12 +1978,15 @@ fn heading_outline(
                 for (at, level, text) in headings {
                     ui.horizontal(|ui| {
                         ui.add_space((*level as f32 - 1.0) * 10.0);
+                        let selected = active == Some(*at);
+                        let mut label = egui::RichText::new(text)
+                            .size(body * 0.82)
+                            .color(if selected { pal.accent } else { pal.text_faint });
+                        if selected {
+                            label = label.strong();
+                        }
                         let response = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .size(body * 0.82)
-                                    .color(pal.text_faint),
-                            )
+                            egui::Label::new(label)
                             .sense(egui::Sense::click())
                             .truncate(),
                         );
@@ -2619,9 +2732,19 @@ fn paint_list_marker(
     body: f32,
     pal: &Palette,
 ) {
-    let Some(row) = output.galley.rows.first() else {
-        return;
-    };
+    paint_list_marker_at(ui, output.galley_pos, &output.galley, ordered, marker, body, pal);
+}
+
+fn paint_list_marker_at(
+    ui: &egui::Ui,
+    text_pos: egui::Pos2,
+    text: &egui::Galley,
+    ordered: bool,
+    marker: &str,
+    body: f32,
+    pal: &Palette,
+) {
+    let Some(row) = text.rows.first() else { return; };
     let galley = ui.painter().layout_no_wrap(
         if ordered { marker.to_owned() } else { "•".to_owned() },
         FontId::proportional(body),
@@ -2631,8 +2754,8 @@ fn paint_list_marker(
     // it; the editing galley starts after the 22 px inset, so the slot centre
     // sits 9 px left of the text (13 px right of the content origin).
     let pos = egui::pos2(
-        output.galley_pos.x - 9.0 - galley.size().x * 0.5,
-        output.galley_pos.y + row.rect.center().y - galley.size().y * 0.5,
+        text_pos.x - 9.0 - galley.size().x * 0.5,
+        text_pos.y + row.rect.center().y - galley.size().y * 0.5,
     );
     ui.painter().galley(pos, galley, pal.accent);
 }
@@ -2969,6 +3092,85 @@ fn code_body_between(segments: &[&str], start: usize, end: usize) -> String {
         .join("\n")
 }
 
+/// The TextEdit owns only visible code, never the fence rows. Keep the raw
+/// envelope in `Editing.text` so language edits and document commits retain
+/// their source spelling (including CRLF and the closing fence's newline).
+struct CodeBodyEdit {
+    range: Range<usize>,
+    text: String,
+    crlf: bool,
+}
+
+impl CodeBodyEdit {
+    fn new(raw: &str) -> Self {
+        let start = raw.find('\n').map_or(raw.len(), |at| at + 1);
+        let last_end = raw.strip_suffix('\n').unwrap_or(raw).len();
+        let last_start = raw[..last_end].rfind('\n').map_or(0, |at| at + 1);
+        let closed = last_start >= start
+            && fence_marker(raw[last_start..last_end].trim()).is_some();
+        let mut end = if closed { last_start } else { raw.len() };
+        // The newline separating body from closing fence is structural, not
+        // an extra editable blank row. Actual trailing blank body rows remain.
+        if closed && end > start && raw.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+            if end > start && raw.as_bytes()[end - 1] == b'\r' { end -= 1; }
+        }
+        Self {
+            range: start..end,
+            text: raw[start..end].replace("\r\n", "\n"),
+            crlf: raw[..start].ends_with("\r\n"),
+        }
+    }
+
+    fn raw_byte(&self, raw: &str, chars: usize) -> usize {
+        let body = &raw[self.range.clone()];
+        let mut count = 0;
+        for (byte, ch) in body.char_indices() {
+            if count == chars { return self.range.start + byte; }
+            if ch == '\r' && body[byte..].starts_with("\r\n") { continue; }
+            count += 1;
+        }
+        self.range.end
+    }
+
+    fn body_cursor(&self, raw: &str, raw_chars: usize) -> usize {
+        let byte = char_to_byte(raw, raw_chars).clamp(self.range.start, self.range.end);
+        raw[self.range.start..byte].replace("\r\n", "\n").chars().count()
+    }
+
+    fn commit(&self, raw: &mut String, edited: &str) {
+        // Replace only the changed span: untouched source, even mixed line
+        // endings, remains byte-for-byte intact. This also handles TextEdit undo.
+        let prefix = self.text.chars().zip(edited.chars()).take_while(|(a, b)| a == b).count();
+        let suffix = self.text.chars().rev().take(self.text.chars().count() - prefix)
+            .zip(edited.chars().rev().take(edited.chars().count() - prefix))
+            .take_while(|(a, b)| a == b).count();
+        let old_end = self.text.chars().count() - suffix;
+        let new_start = char_to_byte(edited, prefix);
+        let new_end = char_to_byte(edited, edited.chars().count() - suffix);
+        let replacement = if self.crlf {
+            edited[new_start..new_end].replace('\n', "\r\n")
+        } else { edited[new_start..new_end].to_owned() };
+        let range = self.raw_byte(raw, prefix)..self.raw_byte(raw, old_end);
+        let needs_separator = self.range.is_empty() && !edited.is_empty()
+            && !raw[self.range.end..].starts_with(['\r', '\n'])
+            && fence_marker(raw[self.range.end..].trim()).is_some();
+        let replacement = if needs_separator {
+            format!("{replacement}{}", if self.crlf { "\r\n" } else { "\n" })
+        } else { replacement };
+        raw.replace_range(range, &replacement);
+    }
+}
+
+fn code_body_edit_job(text: &str, language: &str, body: f32, width: f32, pal: &Palette) -> egui::text::LayoutJob {
+    let font = FontId::monospace((body - 1.0).max(9.0));
+    let mut job = crate::workspace_theme::code_job(text, language, font.clone(), width, pal.dark);
+    if text.is_empty() {
+        job.append("", 0.0, egui::TextFormat { font_id: font, color: pal.text_main, ..Default::default() });
+    }
+    job
+}
+
 /// Result of completing a fence opener typed in the live editor.
 struct FenceShortcut {
     /// Whole replacement for the block being edited.
@@ -3098,6 +3300,11 @@ fn editing_job_for(
         line_height: Some(font.size * BODY_LINE_HEIGHT),
         ..Default::default()
     };
+    if text.is_empty() {
+        // An empty job otherwise falls back to egui's default text format,
+        // which gives the caret a different height from this Markdown row.
+        job.append("", 0.0, base.clone());
+    }
     let kinds = editing_line_kinds(text);
     let segments: Vec<&str> = text.split_inclusive('\n').collect();
     let mut code: Option<EditingCode> = None;
@@ -3465,7 +3672,10 @@ fn editing_cursor_from_click(
         (relative.x - inset.x).max(0.0),
         (relative.y - inset.y).max(0.0),
     );
-    let job = editing_job(raw, &FontId::proportional(body), pal.text_main, pal, width);
+    let code_body = matches!(kind, Kind::Code(_)).then(|| CodeBodyEdit::new(raw));
+    let job = if let Some(code) = &code_body {
+        code_body_edit_job(&code.text, &fence_info_raw(raw.lines().next().unwrap_or("")), body, width, pal)
+    } else { editing_job(raw, &FontId::proportional(body), pal.text_main, pal, width) };
     let galley = ui.fonts(|fonts| fonts.layout_job(job));
     let relative = if matches!(kind, Kind::Heading(_)) {
         let centered = ((width - galley.size().x) * 0.5).max(0.0);
@@ -3473,7 +3683,8 @@ fn editing_cursor_from_click(
     } else {
         relative
     };
-    galley.cursor_from_pos(relative).ccursor.index
+    let cursor = galley.cursor_from_pos(relative).ccursor.index;
+    code_body.map_or(cursor, |code| raw[..code.raw_byte(raw, cursor)].chars().count())
 }
 
 /// Returns the consumed byte length and the inner text for a paired delimiter.
@@ -3806,13 +4017,22 @@ fn image_failure_label(alt: &str, src: &str) -> String {
     }
 }
 
-/// One empty source line still needs a full editor row in the split view: the
-/// preview may collapse blank runs, but every row paints its own line number
-/// and shorter rows make consecutive numbers overlap. Live rendering keeps the
-/// compact gap between paragraphs.
+/// One empty source line still needs a full editor row in the split view:
+/// every row paints its own line number and shorter rows make consecutive
+/// numbers overlap. Live rendering reserves its editable caret row up front
+/// so clicking an empty line never changes the following block's position.
 fn blank_line_height(ui: &egui::Ui, body: f32, split: bool) -> f32 {
     if !split {
-        return 7.0;
+        // A live blank line is clickable and becomes a one-row TextEdit. Keep
+        // its resting height equal to that row instead of a collapsed gap.
+        let font = FontId::proportional(body);
+        let mut job = egui::text::LayoutJob::default();
+        job.append("", 0.0, egui::TextFormat {
+            font_id: font.clone(),
+            line_height: Some(body * BODY_LINE_HEIGHT),
+            ..Default::default()
+        });
+        return galley_height(ui, job).max(ui.fonts(|fonts| fonts.row_height(&font)));
     }
     // `body` is clamped for very large editor fonts, so size this from the
     // upper bound instead: the row must never be shorter than the gutter
@@ -3898,7 +4118,12 @@ fn measure_block(
                 if nowrap { f32::INFINITY } else { width - 20.0 },
             );
             let _ = language;
-            galley_height(ui, job) + 18.0 + code_lang_height(body)
+            // TextEdit reserves at least one font row even with desired_rows(1).
+            // A one-line galley is pixel-rounded and can be shorter than that
+            // fractional row height. Reserve the same minimum in preview, or
+            // entering edit moves both the box bottom and every following block.
+            let row_height = ui.fonts(|fonts| fonts.row_height(&FontId::monospace(body - 1.0)));
+            galley_height(ui, job).max(row_height) + 18.0 + code_lang_height(body)
         }
         Kind::Rule => 16.0,
         Kind::Table => {
@@ -4109,6 +4334,11 @@ fn render_block(
                                 hit.clone(),
                                 pal,
                             ))
+                            // Center the whole title band, not the glyphs a
+                            // second time inside its galley. TextEdit centers
+                            // a left-aligned galley too; matching that avoids
+                            // pixel-rounding differences on odd-width titles.
+                            .halign(egui::Align::LEFT)
                             .selectable(false),
                         );
                     });
@@ -4129,32 +4359,14 @@ fn render_block(
                 }
                 Kind::List { ordered, marker } => {
                     let (_, item) = list_text(raw);
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        let bullet = if *ordered {
-                            marker.clone()
-                        } else {
-                            "•".to_owned()
-                        };
-                        ui.add_sized(
-                            egui::vec2(18.0, body + 2.0),
-                            egui::Label::new(
-                                egui::RichText::new(bullet).color(pal.accent).size(body),
-                            )
-                            .selectable(false),
-                        );
-                        ui.add(
-                            egui::Label::new(inline_job(
-                                &item,
-                                FontId::proportional(body),
-                                pal.text_main,
-                                pal,
-                                width - 22.0,
-                                hit.clone(),
-                            ))
-                            .selectable(false),
-                        );
-                    });
+                    let job = inline_job(
+                        &item, FontId::proportional(body), pal.text_main, pal,
+                        width - 22.0, hit.clone(),
+                    );
+                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                    let text_pos = rect.min + egui::vec2(22.0, 0.0);
+                    paint_list_marker_at(ui, text_pos, &galley, *ordered, marker, body, pal);
+                    ui.painter().galley(text_pos, galley, pal.text_main);
                     ui.add_space(4.0);
                 }
                 Kind::Quote => {
@@ -4241,7 +4453,6 @@ fn render_block(
                             body_rect,
                         )
                     });
-                    ui.add_space(6.0);
                     let text = code_body(raw);
                     let mut job = crate::workspace_theme::code_job(
                         &text,
@@ -4253,10 +4464,17 @@ fn render_block(
                     if let Some(hit) = hit.clone() {
                         highlight_sections(&mut job, hit, pal);
                     }
-                    ui.horizontal(|ui| {
-                        ui.add_space(10.0);
-                        ui.add(egui::Label::new(job).selectable(false));
-                    });
+                    // A horizontal UI centers short labels in at least the
+                    // interaction row height. That adds a font-dependent y
+                    // offset to single-line code, unlike the top-aligned
+                    // body-only TextEdit. Paint at its exact content origin so
+                    // both the glyph baselines and pixels stay put on entry.
+                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                    ui.painter().galley(
+                        rect.min + egui::vec2(10.0, 6.0),
+                        galley,
+                        pal.text_main,
+                    );
                     let row_top = rect.top() + (rect.height() - lang_h).max(0.0);
                     ui.add_space((row_top - ui.cursor().top()).max(0.0));
                     lang_row = code_language_row(
@@ -4952,9 +5170,8 @@ mod tests {
                 blanks.iter().all(|height| (*height - blanks[0]).abs() < 0.01),
                 "consecutive blank lines keep one height: {blanks:?}"
             );
-            // Live rendering has no gutter to line up with and keeps the
-            // compact paragraph gap.
-            assert!(live_heights[1..4].iter().all(|height| (*height - 7.0).abs() < 0.01));
+            // Live blank rows must fit their caret before editing begins.
+            assert!(live_heights[1..4].iter().all(|height| *height >= body * BODY_LINE_HEIGHT - 1.0));
         }
     }
 
@@ -5538,7 +5755,7 @@ mod tests {
         draw(&ctx, &mut app, vec![]);
         let output = draw(&ctx, &mut app, vec![]);
         let after = find_text_where(&output, |text, _| {
-            text.starts_with("```rust\nfn main()")
+            text.starts_with("fn main()")
         })
         .unwrap()
         .0
@@ -5547,6 +5764,93 @@ mod tests {
             (before - after).abs() < 2.0,
             "entering code edit must not move the code: rendered {before}, editing {after}"
         );
+    }
+
+    #[test]
+    fn code_body_adapter_preserves_envelopes_unicode_crlf_and_blank_lines() {
+        for raw in [
+            "```bash\ncodesign -f -s - /Applications/IDA\\ Professional\\ 9.0.app/Contents/MacOS/libida32.dylib\n```",
+            "  ~~~~rust  \r\n你好🙂\r\nsecond\r\n\r\n  ~~~~  \r\n",
+            "```\n\n```\n",
+        ] {
+            let body = CodeBodyEdit::new(raw);
+            let mut committed = raw.to_owned();
+            body.commit(&mut committed, &body.text);
+            assert_eq!(committed, raw, "no-op must preserve the exact source");
+            let edited = format!("{}\n新🙂", body.text);
+            body.commit(&mut committed, &edited);
+            let expected_body = if body.crlf { edited.replace('\n', "\r\n") } else { edited.clone() };
+            assert_eq!(committed, format!("{}{}{}", &raw[..body.range.start], expected_body, &raw[body.range.end..]));
+            let undo = CodeBodyEdit::new(&committed);
+            undo.commit(&mut committed, &body.text);
+            assert_eq!(committed, raw);
+            for cursor in 0..=body.text.chars().count() {
+                let byte = body.raw_byte(raw, cursor);
+                assert_eq!(body.body_cursor(raw, raw[..byte].chars().count()), cursor);
+            }
+        }
+    }
+
+    #[test]
+    fn code_body_edits_empty_blocks_and_crlf_boundaries() {
+        for (raw, edited, expected) in [
+            ("```\n```", "x", "```\nx\n```"),
+            ("```\n\n```", "x", "```\nx\n```"),
+            ("```\nx\n```", "", "```\n\n```"),
+            ("```\r\na\r\nb\r\n```", "ab", "```\r\nab\r\n```"),
+            ("```\r\na\r\nb\r\n```", "ax\nb", "```\r\nax\r\nb\r\n```"),
+        ] {
+            let body = CodeBodyEdit::new(raw);
+            let mut actual = raw.to_owned();
+            body.commit(&mut actual, edited);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn live_code_body_never_places_the_caret_on_hidden_fences() {
+        for source in [
+            "```bash\ncodesign -f -s - /Applications/IDA\\ Professional\\ 9.0.app/Contents/MacOS/libida32.dylib\n```",
+            "```rust\nlet x = 1;\n// 你好🙂\n```\n",
+            "~~~~rust  \r\n你好🙂\r\nsecond\r\n~~~~  \r\n",
+        ] {
+            let ctx = egui::Context::default();
+            crate::setup_fonts(&ctx);
+            let mut app = markdown_app();
+            let file = app.active_mut().unwrap();
+            file.draft_text = Some(source.into());
+            file.sync_draft();
+            file.markdown_mode = Mode::Live;
+            for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+            let id = app.active_id.unwrap();
+            let block = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_block", id, 0usize)))).unwrap();
+            click(&ctx, &mut app, block.center());
+            for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+            let body = CodeBodyEdit::new(source);
+            let job_text = ctx.data(|d| d.get_temp::<String>(egui::Id::new(("markdown_edit_job_text", id)))).unwrap();
+            assert_eq!(job_text, body.text, "TextEdit must contain only real visible body characters");
+            let edit_id = egui::Id::new(("markdown_edit", id, 0usize));
+            let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_edit_rect", id)))).unwrap();
+            click(&ctx, &mut app, rect.right_bottom() - egui::vec2(1.0, 0.1));
+            draw(&ctx, &mut app, vec![]);
+            let cursor = egui::TextEdit::load_state(&ctx, edit_id).unwrap().cursor.char_range().unwrap().primary.index;
+            assert_eq!(cursor, body.text.chars().count(), "bottom-right click must end on the last body row, not a tiny closing-fence row");
+            // Synthetic clicks share egui's default timestamp and can be
+            // interpreted as a double-click word selection. Collapse it before typing.
+            let mut state = egui::TextEdit::load_state(&ctx, edit_id).unwrap();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(cursor))));
+            state.store(&ctx, edit_id);
+            draw(&ctx, &mut app, vec![egui::Event::Text("追加🙂".into())]);
+            let mut expected = source.to_owned();
+            body.commit(&mut expected, &format!("{}追加🙂", body.text));
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(expected.as_str()));
+            draw(&ctx, &mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+            let mut entered = source.to_owned();
+            body.commit(&mut entered, &format!("{}追加🙂\n", body.text));
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(entered.as_str()));
+            let job = code_body_edit_job(&body.text, "bash", 15.0, 480.0, &crate::DARK);
+            assert!(job.sections.iter().all(|s| s.format.font_id.size >= 9.0 && s.format.color != Color32::TRANSPARENT));
+        }
     }
 
     #[test]
@@ -5608,67 +5912,255 @@ mod tests {
     }
 
     #[test]
+    fn list_marker_and_text_keep_the_same_vertical_position_when_editing() {
+        for size in [12.5, 16.0, 22.0, 28.5] {
+            for source in ["1. first item", "12. first item", "- first item", "1. first item\n   continued line"] {
+                let ctx = egui::Context::default();
+                crate::setup_fonts(&ctx);
+                let mut app = markdown_app();
+                let file = app.active_mut().unwrap();
+                file.draft_text = Some(source.into()); file.sync_draft();
+                file.markdown_mode = Mode::Live; file.editor_state.font_size = size;
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let before = draw(&ctx, &mut app, vec![]);
+                let marker = if source.starts_with("12.") { "12." } else if source.starts_with('-') { "•" } else { "1." };
+                let mark_before = find_text_where(&before, |text, _| text == marker).unwrap().0;
+                let body_before = find_text_where(&before, |text, _| text.starts_with("first item")).unwrap().0;
+                let id = app.active_id.unwrap();
+                let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_block", id, 0usize)))).unwrap();
+                click(&ctx, &mut app, rect.center());
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let after = draw(&ctx, &mut app, vec![]);
+                let mark_after = find_text_where(&after, |text, _| text == marker).unwrap().0;
+                let body_after = find_text_where(&after, |text, _| text.contains("first item")).unwrap().0;
+                assert!((mark_before.y - mark_after.y).abs() < 0.1, "{size} {source}: marker {mark_before:?} -> {mark_after:?}");
+                assert!((body_before.y - body_after.y).abs() < 0.1, "{size} {source}: body {body_before:?} -> {body_after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_heading_before_image_while_editing_another_block_keeps_heading_target() {
+        let source = "# First\n\nparagraph\n\n## 打开app-享受底层\n\n![image](missing-image.png)\n";
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        let mut app = markdown_app();
+        let file = app.active_mut().unwrap();
+        file.draft_text = Some(source.into()); file.sync_draft(); file.markdown_mode = Mode::Live;
+        let image = upload_image(&ctx, "test-heading-image", DecodedImage { rgba: vec![255; 600 * 800 * 4], size: [600, 800] });
+        app.active_mut().unwrap().markdown.images.insert("missing-image.png".into(), image);
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let id = app.active_id.unwrap();
+        let rect = |start| ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_block", id, start)))).unwrap();
+        let paragraph = source.find("paragraph").unwrap();
+        let heading = source.find("## 打开").unwrap();
+        click(&ctx, &mut app, rect(paragraph).center());
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        click(&ctx, &mut app, rect(heading).center());
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let editing = app.active().unwrap().markdown.editing.as_ref().unwrap();
+        assert_eq!(editing.range.start, heading);
+        assert!(editing.text.starts_with("## 打开app"));
+        let state = egui::TextEdit::load_state(&ctx, egui::Id::new(("markdown_edit", id, heading))).unwrap();
+        assert!(state.cursor.char_range().unwrap().primary.index <= editing.text.chars().count());
+        // A zero-length edit on the separator belongs only to that blank
+        // block, never also to the preceding heading's end boundary.
+        let separator = source.find("\n\n![image]").unwrap() + 1;
+        app.active_mut().unwrap().markdown.editing = Some(Editing {
+            range: separator..separator, text: String::new(), focus: true,
+            fresh: true, code: false, cursor: Some(0),
+        });
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        click(&ctx, &mut app, rect(heading).center());
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        assert_eq!(app.active().unwrap().markdown.editing.as_ref().unwrap().range.start, heading);
+    }
+
+    #[test]
+    fn editing_blank_line_keeps_following_content_in_place() {
+        for size in [10.0, 14.0, 22.0, 32.0] {
+            for source in ["before\n\nafter", "before\n   \nafter", "before\n\n\nafter"] {
+                let ctx = egui::Context::default();
+                crate::setup_fonts(&ctx);
+                let mut app = markdown_app();
+                let file = app.active_mut().unwrap();
+                file.draft_text = Some(source.into());
+                file.sync_draft();
+                file.markdown_mode = Mode::Live;
+                file.editor_state.font_size = size;
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let id = app.active_id.unwrap();
+                let blocks = parse(source);
+                let blank = blocks.iter().find(|b| b.kind == Kind::Blank).unwrap();
+                let after = blocks.iter().find(|b| &source[b.range.clone()] == "after").unwrap();
+                let rect = |start| ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_block", id, start)))).unwrap();
+                let before = rect(after.range.start);
+                click(&ctx, &mut app, rect(blank.range.start).center());
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                assert!(app.active().unwrap().markdown.editing.is_some());
+                let edited = rect(after.range.start);
+                assert!((edited.top() - before.top()).abs() < 0.5,
+                    "size={size} source={source:?}: before={before:?} edited={edited:?}");
+            }
+        }
+    }
+
+    #[test]
     fn editing_code_box_matches_the_rendered_height_for_one_and_many_lines() {
-        for text in [
-            "```rust\nfn main() {}\n```\n",
-            "```\nplain\n```\n",
-            "```rust\nfn main() {\n    let x = 1;\n}\n```\n",
-            "```python\nx = 1\n```\n",
-        ] {
-            let ctx = egui::Context::default();
-            crate::setup_fonts(&ctx);
-            let mut app = markdown_app();
-            app.active_mut().unwrap().draft_text = Some(text.to_owned());
-            app.active_mut().unwrap().sync_draft();
-            app.active_mut().unwrap().markdown_mode = Mode::Live;
-            for _ in 0..3 {
-                draw(&ctx, &mut app, vec![]);
+        for app_fonts in [false, true] {
+            for font_size in [12.5, 13.5, 16.0, 22.0, 28.5] {
+                for code in [
+                    "```rust\nfn main() {}\n```\n",
+                    "```\nplain\n```\n",
+                    "```rust\nfn main() {\n    let x = 1;\n}\n```\n",
+                    "```python\nx = 1\n```\n",
+                    "```\n\n```\n",
+                ] {
+                    let text = format!("{code}Following paragraph.\n");
+                    let ctx = egui::Context::default();
+                    if app_fonts {
+                        crate::setup_fonts(&ctx);
+                    }
+                    let mut app = markdown_app();
+                    app.active_mut().unwrap().draft_text = Some(text.to_owned());
+                    app.active_mut().unwrap().sync_draft();
+                    app.active_mut().unwrap().editor_state.font_size = font_size;
+                    app.active_mut().unwrap().markdown_mode = Mode::Live;
+                    for _ in 0..3 {
+                        draw(&ctx, &mut app, vec![]);
+                    }
+                    let file_id = app.active_id.unwrap();
+                    let source = app.active().unwrap().draft_text.clone().unwrap();
+                    let block = parse(&source)
+                        .into_iter()
+                        .find(|block| matches!(block.kind, Kind::Code(_)))
+                        .unwrap();
+                    let rendered = ctx
+                        .data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new((
+                                "markdown_code_box",
+                                file_id,
+                                block.range.start,
+                            )))
+                        })
+                        .unwrap();
+                    let block_rect = ctx
+                        .data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new((
+                                "markdown_block",
+                                file_id,
+                                block.range.start,
+                            )))
+                        })
+                        .unwrap();
+                    let following_at = parse(&source)
+                        .into_iter()
+                        .find(|block| matches!(block.kind, Kind::Paragraph))
+                        .unwrap()
+                        .range
+                        .start;
+                    let following_rect = || {
+                        ctx.data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new((
+                                "markdown_block",
+                                file_id,
+                                following_at,
+                            )))
+                        })
+                        .unwrap()
+                    };
+                    let following_before = following_rect();
+                    click(&ctx, &mut app, rendered.center());
+                    assert!(app.active().unwrap().markdown.editing.is_some());
+                    for frame in 0..3 {
+                        draw(&ctx, &mut app, vec![]);
+                        let following_after = following_rect();
+                        assert!(
+                            (following_before.top() - following_after.top()).abs() < 0.05,
+                            "font {font_size}, {code:?}, frame {frame}: following block moved: before {following_before:?}, after {following_after:?}; code block {block_rect:?}"
+                        );
+                    }
+                    let editing = ctx
+                        .data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new((
+                                "markdown_code_edit_box",
+                                file_id,
+                                block.range.start,
+                            )))
+                        })
+                        .unwrap();
+                    assert!(
+                        (editing.height() - rendered.height()).abs() < 0.05,
+                        "{text:?} edit box must keep the rendered height: rendered {rendered:?}, editing {editing:?}"
+                    );
+                    assert!(
+                        (editing.top() - rendered.top()).abs() < 0.05,
+                        "{text:?} edit box must start where the rendered box starts: rendered {rendered:?}, editing {editing:?}"
+                    );
+                }
             }
-            let file_id = app.active_id.unwrap();
-            let source = app.active().unwrap().draft_text.clone().unwrap();
-            let block = parse(&source)
-                .into_iter()
-                .find(|block| matches!(block.kind, Kind::Code(_)))
-                .unwrap();
-            let rendered = ctx
-                .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new((
-                        "markdown_code_box",
-                        file_id,
-                        block.range.start,
-                    )))
-                })
-                .unwrap();
-            let block_rect = ctx
-                .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new((
-                        "markdown_block",
-                        file_id,
-                        block.range.start,
-                    )))
-                })
-                .unwrap();
-            click(&ctx, &mut app, block_rect.center());
-            for _ in 0..3 {
-                draw(&ctx, &mut app, vec![]);
+        }
+    }
+
+    #[test]
+    fn editing_code_preserves_painted_glyph_positions() {
+        // Compare actual text shapes, baselines and glyph mesh vertices, not
+        // just the stable background box. Include the long bash command that
+        // exposed the single-row jump, and mixed-height multiline content.
+        for app_fonts in [false, true] {
+            for font_size in [10.0, 12.5, 16.0, 22.0, 28.5, 32.0] {
+                for body in [
+                    "codesign --force --sign - app",
+                    "codesign --force --deep --sign - /Applications/LiteText.app --preserve-metadata=identifier,entitlements,requirements,flags,runtime",
+                    "codesign --force --deep --sign - /Applications/LiteText.app\necho signed",
+                    "codesign --force --sign - app\n\necho 签名完成",
+                ] {
+                    let source = format!("```bash\n{body}\n```\nFollowing paragraph.\n");
+                    let ctx = egui::Context::default();
+                    if app_fonts { crate::setup_fonts(&ctx); }
+                    let mut app = markdown_app();
+                    let file = app.active_mut().unwrap();
+                    file.draft_text = Some(source);
+                    file.sync_draft();
+                    file.editor_state.font_size = font_size;
+                    file.markdown_mode = Mode::Live;
+                    for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                    let snapshot = |output: &egui::FullOutput| {
+                        let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == body => Some(text),
+                            _ => None,
+                        }).expect("code body must be painted as its own text shape");
+                        let baselines: Vec<_> = text.galley.rows.iter().flat_map(|row| {
+                            row.glyphs.iter().map(|glyph| (glyph.chr, text.pos + glyph.pos.to_vec2()))
+                        }).collect();
+                        let vertices: Vec<_> = text.galley.rows.iter().flat_map(|row| {
+                            row.visuals.mesh.vertices[row.visuals.glyph_vertex_range.clone()]
+                                .iter().map(|vertex| text.pos + vertex.pos.to_vec2())
+                        }).collect();
+                        (text.pos, baselines, vertices)
+                    };
+                    let rendered = snapshot(&draw(&ctx, &mut app, vec![]));
+                    let id = app.active_id.unwrap();
+                    let rect = ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new((
+                        "markdown_code_box", id, 0_usize,
+                    )))).unwrap();
+                    click(&ctx, &mut app, rect.left_top() + egui::vec2(20.0, 10.0));
+                    assert!(app.active().unwrap().markdown.editing.is_some());
+                    for frame in 0..3 {
+                        let edited = snapshot(&draw(&ctx, &mut app, vec![]));
+                        let context = format!("fonts={app_fonts}, size={font_size}, frame={frame}, body={body:?}, rendered origin={:?}, edited origin={:?}", rendered.0, edited.0);
+                        assert_eq!(rendered.1.len(), edited.1.len(), "{context}");
+                        for ((before_char, before), (after_char, after)) in rendered.1.iter().zip(&edited.1) {
+                            assert_eq!(before_char, after_char, "{context}");
+                            assert!(before.distance(*after) < 0.05, "glyph {before_char:?}: {before:?} -> {after:?}; {context}");
+                        }
+                        assert_eq!(rendered.2.len(), edited.2.len(), "{context}");
+                        for (before, after) in rendered.2.iter().zip(&edited.2) {
+                            assert!(before.distance(*after) < 0.05, "painted glyph vertex {before:?} -> {after:?}; {context}");
+                        }
+                    }
+                }
             }
-            let editing = ctx
-                .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new((
-                        "markdown_code_edit_box",
-                        file_id,
-                        block.range.start,
-                    )))
-                })
-                .unwrap();
-            assert!(
-                (editing.height() - rendered.height()).abs() < 1.0,
-                "{text:?} edit box must keep the rendered height: rendered {rendered:?}, editing {editing:?}"
-            );
-            assert!(
-                (editing.top() - rendered.top()).abs() < 1.0,
-                "{text:?} edit box must start where the rendered box starts: rendered {rendered:?}, editing {editing:?}"
-            );
         }
     }
 
@@ -5948,8 +6440,12 @@ mod tests {
         for _ in 0..3 {
             output = Some(draw_width(&ctx, &mut app, vec![], 1400.0));
         }
-        let (pos, size) = find_text_where(&output.unwrap(), |text, pos| {
-            text == "Section 18" && pos.x > 1100.0
+        let output = output.unwrap();
+        assert!(find_text_where(&output, |text, _| {
+            matches!(text, "目录" | "Outline" | "Table of contents")
+        }).is_none(), "the outline must contain only heading entries");
+        let (pos, size) = find_text_where(&output, |text, pos| {
+            text == "Section 12" && pos.x > 1100.0
         })
         .expect("wide live view must show the right-hand outline");
         for _ in 0..2 {
@@ -5973,6 +6469,116 @@ mod tests {
             "clicking an outline item must scroll to that heading: {offset}"
         );
         assert!(app.active().unwrap().markdown.toc_target.is_none());
+        let output = draw_width(&ctx, &mut app, vec![], 1400.0);
+        let active = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.pos.x > 1100.0
+                && text.galley.job.sections.iter().any(|section| {
+                    section.format.color == crate::DARK.accent
+                }) => Some(text.galley.text()),
+            _ => None,
+        });
+        assert_eq!(active, Some("Section 12"), "jumped-to heading must become highlighted");
+    }
+
+    #[test]
+    fn outline_tracks_wheel_scrolling_without_clicking() {
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        let mut app = markdown_app();
+        let source = (0..24)
+            .map(|index| format!("## Section {index}\n\n{}\n\n", format!("Paragraph {index}. ").repeat(40)))
+            .collect::<String>();
+        let headings: Vec<_> = parse(&source).into_iter()
+            .filter(|block| matches!(block.kind, Kind::Heading(_)))
+            .map(|block| block.range.start)
+            .collect();
+        app.active_mut().unwrap().draft_text = Some(source);
+        app.active_mut().unwrap().sync_draft();
+        app.active_mut().unwrap().markdown_mode = Mode::Live;
+        let highlighted = |output: &egui::FullOutput| {
+            output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.pos.x > 1100.0
+                    && text.galley.job.sections.iter().any(|section| {
+                        section.format.color == crate::DARK.accent
+                    }) => Some(text.galley.text().to_owned()),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        for _ in 0..3 {
+            draw_width(&ctx, &mut app, vec![], 1400.0);
+        }
+        let output = draw_width(&ctx, &mut app, vec![], 1400.0);
+        assert_eq!(highlighted(&output), vec!["Section 0"]);
+        let file_id = app.active_id.unwrap();
+        let viewport = ctx.data(|data| data.get_temp::<egui::Rect>(
+            egui::Id::new(("markdown_live_viewport", file_id)),
+        )).unwrap();
+        for delta in [-600.0, 600.0] {
+            draw_width(&ctx, &mut app, vec![
+                egui::Event::PointerMoved(viewport.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ], 1400.0);
+            for _ in 0..12 {
+                draw_width(&ctx, &mut app, vec![], 1400.0);
+            }
+            let output = draw_width(&ctx, &mut app, vec![], 1400.0);
+            let expected = ctx.data(|data| {
+                headings.iter().enumerate().rev().find_map(|(index, at)| {
+                    let rect = data.get_temp::<egui::Rect>(egui::Id::new((
+                        "markdown_block", file_id, *at,
+                    ))).unwrap();
+                    (rect.top() <= viewport.top() + viewport.height() * 0.2).then_some(index)
+                }).unwrap_or(0)
+            });
+            if delta < 0.0 {
+                assert!(expected > 0, "wheel scrolling must reach a later section");
+            } else {
+                assert_eq!(expected, 0, "scrolling back must restore the first section");
+            }
+            assert_eq!(highlighted(&output), vec![format!("Section {expected}")]);
+            assert!(app.active().unwrap().markdown.toc_target.is_none());
+        }
+    }
+
+    #[test]
+    fn outline_hysteresis_stabilizes_close_headings_and_clicks() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let mut state = OutlineState::default();
+        assert_eq!(state.update(&[(0, 0.0), (1, 110.0), (2, 140.0)], viewport, false, None, false), Some(0));
+        assert_eq!(state.update(&[(0, -20.0), (1, 95.0), (2, 125.0)], viewport, false, None, true), Some(0));
+        assert_eq!(state.update(&[(0, -30.0), (1, 85.0), (2, 115.0)], viewport, false, None, true), Some(1));
+        // Reversing a few points around the boundary keeps the current item.
+        assert_eq!(state.update(&[(0, -10.0), (1, 102.0), (2, 132.0)], viewport, false, None, true), Some(1));
+        assert_eq!(state.update(&[(0, 0.0), (1, 120.0), (2, 150.0)], viewport, false, None, true), Some(0));
+        state.clicked = Some(1);
+        assert_eq!(state.update(&[(0, -300.0), (1, -200.0), (2, 20.0)], viewport, true, None, false), Some(1));
+        assert_eq!(state.update(&[(0, -300.0), (1, -200.0), (2, 20.0)], viewport, true, None, true), Some(2));
+        assert_eq!(state.update(&[(0, -300.0), (1, -200.0), (2, 20.0)], viewport, true, Some(0), false), Some(0));
+    }
+
+    #[test]
+    fn outline_highlights_nested_headings_at_bottom_and_while_editing() {
+        let headings = [(0, -100.0), (100, 140.0), (200, 300.0), (300, 800.0)];
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0));
+        assert_eq!(outline_heading_for_view(&headings, viewport, false, None), Some(0));
+        assert_eq!(outline_heading_for_view(&headings, viewport, true, None), Some(200));
+        assert_eq!(outline_heading_for_view(&headings, viewport, true, Some(100)), Some(100));
+        assert_eq!(outline_heading_for_view(&[], viewport, false, None), None);
+    }
+
+    #[test]
+    fn outline_reading_line_keeps_the_current_section_between_headings() {
+        let headings = [(0, 30.0), (100, 300.0), (200, 700.0)];
+        assert_eq!(active_outline_heading(&[], 0.0), None);
+        assert_eq!(active_outline_heading(&headings, 0.0), Some(0));
+        assert_eq!(active_outline_heading(&headings, 200.0), Some(0));
+        assert_eq!(active_outline_heading(&headings, 282.0), Some(100));
+        assert_eq!(active_outline_heading(&headings, 600.0), Some(100));
+        assert_eq!(active_outline_heading(&headings, 900.0), Some(200));
     }
 
     #[test]
@@ -7466,6 +8072,73 @@ mod tests {
             "{text:?}"
         );
         assert!(text.ends_with("\n\nomega\n"), "{text:?}");
+    }
+
+    #[test]
+    fn mixed_heading_glyph_positions_match_live_preview_and_edit() {
+        // Compare actual laid-out glyphs (including the CJK fallback), not just
+        // TextShape origins: hidden syntax can move the visible run within it.
+        fn glyphs(output: &egui::FullOutput, source: &str) -> Vec<(char, egui::Pos2, f32)> {
+            let text = output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    (text.galley.text() == source).then_some(text)
+                } else {
+                    None
+                }
+            }).unwrap_or_else(|| panic!("missing heading {source:?}"));
+            text.galley.rows.iter().flat_map(|row| {
+                row.glyphs.iter().filter(|glyph| !glyph.chr.is_whitespace() && glyph.chr != '#')
+                    .map(|glyph| (glyph.chr, text.pos + glyph.pos.to_vec2(), glyph.advance_width))
+            }).collect()
+        }
+
+        for level in 1..=4 {
+            for (title, scale, font_size) in [
+                ("打开app-享受底层", 1.0, 13.5),
+                ("English中文 app测试", 1.0, 13.5),
+                ("打开app-享受底层", 2.0, 13.5),
+                ("打开app-享受底层", 1.0, 16.0),
+                ("打开app-享受底层", 2.0, 20.0),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                crate::setup_fonts(&ctx);
+                let mut app = markdown_app();
+                let source = format!("{} {title}", "#".repeat(level));
+                {
+                    let file = app.active_mut().unwrap();
+                    file.editor_state.font_size = font_size;
+                    file.draft_text = Some(format!("{source}\n\nbody\n"));
+                    file.sync_draft();
+                    file.markdown_mode = Mode::Live;
+                }
+                for _ in 0..2 { draw(&ctx, &mut app, vec![]); }
+                let output = draw(&ctx, &mut app, vec![]);
+                let before = glyphs(&output, title);
+                let block = parse(&source).remove(0);
+                let file_id = app.active_id.unwrap();
+                let rect = ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new((
+                    "markdown_block", file_id, block.range.start,
+                )))).unwrap();
+                let left = before.first().unwrap().1.x;
+                let right = before.last().unwrap().1.x + before.last().unwrap().2;
+                assert!(((left + right) * 0.5 - rect.center().x).abs() < 1.0,
+                    "H{level} glyphs must be centered: {left}..{right}, block {rect:?}");
+                // Exercise the actual Live transition as well as glyph layout.
+                click(&ctx, &mut app, rect.center());
+                draw(&ctx, &mut app, vec![]);
+                let output = draw(&ctx, &mut app, vec![]);
+                let after = glyphs(&output, &source);
+                assert_eq!(before.len(), after.len());
+                for (preview, edit) in before.iter().zip(&after) {
+                    assert_eq!(preview.0, edit.0);
+                    assert!((preview.2 - edit.2).abs() < 0.01,
+                        "H{level} {:?} advance jumped: {preview:?} -> {edit:?}", preview.0);
+                    assert!(preview.1.distance(edit.1) < 0.01,
+                        "H{level} {:?} position jumped: {preview:?} -> {edit:?}", preview.0);
+                }
+            }
+        }
     }
 
     #[test]
