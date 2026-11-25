@@ -26,11 +26,16 @@ const RUNNING_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     proxy_enabled: bool,
     proxy_url: String,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self { proxy_enabled: false, proxy_url: "http://127.0.0.1:1081".into() }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -67,6 +72,8 @@ pub(crate) struct State {
     status_loaded: bool,
     last_status_check: Option<Instant>,
     next_auto_check: Option<Instant>,
+    proxy_input: Option<String>,
+    proxy_input_error: Option<String>,
 }
 
 impl State {
@@ -118,6 +125,14 @@ fn is_newer(tag: &str, current: &str) -> Result<bool> {
     let latest = version(tag)?;
     Ok(current == "dev" || latest > version(current)?)
 }
+fn validate_proxy(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value.trim())?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || url.host_str().is_none() || url.path() != "" && url.path() != "/"
+        || url.query().is_some() || url.fragment().is_some()
+    { return Err("代理需填写 HTTP(S)/SOCKS5 代理地址，不是 GitHub 镜像前缀".into()); }
+    Ok(url)
+}
 fn client(settings: &Settings, timeout: Duration) -> Result<Client> {
     let mut builder = Client::builder()
         .no_proxy()
@@ -126,15 +141,7 @@ fn client(settings: &Settings, timeout: Duration) -> Result<Client> {
         .timeout(timeout)
         .user_agent("LiteText-updater");
     if settings.proxy_enabled {
-        let url = reqwest::Url::parse(settings.proxy_url.trim())?;
-        if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
-            || url.host_str().is_none()
-            || url.path() != "" && url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err("代理需填写 HTTP(S)/SOCKS5 代理地址，不是 GitHub 镜像前缀".into());
-        }
+        let url = validate_proxy(&settings.proxy_url)?;
         builder = builder.proxy(reqwest::Proxy::all(url)?);
     }
     Ok(builder.build()?)
@@ -1189,6 +1196,7 @@ impl LiteTextApp {
     pub(crate) fn update_settings_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let zh = self.lang == Lang::ZhCn;
         let busy = self.updater.receiver.is_some() || self.updater.prepared.is_some();
+        if self.updates.proxy_url.trim().is_empty() { self.updates.proxy_url = Settings::default().proxy_url; }
         ui.add_enabled_ui(!busy, |ui| {
             let proxy = ui.checkbox(
                 &mut self.updates.proxy_enabled,
@@ -1199,13 +1207,64 @@ impl LiteTextApp {
                 },
             );
             ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("update_proxy_checkbox_rect"), proxy.rect));
-            ui.add_enabled(
-                self.updates.proxy_enabled,
-                egui::TextEdit::singleline(&mut self.updates.proxy_url)
-                    .hint_text("http://127.0.0.1:7890 / socks5h://…")
-                    .desired_width(ui.available_width()),
-            );
+            ui.add_enabled_ui(self.updates.proxy_enabled, |ui| {
+                let input = self.updater.proxy_input.get_or_insert_with(|| {
+                    if self.updates.proxy_url.trim().is_empty() { Settings::default().proxy_url }
+                    else { self.updates.proxy_url.clone() }
+                });
+                let (control, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+                ui.painter().rect_filled(control, 6.0, pal.bg_elevated);
+                let response = ui.put(control.shrink2(egui::vec2(50.0, 2.0)),
+                    egui::TextEdit::singleline(input)
+                        .font(egui::FontId::proportional(13.0))
+                        .horizontal_align(egui::Align::Center).vertical_align(egui::Align::Center)
+                        .frame(false).margin(egui::Margin::ZERO)
+                        .hint_text("http://127.0.0.1:1081"));
+                let changed = input.trim() != self.updates.proxy_url.trim();
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("update_proxy_input_rect"), response.rect);
+                    d.insert_temp(egui::Id::new("update_proxy_control_rect"), control);
+                    d.remove::<egui::Rect>(egui::Id::new("update_proxy_cancel_rect"));
+                    d.remove::<egui::Rect>(egui::Id::new("update_proxy_confirm_rect"));
+                });
+                if changed {
+                    for (confirm, offset) in [(false, 36.0), (true, 14.0)] {
+                        let rect = egui::Rect::from_center_size(
+                            egui::pos2(control.right() - offset, control.center().y), egui::vec2(20.0, 22.0));
+                        let button = ui.interact(rect, egui::Id::new(("update_proxy_action", confirm)), egui::Sense::click())
+                            .on_hover_text(match (confirm, zh) {
+                                (true, true) => "确认修改", (false, true) => "取消修改",
+                                (true, false) => "Apply", (false, false) => "Cancel",
+                            }).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let color = if confirm { pal.accent } else if button.hovered() { pal.danger } else { pal.text_faint };
+                        if button.hovered() { ui.painter().rect_filled(rect.shrink(1.0), 4.0, color.gamma_multiply(0.12)); }
+                        let c = rect.center(); let stroke = egui::Stroke::new(1.5_f32, color);
+                        if confirm {
+                            ui.painter().line_segment([c + egui::vec2(-4.5, 0.0), c + egui::vec2(-1.0, 3.5)], stroke);
+                            ui.painter().line_segment([c + egui::vec2(-1.0, 3.5), c + egui::vec2(5.0, -3.5)], stroke);
+                        } else {
+                            ui.painter().line_segment([c - egui::vec2(3.5, 3.5), c + egui::vec2(3.5, 3.5)], stroke);
+                            ui.painter().line_segment([c + egui::vec2(-3.5, 3.5), c + egui::vec2(3.5, -3.5)], stroke);
+                        }
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(if confirm { "update_proxy_confirm_rect" } else { "update_proxy_cancel_rect" }), rect));
+                        if button.clicked() {
+                            if confirm {
+                                let candidate = Settings { proxy_enabled: true, proxy_url: input.trim().to_owned() };
+                                match validate_proxy(&candidate.proxy_url) {
+                                    Ok(_) => { self.updates.proxy_url = candidate.proxy_url; *input = self.updates.proxy_url.clone(); self.updater.proxy_input_error = None; }
+                                    Err(error) => self.updater.proxy_input_error = Some(error.to_string()),
+                                }
+                            } else {
+                                *input = self.updates.proxy_url.clone(); self.updater.proxy_input_error = None;
+                            }
+                        }
+                    }
+                } else { self.updater.proxy_input_error = None; }
+            });
         });
+        if let Some(error) = &self.updater.proxy_input_error {
+            ui.label(egui::RichText::new(error).small().color(pal.danger));
+        }
         ui.label(
             egui::RichText::new(if zh {
                 "仅用于检查与下载更新；关闭后直连 GitHub。"
@@ -1393,6 +1452,35 @@ mod tests {
         app.schedule_update_check(&ctx);
         assert!(app.updater.next_auto_check.is_none());
         assert!(app.updater.receiver.is_some());
+    }
+
+    #[test]
+    fn proxy_input_uses_confirm_cancel_without_applying_pending_edits() {
+        let ctx = egui::Context::default();
+        let mut app = LiteTextApp::default(); app.updates.proxy_enabled = true;
+        let draw = |app: &mut LiteTextApp, events| {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0,500.0))),
+                events, ..Default::default()
+            }, |ctx| { egui::CentralPanel::default().show(ctx, |ui| app.update_settings_ui(ui, &crate::DARK)); });
+        };
+        draw(&mut app, vec![]);
+        assert_eq!(app.updates.proxy_url, "http://127.0.0.1:1081");
+        assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("update_proxy_confirm_rect"))).is_none());
+        for (cancel, input, expected) in [
+            (true, "http://localhost:9999", "http://127.0.0.1:1081"),
+            (false, "http://localhost:7890", "http://localhost:7890"),
+            (false, "not a proxy", "http://localhost:7890"),
+        ] {
+            app.updater.proxy_input = Some(input.into()); draw(&mut app, vec![]);
+            assert_ne!(app.updates.proxy_url, input);
+            let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(if cancel { "update_proxy_cancel_rect" } else { "update_proxy_confirm_rect" }))).unwrap();
+            for pressed in [true, false] { draw(&mut app, vec![egui::Event::PointerMoved(rect.center()), egui::Event::PointerButton {
+                pos: rect.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+            }]); }
+            assert_eq!(app.updates.proxy_url, expected);
+        }
+        assert!(app.updater.proxy_input_error.is_some());
     }
 
     #[test]

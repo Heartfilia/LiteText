@@ -1,4 +1,4 @@
-//! Whole-document UTF-8 conversions: active workspace only, one undo entry.
+//! Selection-or-document UTF-8 conversions: active workspace only, one undo entry.
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::Digest;
 
@@ -101,11 +101,16 @@ impl crate::LiteTextApp {
         let Some(text) = file.draft_text.as_deref() else {
             return;
         };
-        match convert(text, action) {
-            Ok(result) if result != text => {
-                let len = text.len();
-                crate::line_commands::commit_edits(file, ctx, vec![(0..len, result)], None);
-                if action == Action::UrlParse {
+        let range = match crate::web_tools::tool_input_range(file, text) {
+            Ok(range) => range,
+            Err(error) => { self.plugin_error = Some(error); return; }
+        };
+        let whole_document = range == (0..text.len());
+        let input = &text[range.clone()];
+        match convert(input, action) {
+            Ok(result) if result != input => {
+                crate::line_commands::commit_edits(file, ctx, vec![(range, result)], None);
+                if action == Action::UrlParse && whole_document {
                     file.language_override = Some("JSON".into());
                     file.editor_state.folds.enabled = true;
                     file.editor_state.folds.invalidate();
@@ -222,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_conversion_is_below_whitespace_and_click_applies_to_active_text() {
+    fn plugin_conversion_is_below_curl_and_click_applies_to_active_text() {
         use eframe::egui;
         for lang in [crate::Lang::ZhCn, crate::Lang::En] {
             let ctx = egui::Context::default();
@@ -263,6 +268,12 @@ mod tests {
             };
             draw(&mut app, vec![]);
             let output = draw(&mut app, vec![]);
+            let plugins = find(&output, &format!("‹  {}", crate::tr(lang).plugins));
+            for _ in 0..3 {
+                draw(&mut app, vec![egui::Event::PointerMoved(plugins.center())]);
+            }
+            assert!(app.menu_plugins_open);
+            let output = draw(&mut app, vec![]);
             let entry = find(
                 &output,
                 if lang == crate::Lang::ZhCn {
@@ -279,12 +290,20 @@ mod tests {
                     "‹  Whitespace"
                 },
             );
-            assert!(entry.top() > whitespace.bottom());
+            let curl = find(
+                &output,
+                if lang == crate::Lang::ZhCn { "curl解析  ›" } else { "Parse cURL  ›" },
+            );
+            assert!(entry.top() > curl.bottom());
+            assert!(whitespace.top() > entry.bottom());
             for _ in 0..3 {
                 draw(&mut app, vec![egui::Event::PointerMoved(entry.center())]);
             }
-            assert!(app.menu_conversion_open && !app.menu_whitespace_open);
+            assert!(app.menu_plugins_open && app.menu_conversion_open && !app.menu_whitespace_open);
             let output = draw(&mut app, vec![]);
+            let plugin = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_plugins_submenu_rect"))).unwrap();
+            let child = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_conversion_submenu_rect"))).unwrap();
+            assert!(child.right() <= plugin.left(), "{child:?} / {plugin:?}");
             for action in ACTIONS {
                 find(&output, action.label(lang == crate::Lang::ZhCn));
             }

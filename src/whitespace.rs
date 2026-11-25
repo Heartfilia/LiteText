@@ -531,6 +531,12 @@ mod tests {
                     })
                     .unwrap()
             };
+            let plugins = find(&output, &format!("‹  {}", crate::tr(lang).plugins));
+            for _ in 0..3 {
+                run_menu(&mut app, vec![egui::Event::PointerMoved(plugins.center())]);
+            }
+            assert!(app.menu_plugins_open);
+            let output = run_menu(&mut app, vec![]);
             let entry = find(
                 &output,
                 if lang == Lang::ZhCn {
@@ -539,13 +545,19 @@ mod tests {
                     "‹  Whitespace"
                 },
             );
-            let plugins = find(&output, &format!("‹  {}", crate::tr(lang).plugins));
-            assert!(entry.top() > plugins.bottom());
+            let conversion = find(
+                &output,
+                if lang == Lang::ZhCn { "‹  文本转换" } else { "‹  Text conversion" },
+            );
+            assert!(entry.top() > conversion.bottom());
             for _ in 0..3 {
                 run_menu(&mut app, vec![egui::Event::PointerMoved(entry.center())]);
             }
-            assert!(app.menu_whitespace_open && !app.menu_plugins_open);
+            assert!(app.menu_plugins_open && app.menu_whitespace_open && !app.menu_conversion_open);
             let output = run_menu(&mut app, vec![]);
+            let plugin = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_plugins_submenu_rect"))).unwrap();
+            let child = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_whitespace_submenu_rect"))).unwrap();
+            assert!(child.right() <= plugin.left(), "{child:?} / {plugin:?}");
             for action in ACTIONS {
                 find(&output, action.label(lang == Lang::ZhCn));
             }

@@ -688,8 +688,12 @@ impl LiteTextApp {
         let Some(text) = file.draft_text.as_deref() else {
             return;
         };
-        match convert(text, target) {
-            Ok(out) => self.replace_tool_result(ctx, out, target.language()),
+        let range = match crate::web_tools::tool_input_range(file, text) {
+            Ok(range) => range,
+            Err(error) => { self.plugin_error = Some(error); return; }
+        };
+        match convert(&text[range.clone()], target) {
+            Ok(out) => self.replace_tool_result(ctx, out, target.language(), Some(range)),
             Err(error) => self.plugin_error = Some(format!("cURL → {}: {error}", target.name())),
         }
     }

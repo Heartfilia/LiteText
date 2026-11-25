@@ -49,10 +49,19 @@ fn vertical_toolbar_moves_to_left_and_all_submenus_open_right() {
         for (index, name) in ["recent", "plugins", "whitespace", "conversion"].into_iter().enumerate() {
             let base = index as f64 * 30.0;
             app.show_menu = true;
+            app.active_mut().unwrap().draft_text = Some("  abc  ".into());
             for frame in 0..3 { draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 10.0 + frame as f64, vec![], &DARK); }
+            let nested = matches!(name, "whitespace" | "conversion");
+            if nested {
+                let plugins = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_plugins_row_rect"))).unwrap();
+                for frame in 0..3 { draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 14.0 + frame as f64, vec![egui::Event::PointerMoved(plugins.center())], &DARK); }
+                assert!(app.menu_plugins_open);
+            }
             let row = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(format!("app_{name}_row_rect")))).unwrap();
             for frame in 0..3 { draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 20.0 + frame as f64, vec![egui::Event::PointerMoved(row.center())], &DARK); }
-            let parent = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("app_menu_rect"))).unwrap();
+            let parent_id = if nested { "app_plugins_submenu_rect" } else { "app_menu_rect" };
+            let parent = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(parent_id))).unwrap();
+            if nested { assert!(app.menu_plugins_open, "{name} must keep its plugin parent open"); }
             let sub = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(format!("app_{name}_submenu_rect")))).unwrap();
             if vertical { assert!(sub.left() >= parent.right(), "{name}: {sub:?} / {parent:?}"); }
             else { assert!(sub.right() <= parent.left(), "{name}: {sub:?} / {parent:?}"); }
@@ -62,6 +71,30 @@ fn vertical_toolbar_moves_to_left_and_all_submenus_open_right() {
             assert!(bridge.contains(point));
             draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 24.0, vec![egui::Event::PointerMoved(point)], &DARK);
             assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(format!("app_{name}_submenu_rect")))).is_some());
+            if nested {
+                assert!(app.menu_plugins_open, "{name} bridge must keep its plugin parent open");
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0,720.0))),
+                    time: Some(base + 24.1), ..Default::default()
+                }, |ctx| { app.top_bar(ctx, &DARK); });
+                let label = if name == "conversion" {
+                    crate::text_conversion::Action::Md5.label(app.lang == crate::Lang::ZhCn)
+                } else {
+                    crate::whitespace::Action::TrimBoth.label(app.lang == crate::Lang::ZhCn)
+                };
+                let action = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label =>
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size())),
+                    _ => None,
+                }).unwrap();
+                for frame in 0..3 { draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 24.2 + frame as f64 * 0.1, vec![egui::Event::PointerMoved(action.center())], &DARK); }
+                assert!(app.show_menu && app.menu_plugins_open, "{name} action hover must keep menus open");
+                click(&ctx, &mut app, action.center(), base + 24.6, egui::PointerButton::Primary);
+                assert!(!app.show_menu, "{name} action click must close menus");
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(if name == "conversion" {
+                    "a064c2f1646e31d3c8e7ab5ead8864f5"
+                } else { "abc" }));
+            }
             app.show_menu = false;
             draw(&ctx, &mut app, egui::vec2(1080.0,720.0), base + 25.0, vec![], &DARK);
         }

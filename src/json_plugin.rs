@@ -1,5 +1,7 @@
 //! Lossless JSON whitespace formatting and display-only, logical-line folding.
-use crate::{Lang, LiteTextApp, ViewMode, text_tools};
+use crate::{Lang, LiteTextApp, ViewMode};
+#[cfg(test)]
+use crate::text_tools;
 use eframe::egui;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -80,26 +82,31 @@ pub(crate) fn format_json(input: &str) -> Result<String, serde_json::Error> {
 
 impl LiteTextApp {
     pub(crate) fn format_active_json(&mut self, ctx: &egui::Context) {
+        if self.shortcuts_blocked() { return; }
         let zh = self.lang == Lang::ZhCn;
         let result = self.active_mut().ok_or_else(|| if zh {
             "请先打开一个文本工作区".to_owned()
         } else { "Open a text workspace first".to_owned() }).and_then(|file| {
-            if file.view != ViewMode::Text || file.draft_text.is_none() {
+            if file.is_binary || file.view != ViewMode::Text || file.draft_text.is_none() {
                 return Err(if zh { "当前工作区不是可编辑的文本，请切换到文本视图" } else { "Switch to an editable text workspace" }.to_owned());
             }
             let text = file.draft_text.as_ref().unwrap();
-            let formatted = format_json(text).map_err(|error| if zh {
+            let range = crate::web_tools::tool_input_range(file, text)?;
+            let whole_document = range == (0..text.len());
+            let input = &text[range.clone()];
+            let formatted = format_json(input).map_err(|error| if zh {
                 format!("JSON 格式化失败：第 {} 行，第 {} 列\n{error}\n原内容未更改。", error.line(), error.column())
             } else { format!("JSON formatting failed at line {}, column {}\n{error}\nThe original content was not changed.", error.line(), error.column()) })?;
-            if &formatted != text {
-                let length = text.len();
-                text_tools::replace_range_with_cursor(file, ctx, 0..length, formatted, Some(egui::text::CCursorRange::default()));
+            if formatted != input {
+                crate::line_commands::commit_edits(file, ctx, vec![(range, formatted)], None);
             }
-            file.editor_state.selection = None;
-            file.editor_state.pending_selection = Some(0..0);
-            file.editor_state.folds.enabled = true;
-            file.language_override = Some("JSON".to_owned());
-            file.editor_state.folds.invalidate();
+            if whole_document {
+                file.editor_state.selection = None;
+                file.editor_state.pending_selection = Some(0..0);
+                file.editor_state.folds.enabled = true;
+                file.language_override = Some("JSON".to_owned());
+                file.editor_state.folds.invalidate();
+            }
             Ok(file.id)
         });
         match result {

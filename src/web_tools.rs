@@ -390,6 +390,21 @@ fn check_html_depth(input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve only document-global selections. Live/Rendered Markdown cursors belong
+/// to internal block editors and must never be interpreted as a document range.
+pub(crate) fn tool_input_range(
+    file: &crate::LoadedFile,
+    text: &str,
+) -> Result<std::ops::Range<usize>, String> {
+    if crate::markdown::is_markdown(file)
+        && file.markdown_mode == crate::markdown::Mode::Live
+    {
+        return Err("Markdown Live/Rendered 暂不支持选区工具；请切换到 Source/Split / Switch to Source/Split to use text tools".into());
+    }
+    let range = crate::line_commands::selected_bytes(file, text);
+    if range.is_empty() { Ok(0..text.len()) } else { Ok(range) }
+}
+
 impl crate::LiteTextApp {
     pub(crate) fn apply_web_tool(&mut self, ctx: &eframe::egui::Context, action: Action) {
         if self.shortcuts_blocked() {
@@ -404,7 +419,11 @@ impl crate::LiteTextApp {
         let Some(text) = file.draft_text.as_deref() else {
             return;
         };
-        match convert(text, action) {
+        let range = match tool_input_range(file, text) {
+            Ok(range) => range,
+            Err(error) => { self.plugin_error = Some(error); return; }
+        };
+        match convert(&text[range.clone()], action) {
             Ok(result) => self.replace_tool_result(
                 ctx,
                 result,
@@ -413,6 +432,7 @@ impl crate::LiteTextApp {
                 } else {
                     "JSON"
                 },
+                Some(range),
             ),
             Err(error) => {
                 self.plugin_error = Some(format!(
@@ -428,6 +448,7 @@ impl crate::LiteTextApp {
         ctx: &eframe::egui::Context,
         result: String,
         language: &str,
+        range: Option<std::ops::Range<usize>>,
     ) {
         let Some(file) = self.active_mut() else {
             return;
@@ -435,13 +456,17 @@ impl crate::LiteTextApp {
         let Some(text) = file.draft_text.as_deref() else {
             return;
         };
-        if text != result {
-            let len = text.len();
-            crate::line_commands::commit_edits(file, ctx, vec![(0..len, result)], None);
+        let range = range.unwrap_or(0..text.len());
+        let Some(input) = text.get(range.clone()) else { return; };
+        let whole_document = range == (0..text.len());
+        if input != result {
+            crate::line_commands::commit_edits(file, ctx, vec![(range, result)], None);
         }
-        file.language_override = Some(language.into());
-        file.editor_state.folds.enabled = language == "JSON";
-        file.editor_state.folds.invalidate();
+        if whole_document {
+            file.language_override = Some(language.into());
+            file.editor_state.folds.enabled = language == "JSON";
+            file.editor_state.folds.invalidate();
+        }
         self.focus_editor = self.active_id;
         self.plugin_error = None;
         ctx.request_repaint();
@@ -454,6 +479,115 @@ mod tests {
     fn value(result: Result<String, String>) -> Value {
         serde_json::from_str(&result.unwrap()).unwrap()
     }
+    // All adapters share the same byte-range contract, including native and
+    // large-editor undo paths. Surrounding bytes intentionally include CRLF,
+    // Chinese and an emoji, so character/byte offsets cannot be interchanged.
+    #[test]
+    fn selection_tools_preserve_outside_language_and_single_undo() {
+        use eframe::egui;
+        let mut cases: Vec<(String, String, usize)> = vec![
+            ("{\"中文\":[1,2]}".into(), "{\n  \"中文\": [\n    1,\n    2\n  ]\n}".into(), 0),
+        ];
+        for action in [Action::Html, Action::Header, Action::Cookie] {
+            let input = match action { Action::Html => "<div><p>中文</p></div>", Action::Header => "X-Test: 中文", Action::Cookie => "a=中文" };
+            cases.push((input.into(), convert(input, action).unwrap(), cases.len()));
+        }
+        for action in crate::text_conversion::ACTIONS {
+            let input = match action {
+                crate::text_conversion::Action::Base64Decode => "5Lit5paH",
+                crate::text_conversion::Action::UrlDecode => "%E4%B8%AD%E6%96%87",
+                crate::text_conversion::Action::UrlParse => "https://example.com/?q=中文",
+                _ => "中文🙂",
+            };
+            cases.push((input.into(), crate::text_conversion::convert(input, action).unwrap(), cases.len()));
+        }
+        for target in crate::curl_plugin::TARGETS {
+            let input = "curl 'https://example.com/' --data-raw '中文'";
+            cases.push((input.into(), crate::curl_plugin::convert(input, target).unwrap(), cases.len()));
+        }
+        for large in [false, true] {
+            for (input, expected, operation) in &cases {
+                let ctx = egui::Context::default();
+                let prefix = format!("前🙂\r\n{}", "x".repeat(if large { 300_000 } else { 0 }));
+                let suffix = "\r\n后🙂 untouched";
+                let original = format!("{prefix}{input}{suffix}");
+                let mut app = crate::LiteTextApp::default();
+                app.new_document();
+                app.active_mut().unwrap().draft_text = Some(original.clone());
+                app.active_mut().unwrap().language_override = Some("Python".into());
+                app.active_mut().unwrap().editor_state.folds.enabled = false;
+                let draw = |app: &mut crate::LiteTextApp, events| {
+                    let _ = ctx.run(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), events, ..Default::default()
+                    }, |ctx| { egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, true, crate::Lang::En);
+                    }); });
+                };
+                draw(&mut app, vec![]);
+                draw(&mut app, vec![]);
+                let start = prefix.chars().count();
+                app.active_mut().unwrap().editor_state.cursor = Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(start + input.chars().count()), egui::text::CCursor::new(start)));
+                match *operation {
+                    0 => app.format_active_json(&ctx),
+                    1..=3 => app.apply_web_tool(&ctx, [Action::Html, Action::Header, Action::Cookie][operation - 1]),
+                    4..=9 => app.convert_active_text(&ctx, crate::text_conversion::ACTIONS[operation - 4]),
+                    _ => app.convert_active_curl(&ctx, crate::curl_plugin::TARGETS[operation - 10]),
+                }
+                assert!(app.plugin_error.is_none(), "op={operation} {:?}", app.plugin_error);
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(format!("{prefix}{expected}{suffix}").as_str()), "op={operation} large={large}");
+                assert_eq!(app.active().unwrap().language_override.as_deref(), Some("Python"));
+                assert!(!app.active().unwrap().editor_state.folds.enabled);
+                draw(&mut app, vec![]);
+                draw(&mut app, vec![egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }]);
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(original.as_str()), "undo op={operation} large={large}");
+            }
+        }
+    }
+
+    #[test]
+    fn selection_tools_errors_and_markdown_modes_are_safe() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        for mode in [crate::markdown::Mode::Source, crate::markdown::Mode::Split, crate::markdown::Mode::Live] {
+            for operation in 0..4 {
+                let mut app = crate::LiteTextApp::default();
+                app.new_document();
+                let file = app.active_mut().unwrap();
+                file.draft_text = Some("前%GG后".into());
+                file.language_override = Some("Markdown".into());
+                file.markdown_mode = mode;
+                file.editor_state.cursor = Some(egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(4)));
+                match operation {
+                    0 => app.format_active_json(&ctx),
+                    1 => app.apply_web_tool(&ctx, Action::Header),
+                    2 => app.convert_active_text(&ctx, crate::text_conversion::Action::UrlDecode),
+                    _ => app.convert_active_curl(&ctx, crate::curl_plugin::Target::Python),
+                }
+                assert!(app.plugin_error.is_some());
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("前%GG后"));
+                assert_eq!(app.active().unwrap().language_override.as_deref(), Some("Markdown"));
+            }
+            let mut app = crate::LiteTextApp::default();
+            app.new_document();
+            let file = app.active_mut().unwrap();
+            file.draft_text = Some("前中文后".into());
+            file.language_override = Some("Markdown".into());
+            file.markdown_mode = mode;
+            file.editor_state.cursor = Some(egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(3)));
+            app.convert_active_text(&ctx, crate::text_conversion::Action::Base64Encode);
+            assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(if mode == crate::markdown::Mode::Live { "前中文后" } else { "前5Lit5paH后" }));
+            assert_eq!(app.plugin_error.is_some(), mode == crate::markdown::Mode::Live);
+        }
+        // A collapsed caret is not a non-empty selection, even away from BOF.
+        let mut app = crate::LiteTextApp::default();
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("中文".into());
+        app.active_mut().unwrap().editor_state.cursor = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(1)));
+        app.convert_active_text(&ctx, crate::text_conversion::Action::Base64Encode);
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("5Lit5paH"));
+    }
+
     #[test]
     fn header_colons_pseudo_headers_duplicates_and_invalid_lines() {
         let v = value(headers(

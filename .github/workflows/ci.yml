@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# PR refs are distinct from branch refs (including fork PRs). Keep CI separate
+# from release jobs and cancel only older runs for the same event/ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            os: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: ubuntu-22.04
+            os: linux
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+          - runner: windows-latest
+            os: windows
+            arch: x64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Match release.yml's stable channel so CI checks the release toolchain.
+      # A pinned version is more reproducible but needs coordinated upgrades.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.target }}
+          # PRs may restore caches, but only trusted main pushes save them.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
+      - name: Python unit tests
+        timeout-minutes: 5
+        run: python -m unittest discover -s scripts -p "test_*.py"
+      - name: Compile tests
+        timeout-minutes: 20
+        run: cargo test --locked --target ${{ matrix.target }} --no-run
+      - name: Run tests
+        timeout-minutes: 10
+        run: cargo test --locked --target ${{ matrix.target }} -- --test-threads=2 --nocapture
+      - name: Strict Clippy
+        timeout-minutes: 20
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings

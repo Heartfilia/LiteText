@@ -16,6 +16,7 @@ type RestoredSession = io::Result<Restored>;
 
 /// Session tabs plus the untitled drafts mirrored in the scratch directory.
 pub(crate) struct Restored {
+    pub(crate) leases: std::collections::HashMap<PathBuf, std::fs::File>,
     pub(crate) files: Vec<LoadedFile>,
     pub(crate) active: Option<u64>,
     pub(crate) scratch_active: Option<String>,
@@ -244,19 +245,19 @@ impl LiteTextApp {
                 let _t = crate::timing::phase("restore.read_json");
                 recovery::load(&path)
             };
-            let result = loaded.map(|session| {
-                let (active, scratch_active, scratch_meta, mut files) = match session {
+            let result = loaded.and_then(|session| {
+                let (active, scratch_active, scratch_meta, mut files, leases) = match session {
                     Some(session) => {
                         let active = session.active_id;
                         let scratch_active = session.scratch_active().map(str::to_owned);
                         let scratch_meta = session.scratch_meta();
                         let files = {
                             let _t = crate::timing::phase("restore.build_files");
-                            session.restore()
+                            session.restore_claimed()?
                         };
-                        (active, scratch_active, scratch_meta, files)
+                        (active, scratch_active, scratch_meta, files.0, files.1)
                     }
-                    None => (None, None, Vec::new(), Vec::new()),
+                    None => (None, None, Vec::new(), Vec::new(), Default::default()),
                 };
                 {
                     let _t = crate::timing::phase("restore.index_files");
@@ -284,7 +285,7 @@ impl LiteTextApp {
                     }
                 }
                 let drafts = crate::scratch::scan(scratch_root.as_deref());
-                Restored { files, active, scratch_active, scratch_meta, drafts }
+                Ok(Restored { files, active, scratch_active, scratch_meta, drafts, leases })
             });
             let _ = sender.send(result);
         });
@@ -294,6 +295,7 @@ impl LiteTextApp {
     pub(crate) fn apply_restored(&mut self, result: RestoredSession) {
         match result {
             Ok(restored) => {
+                self.scratch.leases = restored.leases;
                 self.files = restored.files;
                 self.next_file_id = self.files.iter().map(|file| file.id).max().unwrap_or(0) + 1;
                 self.add_scratch_drafts(restored.drafts);
@@ -530,6 +532,7 @@ impl LiteTextApp {
                         )
                     }) {
                         Ok(()) => {
+                            self.scratch_snapshot_committed();
                             self.recovery_key = Some(job.key);
                             self.recovery_stamp = stamp(&job.path);
                             self.remember_recovered_versions();

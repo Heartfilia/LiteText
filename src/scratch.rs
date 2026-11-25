@@ -30,6 +30,8 @@ const DEBOUNCE: Duration = Duration::from_millis(600);
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) leases: HashMap<PathBuf, std::fs::File>,
+    pending_retire: Vec<PathBuf>,
     last_flush: Option<Instant>,
     /// Content versions already present in each mirror.
     written: HashMap<u64, (u64, u64)>,
@@ -41,6 +43,7 @@ pub(crate) struct State {
 
 /// One file found in the scratch directory.
 pub(crate) struct Draft {
+    lease: std::fs::File,
     pub path: PathBuf,
     pub name: String,
     pub text: String,
@@ -69,6 +72,53 @@ fn read_draft_meta(root: &Path) -> HashMap<String, DraftMeta> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// Sidecars are never removed: unlinking a locked inode would split ownership.
+pub(crate) fn claim(path: &Path) -> io::Result<std::fs::File> {
+    use fs2::FileExt;
+    let path = crate::linkage::resolved(path);
+    let parent = path.parent().ok_or_else(|| io::Error::other("Mirror has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let name = path.file_name().ok_or_else(|| io::Error::other("Mirror has no name"))?;
+    let mut sidecar = std::ffi::OsString::from(".");
+    sidecar.push(name);
+    sidecar.push(".litetext-lock");
+    let file = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(parent.join(sidecar))?;
+    file.try_lock_exclusive()?;
+    Ok(file)
+}
+
+fn create_mirror(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| io::Error::other("Mirror has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist_noclobber(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn root_lock(root: &Path) -> io::Result<std::fs::File> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(root)?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(root.join(".litetext-scratch.lock"))?;
+    // Bound contention waits: a subprocess can briefly inherit a root lock
+    // during spawn, while another window may be committing metadata. Never
+    // enter an unbounded blocking lock on the GUI thread.
+    let deadline = Instant::now() + Duration::from_millis(25);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                && Instant::now() < deadline => std::thread::yield_now(),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(file)
 }
 
 /// Persistent default: an app-data subdirectory rather than an OS temporary
@@ -107,11 +157,13 @@ pub(crate) fn scan(root: Option<&Path>) -> Vec<Draft> {
         let Ok(metadata) = entry.metadata() else { continue };
         if metadata.len() == 0 || metadata.len() > MAX_SCAN_BYTES { continue; }
         let path = entry.path();
+        let Ok(lease) = claim(&path) else { continue };
         let Ok(bytes) = std::fs::read(&path) else { continue };
         if crate::detect_binary(&bytes) { continue; }
         let (_, text) = recovery::Encoding::decode(&bytes);
         let entry = meta.get(file_name);
         drafts.push(Draft {
+            lease,
             name: display_name(file_name),
             language_override: entry
                 .and_then(|meta| meta.language.clone())
@@ -228,44 +280,9 @@ fn edits_directory(root: &Path) -> PathBuf {
 /// per-window directories. Referenced mirrors stay where they are until the
 /// next flush moves them with their tab.
 fn maintain_edits(root: &Path, referenced: &std::collections::HashSet<PathBuf>) -> io::Result<()> {
-    let edits = root.join("edits");
-    let Ok(entries) = std::fs::read_dir(&edits) else { return Ok(()) };
-    for entry in entries.flatten() {
-        let directory = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
-        if !kind.is_dir() {
-            continue;
-        }
-        let mut retain = false;
-        for child in std::fs::read_dir(&directory)?.flatten() {
-            let path = child.path();
-            if !child.file_type().is_ok_and(|kind| kind.is_file()) {
-                retain = true;
-                continue;
-            }
-            if referenced.contains(&crate::linkage::resolved(&path)) {
-                retain = true;
-                continue;
-            }
-            let Some(name) = path.file_name() else { continue };
-            let target = edits.join(name);
-            match std::fs::metadata(&target) {
-                Ok(existing) if existing.is_file() => {
-                    let current = existing.modified().ok();
-                    let candidate = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    if candidate > current {
-                        std::fs::rename(&path, &target)?;
-                    } else {
-                        remove(&path)?;
-                    }
-                }
-                _ => std::fs::rename(&path, &target)?,
-            }
-        }
-        if !retain {
-            let _ = std::fs::remove_dir(&directory);
-        }
-    }
+    // An unlocked mirror may still be referenced by another closed window's
+    // snapshot. Keep its stable path until global reference-aware GC exists.
+    let _ = (root, referenced);
     Ok(())
 }
 
@@ -447,30 +464,37 @@ impl LiteTextApp {
     /// older build; a present session still overrides it.
     pub(crate) fn flush_draft_meta(&mut self) {
         let Some(root) = self.scratch_root() else { return };
-        let mut meta: std::collections::BTreeMap<String, DraftMeta> = Default::default();
-        for file in &self.files {
-            if !file.is_untitled() {
-                continue;
-            }
-            let Some(path) = &file.scratch_path else { continue };
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            meta.insert(
-                name.to_owned(),
-                DraftMeta {
-                    pinned: file.pinned,
-                    language: file.language_override.clone(),
-                    markdown_mode: Some(file.markdown_mode),
-                },
-            );
-        }
+        // Compare only this window's owned metadata before touching disk. An
+        // idle GUI frame must not lock/read/serialize the shared metadata file.
+        let local: std::collections::BTreeMap<_, _> = self.files.iter().filter(|file| file.is_untitled())
+            .filter_map(|file| {
+                let path = file.scratch_path.as_ref()?;
+                if path.parent() != Some(root.as_path()) || !self.scratch.leases.contains_key(&crate::linkage::resolved(path)) { return None; }
+                Some((path.file_name()?.to_str()?.to_owned(), DraftMeta {
+                    pinned: file.pinned, language: file.language_override.clone(), markdown_mode: Some(file.markdown_mode),
+                }))
+            }).collect();
+        let Ok(local_bytes) = serde_json::to_vec(&(root.clone(), &local)) else { return; };
+        if self.scratch.meta_written.as_ref() == Some(&local_bytes) { return; }
+        let _lock = match root_lock(&root) {
+            Ok(lock) => lock,
+            Err(error) => { self.report_scratch_error(&error); return; }
+        };
+        let mut meta: std::collections::BTreeMap<String, DraftMeta> = match std::fs::read(root.join(DRAFT_META_FILE)) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(meta) => meta,
+                Err(error) => { self.report_scratch_error(&io::Error::other(error)); return; }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Default::default(),
+            Err(error) => { self.report_scratch_error(&error); return; }
+        };
+        meta.extend(local);
         let Ok(bytes) = serde_json::to_vec(&meta) else { return };
-        if self.scratch.meta_written.as_deref() == Some(bytes.as_slice()) {
-            return;
+        if std::fs::read(root.join(DRAFT_META_FILE)).ok().as_deref() == Some(bytes.as_slice()) {
+            self.scratch.meta_written = Some(local_bytes); return;
         }
         match recovery::atomic_write(&root.join(DRAFT_META_FILE), &bytes) {
-            Ok(()) => self.scratch.meta_written = Some(bytes),
+            Ok(()) => self.scratch.meta_written = Some(local_bytes),
             Err(error) => self.report_scratch_error(&error),
         }
     }
@@ -508,6 +532,21 @@ impl LiteTextApp {
                 return;
             }
         }
+        let allocation_lock = match root_lock(&root) {
+            Ok(lock) => lock,
+            Err(error) => {
+                // Synchronous recovery must inline current text, not publish
+                // references to mirrors that this flush could not refresh.
+                for file in &mut self.files {
+                    if let Some(path) = file.scratch_path.take() {
+                        self.scratch.pending_retire.push(path);
+                    }
+                }
+                self.scratch.written.clear();
+                self.report_scratch_error(&error);
+                return;
+            }
+        };
         self.scratch.last_flush = Some(Instant::now());
         let mut error = None;
         for index in 0..self.files.len() {
@@ -538,6 +577,20 @@ impl LiteTextApp {
                     wanted,
                 )
             };
+            if let Some(path) = existing.as_deref() {
+                let key = crate::linkage::resolved(path);
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.scratch.leases.entry(key) {
+                    match claim(path) {
+                        Ok(lease) => { entry.insert(lease); }
+                        Err(failure) => {
+                            error = Some(failure);
+                            self.files[index].scratch_path = None;
+                            self.scratch.written.remove(&id);
+                            continue;
+                        }
+                    }
+                }
+            }
             if !wanted {
                 if let Some(path) = existing.as_deref()
                     && let Err(failure) = remove(path)
@@ -599,8 +652,20 @@ impl LiteTextApp {
                 };
                 (path, bytes)
             };
+            let key = crate::linkage::resolved(&path);
+            if !self.scratch.leases.contains_key(&key) {
+                match claim(&path) {
+                    Ok(lease) => { self.scratch.leases.insert(crate::linkage::resolved(&path), lease); }
+                    Err(failure) => { error = Some(failure); continue; }
+                }
+            }
             let previous = self.files[index].scratch_path.clone();
-            match recovery::atomic_write(&path, &bytes) {
+            let write = if previous.as_deref() == Some(path.as_path()) {
+                recovery::atomic_write(&path, &bytes)
+            } else {
+                create_mirror(&path, &bytes)
+            };
+            match write {
                 Ok(()) => {
                     if untitled && untitled_number(&name).is_some()
                         && let Some(file_name) = path.file_name().and_then(|name| name.to_str())
@@ -615,15 +680,17 @@ impl LiteTextApp {
                     if let Some(previous) = previous
                         && previous != path
                     {
-                        let _ = remove(&previous);
+                        self.scratch.pending_retire.push(previous);
                     }
                 }
                 Err(failure) => {
                     error = Some(failure);
                     // Drop the now-stale mirror so recovery falls back to an
                     // inline copy instead of restoring older content.
-                    if let Some(previous) = previous.as_deref() {
-                        let _ = remove(previous);
+                    // Keep the old copy claimed until the inline replacement is
+                    // durable, preventing a scan from adopting stale content.
+                    if let Some(previous) = previous {
+                        self.scratch.pending_retire.push(previous);
                     }
                     self.files[index].scratch_path = None;
                     self.scratch.written.remove(&id);
@@ -642,6 +709,12 @@ impl LiteTextApp {
         }
         // Drafts whose mirror was just allocated now have a file name to key
         // the metadata sidecar by.
+        let retained: std::collections::HashSet<_> = self.files.iter()
+            .filter_map(|file| file.scratch_path.as_deref())
+            .chain(self.scratch.pending_retire.iter().map(PathBuf::as_path))
+            .map(crate::linkage::resolved).collect();
+        self.scratch.leases.retain(|path, _| retained.contains(path));
+        drop(allocation_lock);
         self.flush_draft_meta();
         remove_empty_edit_dirs(&root);
     }
@@ -664,10 +737,12 @@ impl LiteTextApp {
             }) {
                 continue;
             }
+            self.scratch.leases.insert(draft_path, draft.lease);
             // A session snapshot written before this feature existed (or one
             // that raced with a mirror write) may still describe the same
-            // untitled tab. The mirror is refreshed more often, so adopt it
-            // instead of opening a duplicate tab. Compare stems because a
+            // untitled tab. Adopt only identical content: matching names are
+            // not identity and must never overwrite an independent inline copy.
+            // Compare stems because a
             // draft that switched to Markdown carries a `.md` file extension.
             if let Some(index) = self.files.iter().position(|file| {
                 file.is_untitled()
@@ -675,14 +750,10 @@ impl LiteTextApp {
                     && file
                         .draft_text
                         .as_deref()
-                        .is_some_and(|text| !text.is_empty())
+                        .is_some_and(|text| !text.is_empty() && text == draft.text)
                     && draft_stem(&file.name) == draft_stem(&draft.name)
             }) {
                 let file = &mut self.files[index];
-                if file.draft_text.as_deref() != Some(draft.text.as_str()) {
-                    file.draft_text = Some(draft.text);
-                    file.sync_draft();
-                }
                 if file.language_override.is_none() {
                     file.language_override = draft.language_override;
                 }
@@ -731,6 +802,10 @@ impl LiteTextApp {
                 saved_generation: 0,
                 scratch_path: Some(draft.path),
             };
+            if untitled_number(&file.name).is_some() && self.files.iter().any(|open|
+                open.is_untitled() && draft_stem(&open.name) == draft_stem(&file.name)) {
+                file.name = format!("{} {}", tr(self.lang).untitled, self.next_untitled_number());
+            }
             file.sync_draft();
             self.scratch.written.insert(id, (file.content_revision, file.editor_state.large.revision));
             self.files.push(file);
@@ -829,13 +904,31 @@ pub(crate) fn restore_scratch_meta(&mut self, meta: &[recovery::ScratchMeta]) {
     self.files = rest;
 }
 
+    /// Retire migration sources only after their replacement session is durable.
+    pub(crate) fn scratch_snapshot_committed(&mut self) {
+        for path in std::mem::take(&mut self.scratch.pending_retire) {
+            if self.files.iter().any(|file| file.scratch_path.as_deref() == Some(&path)) { continue; }
+            let key = crate::linkage::resolved(&path);
+            if self.scratch.leases.contains_key(&key) {
+                if let Err(error) = remove(&path) {
+                    self.report_scratch_error(&error);
+                    self.scratch.pending_retire.push(path);
+                    continue;
+                }
+                self.scratch.leases.remove(&key);
+            }
+        }
+    }
+
 /// Remove the mirror belonging to a tab that is being closed on purpose.
     pub(crate) fn retire_file(&mut self, file: LoadedFile) {
         if let Some(path) = &file.scratch_path
+            && self.scratch.leases.contains_key(&crate::linkage::resolved(path))
             && let Err(error) = remove(path)
         {
             self.report_scratch_error(&error);
         }
+        if let Some(path) = &file.scratch_path { self.scratch.leases.remove(&crate::linkage::resolved(path)); }
         self.scratch.written.remove(&file.id);
     }
 
@@ -843,7 +936,8 @@ pub(crate) fn restore_scratch_meta(&mut self, meta: &[recovery::ScratchMeta]) {
     /// longer needed. Saving to the mirror path itself keeps that file.
     pub(crate) fn retire_mirror_after_save(&mut self, id: u64, mirror: Option<PathBuf>, target: &Path) {
         if let Some(path) = mirror {
-            if crate::linkage::resolved(&path) != crate::linkage::resolved(target)
+            if self.scratch.leases.contains_key(&crate::linkage::resolved(&path))
+                && crate::linkage::resolved(&path) != crate::linkage::resolved(target)
                 && let Err(error) = remove(&path)
             {
                 self.report_scratch_error(&error);
@@ -851,6 +945,7 @@ pub(crate) fn restore_scratch_meta(&mut self, meta: &[recovery::ScratchMeta]) {
             if let Some(file) = self.files.iter_mut().find(|file| file.id == id) {
                 file.scratch_path = None;
             }
+            self.scratch.leases.remove(&crate::linkage::resolved(&path));
             self.scratch.written.remove(&id);
         }
     }
@@ -886,7 +981,143 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| path.file_name().is_some_and(|name| name != "session.json" && name != DRAFT_META_FILE))
+            .find(|path| path.file_name().is_some_and(|name| !name.to_string_lossy().starts_with('.') && name != "session.json" && name != DRAFT_META_FILE))
+    }
+
+    #[test]
+    fn failed_mirror_update_keeps_old_copy_until_inline_snapshot_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("old durable".into());
+        app.active_mut().unwrap().sync_draft();
+        app.scratch_flush(None, true);
+        let path = app.active().unwrap().scratch_path.clone().unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        app.active_mut().unwrap().draft_text = Some("latest text".into());
+        app.active_mut().unwrap().sync_draft();
+        app.scratch_flush(None, true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old durable");
+        assert!(app.active().unwrap().scratch_path.is_none());
+        assert!(claim(&path).is_err(), "stale copy cannot be adopted before commit");
+        app.write_recovery().unwrap();
+        let session = recovery::load(&dir.path().join("recovery/session.json")).unwrap().unwrap();
+        assert_eq!(session.restore()[0].draft_text.as_deref(), Some("latest text"));
+    }
+
+    #[test]
+    fn mirror_claim_is_exclusive_across_processes() {
+        const CHILD: &str = "LITETEXT_TEST_LOCK_PATH";
+        if let Some(path) = std::env::var_os(CHILD) {
+            assert!(claim(Path::new(&path)).is_err());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cross-process.txt");
+        std::fs::write(&path, "before").unwrap();
+        let lease = claim(&path).unwrap();
+        // Replacing the content inode must not release sidecar ownership.
+        recovery::atomic_write(&path, b"after").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "scratch::tests::mirror_claim_is_exclusive_across_processes"])
+            .env(CHILD, &path).status().unwrap();
+        assert!(status.success());
+        drop(lease);
+        assert!(claim(&path).is_ok());
+    }
+
+    #[test]
+    fn live_window_drafts_are_not_adopted_and_drop_releases_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = test_app(dir.path());
+        owner.new_document();
+        owner.active_mut().unwrap().draft_text = Some("owner body".into());
+        owner.active_mut().unwrap().sync_draft();
+        owner.scratch_flush(None, true);
+        let path = owner.active().unwrap().scratch_path.clone().unwrap();
+        assert!(claim(&path).is_err());
+        let mut other = test_app(dir.path());
+        other.open_scratch_files();
+        assert!(other.files.is_empty());
+        drop(owner);
+        other.open_scratch_files();
+        assert_eq!(other.files.len(), 1);
+        assert_eq!(other.files[0].draft_text.as_deref(), Some("owner body"));
+    }
+
+    #[test]
+    fn metadata_updates_preserve_other_windows_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = test_app(dir.path());
+        let mut b = test_app(dir.path());
+        for (app, text) in [(&mut a, "A"), (&mut b, "B")] {
+            app.new_document();
+            app.active_mut().unwrap().draft_text = Some(text.into());
+            app.active_mut().unwrap().pinned = true;
+            app.active_mut().unwrap().sync_draft();
+            app.scratch_flush(None, true);
+        }
+        a.flush_draft_meta();
+        b.flush_draft_meta();
+        assert_eq!(read_draft_meta(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn session_restore_never_inherits_another_windows_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path());
+        app.new_document();
+        app.active_mut().unwrap().draft_text = Some("private".into());
+        app.active_mut().unwrap().sync_draft();
+        app.write_recovery().unwrap();
+        let session = recovery::load(&dir.path().join("recovery/session.json")).unwrap().unwrap();
+        let (files, leases) = session.restore_claimed().unwrap();
+        assert!(files.is_empty());
+        assert!(leases.is_empty());
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("private"));
+        let mut other = test_app(dir.path());
+        other.start_restore(dir.path().join("recovery/session.json"), Some(dir.path().to_path_buf()));
+        other.finish_restore();
+        assert!(other.files.is_empty(), "background restore must also skip owned mirrors");
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some("private"));
+    }
+
+    #[test]
+    fn unchanged_metadata_does_not_try_shared_root_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path()); app.new_document();
+        app.active_mut().unwrap().draft_text = Some("body".into());
+        app.active_mut().unwrap().sync_draft(); app.scratch_flush(None, true);
+        let lock = root_lock(dir.path()).unwrap();
+        app.io_error = None;
+        app.flush_draft_meta();
+        assert!(app.io_error.is_none(), "unchanged metadata uses only local cached state");
+        drop(lock);
+    }
+
+    #[test]
+    fn newly_allocated_publication_never_clobbers_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.txt");
+        std::fs::write(&path, "original").unwrap();
+        assert!(create_mirror(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn same_named_inline_and_disk_drafts_with_different_content_are_both_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(dir.path()); app.new_document();
+        app.active_mut().unwrap().draft_text = Some("new inline".into());
+        app.active_mut().unwrap().sync_draft();
+        std::fs::write(dir.path().join("未命名 1.txt"), "old disk").unwrap();
+        app.open_scratch_files();
+        assert_eq!(app.files.len(), 2);
+        assert!(app.files.iter().any(|f| f.draft_text.as_deref() == Some("new inline")));
+        assert!(app.files.iter().any(|f| f.draft_text.as_deref() == Some("old disk")));
+        assert_ne!(app.files[0].name, app.files[1].name);
     }
 
     #[test]
@@ -1025,6 +1256,7 @@ mod tests {
         assert!(json.contains("\"mirror\""), "the session must point at the mirror");
         assert_eq!(session.scratch_active(), None);
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files.len(), 1);
@@ -1047,14 +1279,12 @@ mod tests {
         // The mirror is newer than the session snapshot.
         std::fs::write(dir.path().join("未命名 1.txt"), "newer mirror text").unwrap();
 
+        first.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
-        assert_eq!(restored.files.len(), 1, "no duplicate tab for the same draft");
-        assert_eq!(
-            restored.files[0].draft_text.as_deref(),
-            Some("newer mirror text")
-        );
-        assert!(restored.files[0].is_scratch_mirror());
+        assert_eq!(restored.files.len(), 2, "different content with the same name must not be discarded");
+        assert!(restored.files.iter().any(|file| file.draft_text.as_deref() == Some("stale session text")));
+        assert!(restored.files.iter().any(|file| file.draft_text.as_deref() == Some("newer mirror text") && file.is_scratch_mirror()));
     }
 
     #[test]
@@ -1090,6 +1320,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["未命名 2", "未命名 1"], "pin order follows the tab strip");
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         let pinned: Vec<&str> = restored
@@ -1116,6 +1347,7 @@ mod tests {
         app.scratch_flush(None, true);
         app.write_recovery().unwrap();
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files.len(), 1);
@@ -1157,6 +1389,7 @@ mod tests {
             "a language override must not rename the mirror"
         );
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files.len(), 1);
@@ -1192,6 +1425,7 @@ mod tests {
                 .all(|record| record["language_override"].is_null()),
             "an Auto draft must not keep writing a language"
         );
+        restored.scratch.leases.clear();
         let mut again = test_app(dir.path());
         again.restore_session();
         assert_eq!(again.files[0].language_override, None);
@@ -1218,6 +1452,7 @@ mod tests {
         // instead of being replaced by extension-derived language detection.
         app.active_mut().unwrap().language_override = Some("Rust".into());
         app.write_recovery().unwrap();
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files[0].language_override.as_deref(), Some("Rust"));
@@ -1251,23 +1486,14 @@ mod tests {
         );
         std::fs::write(dir.path().join("未命名 1.md"), "# newer mirror text").unwrap();
 
+        first.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
-        assert_eq!(restored.files.len(), 1, "no duplicate tab for the same draft");
-        assert_eq!(
-            restored.files[0].draft_text.as_deref(),
-            Some("# newer mirror text")
-        );
-        assert!(crate::markdown::is_markdown(&restored.files[0]));
-        assert_eq!(
-            restored.files[0]
-                .scratch_path
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy())
-                .as_deref(),
-            Some("未命名 1.md")
-        );
+        assert_eq!(restored.files.len(), 2, "independent inline and mirror content both survive");
+        assert!(restored.files.iter().any(|file| file.draft_text.as_deref() == Some("older session text")));
+        let mirror = restored.files.iter().find(|file| file.draft_text.as_deref() == Some("# newer mirror text")).unwrap();
+        assert!(crate::markdown::is_markdown(mirror));
+        assert_eq!(mirror.scratch_path.as_ref().and_then(|path| path.file_name()).unwrap(), "未命名 1.md");
     }
 
     #[test]
@@ -1288,19 +1514,23 @@ mod tests {
         let markdown_mirror = app.active().unwrap().scratch_path.clone().unwrap();
         assert_eq!(markdown_mirror.extension().unwrap(), "md");
         assert_eq!(markdown_mirror.file_stem(), text_mirror.file_stem());
+        app.write_recovery().unwrap();
         assert!(!text_mirror.exists(), "the old .txt mirror is not left behind");
         assert_eq!(std::fs::read_to_string(&markdown_mirror).unwrap(), "# Heading\n");
 
         // A restored draft reads the extension back as the Markdown override.
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.open_scratch_files();
         assert_eq!(restored.files.len(), 1);
         assert!(crate::markdown::is_markdown(&restored.files[0]));
 
-        app.active_mut().unwrap().language_override = None;
-        app.scratch_flush(None, true);
-        let back = app.active().unwrap().scratch_path.clone().unwrap();
+        restored.active_id = restored.files.first().map(|file| file.id);
+        restored.active_mut().unwrap().language_override = None;
+        restored.scratch_flush(None, true);
+        let back = restored.active().unwrap().scratch_path.clone().unwrap();
         assert_eq!(back.extension().unwrap(), "txt");
+        restored.write_recovery().unwrap();
         assert!(!markdown_mirror.exists(), "the .md mirror is replaced");
         assert_eq!(std::fs::read_to_string(&back).unwrap(), "# Heading\n");
     }
@@ -1322,6 +1552,7 @@ mod tests {
         let new = app.active().unwrap().scratch_path.clone().unwrap();
         assert_eq!(new.parent(), Some(second.path()));
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "relocate me");
+        app.write_recovery().unwrap();
         assert!(!old.exists(), "the old mirror is not left behind");
     }
 
@@ -1384,6 +1615,7 @@ mod tests {
             "writing the session does not save the document"
         );
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files.len(), 1);
@@ -1530,6 +1762,7 @@ mod tests {
             "the session must retain the text instead of losing it"
         );
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files[0].draft_text.as_deref(), Some("edited\n"));
@@ -1561,6 +1794,7 @@ mod tests {
             "the mirror must not silently transcode the document"
         );
         app.write_recovery().unwrap();
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files[0].draft_text.as_deref(), Some("edited\r\n"));
@@ -1592,6 +1826,7 @@ mod tests {
         assert!(app.files[0].scratch_path.is_none());
         app.write_recovery().unwrap();
 
+        app.scratch.leases.clear();
         let mut restored = test_app(dir.path());
         restored.restore_session();
         assert_eq!(restored.files.len(), 1);
@@ -1613,6 +1848,7 @@ mod tests {
         app.scratch_flush(None, true);
 
         // No session is read here: only the hidden sidecar and the mirror exist.
+        app.scratch.leases.clear();
         let drafts = scan(Some(dir.path()));
         assert_eq!(drafts.len(), 1);
         assert!(drafts[0].pinned, "a pinned draft stays pinned on rescan");
@@ -1620,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_edit_directories_are_flattened_and_referenced_mirrors_are_kept() {
+    fn orphan_edit_directories_keep_stable_snapshot_references() {
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("edits/window-old");
         let live = dir.path().join("edits/window-live");
@@ -1632,10 +1868,10 @@ mod tests {
         referenced.insert(crate::linkage::resolved(&live.join("note-bbbbbbbbbbbbbbbb.txt")));
         maintain_edits(dir.path(), &referenced).unwrap();
 
-        assert!(!old.exists(), "the retired window directory is gone");
+        assert!(old.exists(), "unclaimed snapshots may still reference old mirrors");
         assert!(live.exists(), "a referenced mirror stays with its live tab");
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("edits/note-aaaaaaaaaaaaaaaa.txt")).unwrap(),
+            std::fs::read_to_string(old.join("note-aaaaaaaaaaaaaaaa.txt")).unwrap(),
             "abandoned",
             "an unreferenced mirror is preserved in the flat directory"
         );
@@ -1652,6 +1888,7 @@ mod tests {
         app.active_mut().unwrap().language_override = Some("Python".to_owned());
         app.scratch_flush(None, true);
 
+        app.scratch.leases.clear();
         let mut reopened = test_app(dir.path());
         reopened.restore_session();
         assert_eq!(reopened.files.len(), 1);

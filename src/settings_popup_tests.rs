@@ -3,6 +3,29 @@ use crate::{DARK, LIGHT, Lang, LiteTextApp, Palette};
 use eframe::egui;
 
 #[test]
+fn long_dropdown_stays_on_screen_and_scrolls_to_last_option() {
+    let ctx = egui::Context::default();
+    let id = egui::Id::new("long-theme-list-test");
+    let render = |events| ctx.run(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0,420.0))), events,
+        ..Default::default()
+    }, |ctx| { egui::CentralPanel::default().show(ctx, |ui| {
+        crate::dropdown(ui, &DARK, id, "Theme 0".into(), (0..25).map(|i| (format!("Theme {i}"), i)).collect(), 230.0);
+    }); });
+    render(vec![]); ctx.memory_mut(|m| m.open_popup(id));
+    for _ in 0..4 { render(vec![]); }
+    let viewport = ctx.data(|d| d.get_temp::<egui::Rect>(id.with("options_viewport"))).unwrap();
+    assert!(viewport.top() >= 0.0 && viewport.bottom() <= 420.0);
+    assert!((290.0..=301.0).contains(&viewport.height()), "long selector must show multiple rows: {viewport:?}");
+    render(vec![egui::Event::PointerMoved(viewport.center()), egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -2000.0), modifiers: Default::default(),
+    }]);
+    for _ in 0..30 { render(vec![]); }
+    let last = ctx.data(|d| d.get_temp::<egui::Rect>(id.with(("option_rect", "Theme 24")))).unwrap();
+    assert!(viewport.intersects(last), "last option must be reachable: {last:?} / {viewport:?}");
+}
+
+#[test]
 fn general_and_terminal_selectors_share_width_and_centered_values() {
     for pal in [&DARK, &LIGHT] {
         let ctx = egui::Context::default();

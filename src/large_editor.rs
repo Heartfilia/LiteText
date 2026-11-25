@@ -34,6 +34,7 @@ pub(crate) struct State {
     pub(crate) revision: u64,
     next_revision: u64,
     undo: Vec<Edit>,
+    undo_limit: usize,
     redo: Vec<Edit>,
     wrap_key: Option<(u32, usize)>,
     visual_starts: Vec<usize>,
@@ -143,6 +144,7 @@ impl State {
         prepared.state.revision = self.next_revision;
         prepared.state.next_revision = self.next_revision;
         prepared.state.cursor = prepared.edit.cursor_after;
+        prepared.state.undo_limit = self.undo_limit;
         prepared.state.undo = std::mem::take(&mut self.undo);
         prepared.state.undo.push(prepared.edit);
         prepared.state.trim_history();
@@ -482,7 +484,7 @@ impl State {
             .iter()
             .map(|e| e.removed.len() + e.inserted.len())
             .sum();
-        while self.undo.len() > 1 && (size > HISTORY_BYTES || self.undo.len() > 1000) {
+        while self.undo.len() > 1 && (size > HISTORY_BYTES || self.undo.len() > if self.undo_limit == 0 { crate::undo_settings::DEFAULT } else { self.undo_limit }) {
             let removed = self.undo.remove(0);
             size -= removed.removed.len() + removed.inserted.len();
         }
@@ -666,6 +668,12 @@ pub(crate) fn show(
     t: &Strings,
 ) -> bool {
     state.large.active = true;
+    state.large.undo_limit = crate::undo_settings::limit(ui.ctx());
+    state.large.trim_history();
+    if state.large.redo.len() > state.large.undo_limit {
+        let excess = state.large.redo.len() - state.large.undo_limit;
+        state.large.redo.drain(..excess);
+    }
     let id = egui::Id::new("large_editor").with(file_id);
     if ui.is_enabled() { state.line_ending.remap_enter(ui.ctx(), id, &mut state.composing, text, state.large.cursor); }
     let fold_selection = state
@@ -1033,6 +1041,10 @@ pub(crate) fn show(
             let pointer_extends = ui.input(|input| input.modifiers.shift || input.pointer.primary_down() && !input.pointer.any_pressed());
             let previous =
                 egui::TextEdit::load_state(ui.ctx(), id).and_then(|edit| edit.cursor.char_range());
+            let rule_viewport = egui::Rect::from_min_max(
+                egui::pos2(gutter.right() + 1.0, viewport_clip.top()), viewport_clip.max);
+            let rule_painter = ui.painter().with_clip_rect(rule_viewport);
+            let rule_slot = crate::notebook::slot(&rule_painter, tools.workspace.as_ref());
             let mut output = ui
                 .allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.set_clip_rect(ui.clip_rect().intersect(egui::Rect::from_min_max(
@@ -1059,6 +1071,8 @@ pub(crate) fn show(
                     output
                 })
                 .inner;
+            crate::notebook::paint_rows(&rule_painter, rule_slot, tools.workspace.as_ref(),
+                &output.galley, output.galley_pos, rule_viewport);
             // egui collapses a selection on any pointer press, including the
             // right-click that opens the context menu. Restore it when the
             // right-click lands inside the selection so the highlight stays
@@ -1085,6 +1099,7 @@ pub(crate) fn show(
                     ui.ctx().request_repaint();
                 }
             }
+            editor::paint_unfocused_selection(ui, &mut output);
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
             }
@@ -1810,7 +1825,7 @@ mod tests {
     fn incremental_index_matches_full_scan_for_unicode_crlf_and_line_merges() {
         let original = "中文🙂\r\n\nabc\tdef\r\n末尾\r".repeat(12);
         let mut text = original.clone();
-        let mut state = State::default();
+        let mut state = State { undo_limit: 500, ..Default::default() };
         state.index(&text);
         let mut seed = 42u64;
         for i in 0..300 {
@@ -1845,9 +1860,19 @@ mod tests {
     }
 
     #[test]
+    fn configurable_large_history_limits_records() {
+        let mut text = "abc".to_owned();
+        let mut state = State { undo_limit: 3, ..Default::default() }; state.index(&text);
+        for _ in 0..10 { state.record(&mut text, 0..0, "x".into(), None, None); }
+        assert_eq!(state.undo.len(), 3);
+        for _ in 0..3 { assert!(state.undo(&mut text, false)); }
+        assert!(!state.undo(&mut text, false));
+    }
+
+    #[test]
     fn delta_history_does_not_retain_full_documents_and_branch_revisions_are_unique() {
         let mut text = "line 中文🙂\r\n".repeat(100_000);
-        let mut state = State::default();
+        let mut state = State { undo_limit: 100, ..Default::default() };
         state.index(&text);
         for i in 0..100 {
             state.record(&mut text, i..i, "x".to_owned(), None, None);

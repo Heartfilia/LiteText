@@ -19,6 +19,7 @@ struct Preferences {
     tab_mode: crate::whitespace::TabMode,
     tab_close_mode: crate::TabCloseMode,
     vertical_tabs: bool,
+    undo_limit: usize,
     workspace_font: Option<crate::fonts::Choice>,
     terminal: crate::terminal::Settings,
     updates: crate::updater::Settings,
@@ -44,6 +45,7 @@ impl Preferences {
             tab_mode: app.tab_mode,
             tab_close_mode: app.tab_close_mode,
             vertical_tabs: app.vertical_tabs,
+            undo_limit: app.undo_limit.clamp(20, 500),
             workspace_font: app.workspace_font.clone(),
             terminal: app.terminal.clone(), updates: app.updates.clone(),
             shortcut_keys: app.shortcut_keys.clone(), hex_case_upper: app.hex_upper,
@@ -63,6 +65,9 @@ impl Preferences {
         app.tab_mode = self.tab_mode;
         app.tab_close_mode = self.tab_close_mode;
         app.vertical_tabs = self.vertical_tabs;
+        app.undo_limit = self.undo_limit.clamp(20, 500);
+        app.undo_limit_input = None;
+        app.undo_limit_error = None;
         app.workspace_font = self.workspace_font;
         app.terminal = self.terminal;
         app.updates = self.updates;
@@ -264,6 +269,103 @@ mod tests {
 
         let legacy_app: LiteTextApp = serde_json::from_str("{}").unwrap();
         assert!(!legacy_app.vertical_tabs);
+    }
+
+    #[test]
+    fn undo_limit_defaults_round_trips_and_clamps_preferences() {
+        let legacy_app: LiteTextApp = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy_app.undo_limit, 50);
+        assert!(legacy_app.undo_limit_input.is_none());
+        assert!(legacy_app.undo_limit_error.is_none());
+        let legacy: Preferences = serde_json::from_str(r#"{"lang":"en"}"#).unwrap();
+        let mut app = LiteTextApp { undo_limit: 123, ..Default::default() };
+        legacy.apply(&mut app);
+        assert_eq!(app.undo_limit, 50);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        app.preferences.path_override = Some(path.clone());
+        for (value, expected) in [(0, 20), (1, 20), (19, 20), (20, 20), (75, 75), (500, 500), (501, 500), (usize::MAX, 500)] {
+            app.undo_limit = value;
+            app.save_preferences(true).unwrap();
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["undo_limit"], expected);
+            assert!(saved.get("undo_limit_input").is_none());
+            assert!(saved.get("undo_limit_error").is_none());
+            let mut restored = LiteTextApp::default();
+            restored.preferences.path_override = Some(path.clone());
+            restored.load_preferences().unwrap();
+            assert_eq!(restored.undo_limit, expected);
+
+            let prefs: Preferences = serde_json::from_value(serde_json::json!({"undo_limit": value})).unwrap();
+            restored.undo_limit_input = Some("unconfirmed".into());
+            restored.undo_limit_error = Some("invalid".into());
+            prefs.apply(&mut restored);
+            assert_eq!(restored.undo_limit, expected);
+            assert!(restored.undo_limit_input.is_none());
+            assert!(restored.undo_limit_error.is_none());
+        }
+        app.undo_limit_input = Some("draft".into());
+        app.undo_limit_error = Some("error".into());
+        let saved_app = serde_json::to_value(&app).unwrap();
+        assert!(saved_app.get("undo_limit_input").is_none());
+        assert!(saved_app.get("undo_limit_error").is_none());
+    }
+
+    #[test]
+    fn undo_limit_settings_require_confirmation_and_reject_invalid_input() {
+        use eframe::egui;
+        for lang in [crate::Lang::ZhCn, crate::Lang::En] {
+            let ctx = egui::Context::default();
+            let mut app = LiteTextApp { lang, show_settings: true, ..Default::default() };
+            let mut frame = 0;
+            let mut draw = |app: &mut LiteTextApp, events| {
+                frame += 1;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 800.0))),
+                    time: Some(frame as f64 * 0.05), events, ..Default::default()
+                }, |ctx| app.settings_window(ctx, &crate::DARK));
+            };
+            for _ in 0..3 { draw(&mut app, vec![]); }
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("undo_limit_input_rect"))).is_some());
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("undo_limit_confirm_rect"))).is_none());
+            app.undo_limit_input = Some("123".into()); draw(&mut app, vec![]);
+            let cancel = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("undo_limit_cancel_rect"))).unwrap().center();
+            for pressed in [true, false] {
+                draw(&mut app, vec![egui::Event::PointerMoved(cancel), egui::Event::PointerButton {
+                    pos: cancel, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                }]);
+            }
+            draw(&mut app, vec![]);
+            assert_eq!(app.undo_limit_input.as_deref(), Some("50"));
+            assert_eq!(app.undo_limit, 50);
+            assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("undo_limit_cancel_rect"))).is_none());
+            for (input, expected, error) in [
+                ("0", 50, true), ("501", 50, true), ("-1", 50, true),
+                ("1.5", 50, true), ("", 50, true), ("abc", 50, true),
+                ("999999999999999999999999999999999999", 50, true),
+                ("1", 50, true), ("19", 50, true), ("20", 20, false), ("500", 500, false), (" 75 ", 75, false),
+            ] {
+                let previous = app.undo_limit;
+                app.undo_limit_input = Some(input.into());
+                draw(&mut app, vec![]);
+                assert_eq!(app.undo_limit, previous, "typing must not apply the limit");
+                let pos = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("undo_limit_confirm_rect"))).unwrap().center();
+                for pressed in [true, false] {
+                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                    }]);
+                }
+                assert_eq!(app.undo_limit, expected, "input: {input}");
+                assert_eq!(app.undo_limit_error.is_some(), error, "input: {input}");
+                if error {
+                    assert_eq!(app.undo_limit_input.as_deref(), Some(input));
+                    assert_eq!(app.undo_limit_error.as_deref(), Some(if lang == crate::Lang::ZhCn {
+                        "请输入 20 到 500 之间的整数"
+                    } else { "Enter an integer from 20 to 500" }));
+                }
+            }
+        }
     }
 
     #[test]

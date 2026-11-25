@@ -522,6 +522,7 @@ fn pinned_state_survives_restart_for_real_files_and_scratch_drafts() {
     app.scratch_flush(None, true);
     app.toggle_pin(draft_id);
     app.write_recovery().unwrap();
+    drop(app); // A restart releases the previous window's mirror leases.
 
     let mut restored = LiteTextApp {
         recovery_path_override: Some(snapshot),

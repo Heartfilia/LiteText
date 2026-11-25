@@ -794,6 +794,7 @@ pub(crate) fn live_editor(
                             } else {
                                 FontId::proportional(body)
                             };
+                            crate::undo_settings::configure(ui.ctx(), edit_id, body_text.as_deref().unwrap_or(&edit.text));
                             let (output, frame_rect) = if boxed {
                                 let framed = egui::Frame::new()
                                     .fill(pal.bg_inset)

@@ -506,6 +506,43 @@ impl Session {
         }
     }
 
+    /// Claim before reading; occupied mirror-only records belong to their live
+    /// owner. Inline records may recover independently without that mirror.
+    pub(crate) fn restore_claimed(mut self) -> io::Result<(Vec<LoadedFile>, std::collections::HashMap<PathBuf, std::fs::File>)> {
+        let mut leases = std::collections::HashMap::new();
+        let mut failure = None;
+        self.files.retain_mut(|record| {
+            let Some(path) = record.mirror.as_ref() else { return true; };
+            let key = crate::linkage::resolved(path);
+            if leases.contains_key(&key) { return true; }
+            match crate::scratch::claim(path) {
+                Ok(lease) => { leases.insert(key, lease); true }
+                Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                    if record.text.is_some() { record.mirror = None; true } else { false }
+                }
+                Err(error) => {
+                    // A lease failure must not discard unrelated session tabs.
+                    // Recover readable content independently and never retain
+                    // a write association to the unclaimed mirror.
+                    if record.text.is_none() {
+                        match std::fs::read(path) {
+                            Ok(bytes) => record.text = Some(if record.path.as_os_str().is_empty() {
+                                Encoding::decode(&bytes).1
+                            } else {
+                                record.encoding.decode_as(&bytes).unwrap_or_else(|| Encoding::decode(&bytes).1)
+                            }),
+                            Err(_) => { failure = Some(error); return true; }
+                        }
+                    }
+                    record.mirror = None;
+                    true
+                },
+            }
+        });
+        if let Some(error) = failure { return Err(error); }
+        Ok((self.restore(), leases))
+    }
+
     pub(crate) fn restore(&self) -> Vec<LoadedFile> {
         self.files
             .iter()
@@ -1086,6 +1123,25 @@ pub(crate) fn save_document_checked(
 mod tests {
     use super::*;
     use crate::LiteTextApp;
+
+    #[test]
+    fn unreadable_lease_sidecar_does_not_discard_other_session_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = dir.path().join("draft.txt");
+        std::fs::write(&mirror, "mirror body").unwrap();
+        std::fs::create_dir(dir.path().join(".draft.txt.litetext-lock")).unwrap();
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "version": 2, "active": 1, "files": [
+                { "id": 1, "path": "", "name": "first", "view": "Text", "encoding": "Utf8", "mirror": mirror },
+                { "id": 2, "path": "", "name": "second", "view": "Text", "encoding": "Utf8", "text": "inline body" }
+            ]
+        })).unwrap();
+        let (files, _) = session.restore_claimed().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].draft_text.as_deref(), Some("mirror body"));
+        assert!(files[0].scratch_path.is_none());
+        assert_eq!(files[1].draft_text.as_deref(), Some("inline body"));
+    }
 
     #[test]
     fn partial_atomic_write_failure_preserves_original_and_removes_temporary_output() {

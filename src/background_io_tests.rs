@@ -598,6 +598,7 @@ fn background_restore_keeps_scratch_pin_state() {
     original.scratch_flush(None, true);
     original.toggle_pin(original.active_id.unwrap());
     original.write_recovery().unwrap();
+    drop(original); // Simulate shutdown, releasing persistent scratch ownership.
 
     let mut restored = LiteTextApp {
         recovery_path_override: Some(dir.path().join("session.json")),

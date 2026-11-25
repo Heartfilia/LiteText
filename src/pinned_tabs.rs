@@ -172,7 +172,7 @@ impl LiteTextApp {
                             painter.rect_filled(
                                 rect.shrink(1.0),
                                 6.0,
-                                pal.danger.gamma_multiply(0.12),
+                                pal.accent.gamma_multiply(if active { 0.15 } else { 0.05 }),
                             );
                         }
                         let color = if active {

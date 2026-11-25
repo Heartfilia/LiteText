@@ -121,6 +121,30 @@ pub(crate) fn select_word_on_double_click(
     ui.ctx().request_repaint();
 }
 
+/// TextEdit hides selection on focus loss (e.g. opening the app/plugin menu).
+/// Retain the document selection visually without stealing focus from menus.
+pub(crate) fn paint_unfocused_selection(ui: &egui::Ui, output: &mut egui::text_edit::TextEditOutput) {
+    if output.response.has_focus() { return; }
+    let Some(range) = output.state.cursor.char_range().filter(|range| range.primary.index != range.secondary.index) else { return; };
+    let old = output.galley.clone();
+    let mut galley = std::sync::Arc::new((*old).clone());
+    let cursor = egui::text::CursorRange {
+        primary: galley.from_ccursor(range.primary), secondary: galley.from_ccursor(range.secondary),
+    };
+    egui::text_selection::visuals::paint_text_selection(&mut galley, ui.visuals(), &cursor, None);
+    ui.ctx().graphics_mut(|graphics| {
+        let list = graphics.entry(ui.layer_id());
+        let indices: Vec<_> = list.all_entries().enumerate().filter_map(|(index, shape)| match &shape.shape {
+            egui::Shape::Text(text) if std::sync::Arc::ptr_eq(&text.galley, &old) => Some(index), _ => None,
+        }).collect();
+        for index in indices { list.mutate_shape(egui::layers::ShapeIdx(index), |shape| {
+            if let egui::Shape::Text(text) = &mut shape.shape { text.galley = galley.clone(); }
+        }); }
+    });
+    output.galley = galley;
+    output.cursor_range = Some(cursor);
+}
+
 /// ScrollArea includes the frozen gutter in its viewport, but TextEdit does not
 /// know that it is covered. Reserve that width on the left of its reveal target.
 /// Only reveal on cursor/edit changes, so manual scrolling can leave it offscreen.
@@ -535,8 +559,13 @@ fn show_impl(
                     )));
                 edit.store(ui.ctx(), editor_id);
             }
+            crate::undo_settings::configure(ui.ctx(), editor_id, text);
             let previous = egui::TextEdit::load_state(ui.ctx(), editor_id)
                 .and_then(|edit| edit.cursor.char_range());
+            let rule_viewport = egui::Rect::from_min_max(
+                egui::pos2(gutter.right() + 1.0, viewport_clip.top()), viewport_clip.max);
+            let rule_painter = ui.painter().with_clip_rect(rule_viewport);
+            let rule_slot = crate::notebook::slot(&rule_painter, tools.workspace.as_ref());
             let editor_output =
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(editor_rect), |ui| {
                     // Keep the gutter frozen during horizontal scrolling.
@@ -562,6 +591,8 @@ fn show_impl(
                 });
             // Propagate the full text extent to the scroll area, not just the viewport-sized child.
             let mut output = editor_output.inner;
+            crate::notebook::paint_rows(&rule_painter, rule_slot, tools.workspace.as_ref(),
+                &output.galley, output.galley_pos, rule_viewport);
             // egui collapses a text selection on any pointer press, including
             // the secondary click that opens the context menu. When the user
             // right-clicks inside the selection, restore it so the highlight
@@ -580,6 +611,7 @@ fn show_impl(
                     ui.ctx().request_repaint();
                 }
             }
+            paint_unfocused_selection(ui, &mut output);
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
             }

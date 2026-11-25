@@ -103,7 +103,7 @@ impl LiteTextApp {
         let response = response.on_hover_text(path);
         let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
         painter.rect_filled(rect, 5.0, if active { pal.bg_window } else if response.hovered() { pal.bg_elevated } else { pal.bg_panel });
-        if dirty { painter.rect_filled(rect, 5.0, pal.danger.gamma_multiply(if active { 0.12 } else { 0.06 })); }
+        if dirty { painter.rect_filled(rect, 5.0, pal.accent.gamma_multiply(if active { 0.15 } else { 0.05 })); }
         if active { painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 2.0, pal.accent); }
         let title_rect = egui::Rect::from_min_max(rect.min + egui::vec2(6.0, 0.0), rect.max - egui::vec2(6.0, 0.0));
         crate::paint_tab_title(&painter, title_rect, &title, if active { pal.text_main } else { pal.text_faint });

@@ -26,10 +26,26 @@ pub(crate) enum Preset {
     Mariana,
     OneDark,
     Nord,
+    Dracula,
+    GitHubDark,
+    GitHubLight,
+    TokyoNight,
+    CatppuccinMocha,
+    CatppuccinLatte,
+    GruvboxDark,
+    GruvboxLight,
+    SolarizedDark,
+    SolarizedLight,
+    NightOwl,
+    AyuDark,
+    AyuLight,
+    EverforestDark,
+    RosePine,
+    RosePineDawn,
 }
 
 impl Preset {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 25] = [
         Self::Auto,
         Self::DarkPlus,
         Self::LightPlus,
@@ -39,6 +55,22 @@ impl Preset {
         Self::Mariana,
         Self::OneDark,
         Self::Nord,
+        Self::Dracula,
+        Self::GitHubDark,
+        Self::GitHubLight,
+        Self::TokyoNight,
+        Self::CatppuccinMocha,
+        Self::CatppuccinLatte,
+        Self::GruvboxDark,
+        Self::GruvboxLight,
+        Self::SolarizedDark,
+        Self::SolarizedLight,
+        Self::NightOwl,
+        Self::AyuDark,
+        Self::AyuLight,
+        Self::EverforestDark,
+        Self::RosePine,
+        Self::RosePineDawn,
     ];
     fn label(self, zh: bool) -> &'static str {
         match self {
@@ -57,6 +89,40 @@ impl Preset {
             Self::Mariana => "Mariana · Sublime",
             Self::OneDark => "One Dark",
             Self::Nord => "Nord",
+            Self::Dracula => "Dracula",
+            Self::GitHubDark => "GitHub Dark",
+            Self::GitHubLight => "GitHub Light",
+            Self::TokyoNight => "Tokyo Night",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::GruvboxLight => "Gruvbox Light",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::SolarizedLight => "Solarized Light",
+            Self::NightOwl => "Night Owl",
+            Self::AyuDark => "Ayu Dark",
+            Self::AyuLight => "Ayu Light",
+            Self::EverforestDark => "Everforest Dark",
+            Self::RosePine => "Rosé Pine",
+            Self::RosePineDawn => "Rosé Pine Dawn",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Texture {
+    #[default]
+    Default,
+    Notebook,
+}
+
+impl Texture {
+    fn label(self, zh: bool) -> &'static str {
+        match (self, zh) {
+            (Self::Default, true) => "默认无",
+            (Self::Default, false) => "None (default)",
+            (Self::Notebook, true) => "记事本",
+            (Self::Notebook, false) => "Notebook",
         }
     }
 }
@@ -126,6 +192,7 @@ impl Colors {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct WorkspaceTheme {
+    pub texture: Texture,
     pub preset: Preset,
     pub syntax: bool,
     pub custom: Option<Colors>,
@@ -134,6 +201,7 @@ pub(crate) struct WorkspaceTheme {
 impl Default for WorkspaceTheme {
     fn default() -> Self {
         Self {
+            texture: Texture::Default,
             preset: Preset::Auto,
             syntax: true,
             custom: None,
@@ -196,7 +264,10 @@ impl WorkspaceTheme {
 }
 
 impl Preset {
-    /// Inspired editor palettes, not imported vendor themes or semantic tokens.
+    /// Inspired approximations, not official/exact vendor theme imports or semantic tokens.
+    /// Muted foregrounds are adjusted for readability. Slots: text, background, bracket,
+    /// selection, selected text, search, cursor, gutter, keyword, string, comment,
+    /// number, function, type, property.
     fn colors(self, dark: bool) -> Colors {
         let values = match self {
             Self::Auto => return Colors::preset(dark),
@@ -225,6 +296,70 @@ impl Preset {
             Self::Nord => [
                 0xd8dee9, 0x2e3440, 0xebcb8b, 0x434f65, 0xeceff4, 0x61583e, 0xd8dee9, 0x8c9bb0,
                 0x81a1c1, 0xa3be8c, 0x8c9bb0, 0xb48ead, 0x88c0d0, 0x8fbcbb, 0xebcb8b,
+            ],
+            Self::Dracula => [
+                0xf8f8f2, 0x282a36, 0xf1fa8c, 0x44475a, 0xf8f8f2, 0x66543c, 0xf8f8f2, 0x929cc2,
+                0xff79c6, 0xf1fa8c, 0x929cc2, 0xbd93f9, 0x50fa7b, 0x8be9fd, 0xffb86c,
+            ],
+            Self::GitHubDark => [
+                0xe6edf3, 0x0d1117, 0xffd866, 0x264466, 0xffffff, 0x5b4718, 0x58a6ff, 0x8b949e,
+                0xff7b72, 0xa5d6ff, 0x8b949e, 0x79c0ff, 0xd2a8ff, 0xffa657, 0x7ee787,
+            ],
+            Self::GitHubLight => [
+                0x1f2328, 0xffffff, 0x8250df, 0xb6d7ff, 0x1f2328, 0xffe49c, 0x0969da, 0x636c76,
+                0xcf222e, 0x0a3069, 0x636c76, 0x0550ae, 0x8250df, 0x953800, 0x116329,
+            ],
+            Self::TokyoNight => [
+                0xc0caf5, 0x1a1b26, 0xe0af68, 0x33467c, 0xc0caf5, 0x59472c, 0xc0caf5, 0x828bb8,
+                0xbb9af7, 0x9ece6a, 0x828bb8, 0xff9e64, 0x7aa2f7, 0x2ac3de, 0x7dcfff,
+            ],
+            Self::CatppuccinMocha => [
+                0xcdd6f4, 0x1e1e2e, 0xf9e2af, 0x45475a, 0xcdd6f4, 0x62513d, 0xf5e0dc, 0x9399b2,
+                0xcba6f7, 0xa6e3a1, 0x9399b2, 0xfab387, 0x89b4fa, 0xf9e2af, 0xf5c2e7,
+            ],
+            Self::CatppuccinLatte => [
+                0x4c4f69, 0xeff1f5, 0x8839ef, 0xccd0da, 0x4c4f69, 0xf5d99b, 0xdc8a78, 0x696c82,
+                0x8839ef, 0x32751b, 0x696c82, 0xa94708, 0x1e66f5, 0x8a5a00, 0xa72c87,
+            ],
+            Self::GruvboxDark => [
+                0xebdbb2, 0x282828, 0xfabd2f, 0x504945, 0xfbf1c7, 0x66512c, 0xebdbb2, 0xa89984,
+                0xfb4934, 0xb8bb26, 0xa89984, 0xd3869b, 0x8ec07c, 0xfabd2f, 0x83a598,
+            ],
+            Self::GruvboxLight => [
+                0x3c3836, 0xfbf1c7, 0x8f3f71, 0xd5c4a1, 0x3c3836, 0xf2d786, 0x3c3836, 0x776a60,
+                0x9d0006, 0x646900, 0x776a60, 0x8f3f71, 0x427b58, 0x9a5800, 0x076678,
+            ],
+            Self::SolarizedDark => [
+                0x93a1a1, 0x002b36, 0xb58900, 0x164652, 0xeee8d5, 0x40330d, 0x93a1a1, 0x839496,
+                0x4aa5d8, 0x929900, 0x839496, 0xd087af, 0xb58900, 0x42b6ac, 0xe08035,
+            ],
+            Self::SolarizedLight => [
+                0x586e75, 0xfdf6e3, 0x8b6800, 0xd4e4e5, 0x073642, 0xf9edc5, 0x586e75, 0x5d7279,
+                0x216b9b, 0x6c7100, 0x5d7279, 0xa03c76, 0x8b6800, 0x167a72, 0xa84c05,
+            ],
+            Self::NightOwl => [
+                0xd6deeb, 0x011627, 0xffcb8b, 0x1d3b53, 0xffffff, 0x59452f, 0x80a4c2, 0x7e9eae,
+                0xc792ea, 0xecc48d, 0x7e9eae, 0xf78c6c, 0x82aaff, 0xffcb8b, 0xaddb67,
+            ],
+            Self::AyuDark => [
+                0xbfbdb6, 0x0b0e14, 0xf29668, 0x253b53, 0xe6e1cf, 0x584423, 0xe6b450, 0x858b94,
+                0xff8f40, 0xaad94c, 0x858b94, 0xd2a6ff, 0xffb454, 0x59c2ff, 0x95e6cb,
+            ],
+            Self::AyuLight => [
+                0x575f66, 0xf8f9fa, 0xa65214, 0xc6dcef, 0x343b42, 0xf5dfa5, 0x8a6000, 0x6b737c,
+                0xa65214, 0x588000, 0x6b737c, 0x8455bb, 0x8a6000, 0x0076a8, 0x267568,
+            ],
+            Self::EverforestDark => [
+                0xd3c6aa, 0x2d353b, 0xdbbc7f, 0x4c5b54, 0xe8ddc4, 0x585036, 0xd3c6aa, 0x9da9a0,
+                0xe67e80, 0xa7c080, 0x9da9a0, 0xd699b6, 0xa7c080, 0xdbbc7f, 0x83c092,
+            ],
+            Self::RosePine => [
+                0xe0def4, 0x191724, 0xf6c177, 0x403d52, 0xe0def4, 0x594533, 0xebbcba, 0x908caa,
+                0xc4a7e7, 0xf6c177, 0x908caa, 0xebbcba, 0xeb6f92, 0x9ccfd8, 0x6eb5cb,
+            ],
+            Self::RosePineDawn => [
+                0x575279, 0xfaf4ed, 0x925b12, 0xdfdad9, 0x575279, 0xf4d9b0, 0x907aa9, 0x726b87,
+                0x80609b, 0x925b12, 0x726b87, 0xa34d58, 0xb4355b, 0x286983, 0x477c86,
             ],
         };
         let c = values.map(|hex| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8));
@@ -558,6 +693,7 @@ fn parse_line(
 
 #[derive(Clone)]
 pub(crate) struct Render {
+    pub texture: Texture,
     pub colors: Colors,
     pub language: String,
     pub syntax: bool,
@@ -584,6 +720,7 @@ impl Render {
             }
         }
         Self {
+            texture: theme.texture,
             colors: theme.colors(dark),
             fast_json: language == "JSON",
             language,
@@ -1264,8 +1401,32 @@ impl LiteTextApp {
             .color(pal.text_faint),
         );
         ui.add_space(8.0);
+        let texture_label = if zh { "工作区纹路" } else { "Workspace texture" };
+        let preset_label = if zh { "内置风格" } else { "Preset" };
+        let label_width = [texture_label, preset_label].into_iter().map(|label| {
+            ui.painter().layout_no_wrap(label.to_owned(),
+                egui::TextStyle::Body.resolve(ui.style()), pal.text_main).size().x
+        }).fold(0.0_f32, f32::max);
+        let selector_width = 230.0_f32.min((ui.available_width() - label_width - ui.spacing().item_spacing.x).max(100.0));
         ui.horizontal_wrapped(|ui| {
-            ui.label(if zh { "内置风格" } else { "Preset" });
+            ui.add_sized([label_width, 26.0], egui::Label::new(texture_label).halign(egui::Align::LEFT));
+            if let Some(texture) = crate::dropdown(
+                ui,
+                pal,
+                egui::Id::new("workspace_texture"),
+                self.workspace_theme.texture.label(zh).to_owned(),
+                [Texture::Default, Texture::Notebook]
+                    .into_iter()
+                    .map(|texture| (texture.label(zh).to_owned(), texture))
+                    .collect(),
+                selector_width,
+            ) {
+                self.workspace_theme.texture = texture;
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_sized([label_width, 26.0], egui::Label::new(preset_label).halign(egui::Align::LEFT));
             if let Some(preset) = crate::dropdown(
                 ui,
                 pal,
@@ -1275,7 +1436,7 @@ impl LiteTextApp {
                     .into_iter()
                     .map(|p| (p.label(zh).to_owned(), p))
                     .collect(),
-                230.0,
+                selector_width,
             ) {
                 self.workspace_theme.preset = preset;
                 self.workspace_theme.custom = None;
@@ -1410,6 +1571,114 @@ impl LiteTextApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_texture_defaults_persists_and_reaches_render() {
+        assert_eq!(Texture::default(), Texture::Default);
+        for json in ["{}", r#"{"preset":"Monokai","syntax":false,"custom":null}"#] {
+            let theme: WorkspaceTheme = serde_json::from_str(json).unwrap();
+            assert_eq!(theme.texture, Texture::Default);
+        }
+        for json in ["{}", r#"{"workspace_theme":{"preset":"Nord"}}"#] {
+            let app: LiteTextApp = serde_json::from_str(json).unwrap();
+            assert_eq!(app.workspace_theme.texture, Texture::Default);
+        }
+        for texture in [Texture::Default, Texture::Notebook] {
+            let theme = WorkspaceTheme {
+                texture,
+                preset: Preset::Monokai,
+                syntax: false,
+                custom: Some(Colors::preset(false)),
+            };
+            let json = serde_json::to_string(&theme).unwrap();
+            let restored: WorkspaceTheme = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.texture, texture);
+            assert_eq!(restored.preset, theme.preset);
+            assert_eq!(restored.syntax, theme.syntax);
+            assert_eq!(restored.custom, theme.custom);
+            let app = LiteTextApp { workspace_theme: restored, ..Default::default() };
+            let restored: LiteTextApp =
+                serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
+            assert_eq!(restored.workspace_theme.texture, texture);
+            for dark in [false, true] {
+                let render = Render::prepare(
+                    &restored.workspace_theme, dark, "text".into(), (0, 0), Default::default(),
+                );
+                assert_eq!(render.texture, texture);
+                assert_eq!(render.colors, theme.colors(dark));
+                assert!(!render.syntax);
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_texture_ui_is_above_presets_localized_and_selectable() {
+        for lang in [Lang::ZhCn, Lang::En] {
+            let ctx = egui::Context::default();
+            crate::setup_fonts(&ctx);
+            let mut app = LiteTextApp { lang, ..Default::default() };
+            app.workspace_theme.preset = Preset::Nord;
+            app.workspace_theme.custom = Some(Colors::preset(false));
+            app.workspace_theme.syntax = false;
+            let before = app.workspace_theme.clone();
+            let pal = before.palette(None);
+            crate::apply_style(&ctx, &pal);
+            let frame = |app: &mut LiteTextApp, events| {
+                ctx.run(raw(events, egui::vec2(1080.0, 720.0)), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.workspace_theme_ui(ui, &pal));
+                })
+            };
+            let mut output = frame(&mut app, vec![]);
+            for _ in 0..2 { output = frame(&mut app, vec![]); }
+            let zh = lang == Lang::ZhCn;
+            let label = if zh { "工作区纹路" } else { "Workspace texture" };
+            assert!(output.shapes.iter().any(|shape| matches!(
+                &shape.shape, egui::Shape::Text(text) if text.galley.text() == label
+            )));
+            let id = egui::Id::new("workspace_texture");
+            let button = ctx.data(|d| d.get_temp::<egui::Rect>(id.with("button_rect"))).unwrap();
+            let preset = ctx.data(|d| d.get_temp::<egui::Rect>(
+                egui::Id::new("workspace_theme_preset").with("button_rect")
+            )).unwrap();
+            assert_eq!(button.width(), 230.0);
+            assert_eq!(button.width(), preset.width());
+            assert!((button.left() - preset.left()).abs() < 0.1);
+            assert!(button.bottom() < preset.top());
+            assert!(output.shapes.iter().any(|shape| matches!(
+                &shape.shape, egui::Shape::Text(text) if text.galley.text() == Texture::Default.label(zh)
+            )));
+            let click = |app: &mut LiteTextApp, pos| {
+                for pressed in [true, false] {
+                    frame(app, vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos, button: egui::PointerButton::Primary, pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                }
+            };
+            for texture in [Texture::Notebook, Texture::Default] {
+                click(&mut app, button.center());
+                for _ in 0..3 { frame(&mut app, vec![]); }
+                assert!(ctx.memory(|m| m.is_popup_open(id)));
+                for option in [Texture::Default, Texture::Notebook] {
+                    assert!(ctx.data(|d| d.get_temp::<egui::Rect>(
+                        id.with(("option_rect", option.label(zh)))
+                    )).is_some());
+                }
+                let option = ctx.data(|d| d.get_temp::<egui::Rect>(
+                    id.with(("option_rect", texture.label(zh)))
+                )).unwrap();
+                click(&mut app, option.center());
+                assert_eq!(app.workspace_theme.texture, texture);
+                assert!(!ctx.memory(|m| m.is_popup_open(id)));
+                assert_eq!(app.workspace_theme.preset, before.preset);
+                assert_eq!(app.workspace_theme.custom, before.custom);
+                assert_eq!(app.workspace_theme.syntax, before.syntax);
+            }
+        }
+    }
 
     #[test]
     fn log_highlighting_is_theme_aware_utf8_safe_and_viewport_only() {
@@ -1557,6 +1826,82 @@ mod tests {
         assert!(labels.contains(&"全局主题    ›"));
         for obsolete in ["主题", "黑夜", "白天", "工作区主题    ›"] {
             assert!(!labels.contains(&obsolete));
+        }
+    }
+
+    #[test]
+    fn builtin_presets_serde_roundtrip_and_legacy_defaults_remain_compatible() {
+        assert_eq!(Preset::default(), Preset::Auto);
+        for json in ["{}", r#"{"syntax":false}"#] {
+            let theme: WorkspaceTheme = serde_json::from_str(json).unwrap();
+            assert_eq!(theme.preset, Preset::Auto);
+            assert_eq!(theme.texture, Texture::Default);
+            assert!(theme.custom.is_none());
+        }
+        let mut names = Vec::new();
+        let mut labels = Vec::new();
+        for preset in Preset::ALL {
+            let json = serde_json::to_string(&preset).unwrap();
+            assert_eq!(serde_json::from_str::<Preset>(&json).unwrap(), preset);
+            assert!(!names.contains(&json), "duplicate enum entry {preset:?}");
+            names.push(json);
+            assert!(!labels.contains(&preset.label(false)), "duplicate label {preset:?}");
+            labels.push(preset.label(false));
+            assert!(!preset.label(true).is_empty());
+            let theme = WorkspaceTheme { preset, ..Default::default() };
+            let restored: WorkspaceTheme =
+                serde_json::from_str(&serde_json::to_string(&theme).unwrap()).unwrap();
+            assert_eq!(restored.preset, preset);
+            for dark in [false, true] {
+                assert_eq!(restored.colors(dark), preset.colors(dark));
+            }
+        }
+        // Existing serialized names retain their meaning, independently of ALL's size/order.
+        for (name, preset) in [
+            ("Auto", Preset::Auto), ("DarkPlus", Preset::DarkPlus),
+            ("LightPlus", Preset::LightPlus), ("Darcula", Preset::Darcula),
+            ("IntelliJLight", Preset::IntelliJLight), ("Monokai", Preset::Monokai),
+            ("Mariana", Preset::Mariana), ("OneDark", Preset::OneDark), ("Nord", Preset::Nord),
+            ("RosePineDawn", Preset::RosePineDawn),
+        ] {
+            assert_eq!(serde_json::from_value::<Preset>(serde_json::json!(name)).unwrap(), preset);
+            assert!(Preset::ALL.contains(&preset));
+        }
+    }
+
+    #[test]
+    fn builtin_palettes_keep_text_selection_comments_and_gutters_readable() {
+        let luminance = |color: Color32| {
+            let linear = |channel: u8| {
+                let value = channel as f64 / 255.0;
+                if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        };
+        let contrast = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for preset in Preset::ALL {
+            for dark in [false, true] {
+                let colors = preset.colors(dark);
+                // Preserve older muted palettes; new inspired palettes meet 4.5:1 here.
+                let muted_minimum = match preset {
+                    Preset::Darcula | Preset::Mariana | Preset::OneDark | Preset::Nord => 3.9,
+                    _ => 4.5,
+                };
+                let search_minimum = if preset == Preset::OneDark { 3.4 } else { 4.5 };
+                for (slot, foreground, background, minimum) in [
+                    ("text", colors.text, colors.background, 4.5),
+                    ("selected text", colors.selected_text, colors.selection, 4.5),
+                    ("search text", colors.text, colors.search, search_minimum),
+                    ("comment", colors.comment, colors.background, muted_minimum),
+                    ("gutter", colors.gutter, colors.background, muted_minimum),
+                ] {
+                    let ratio = contrast(foreground, background);
+                    assert!(ratio >= minimum, "{preset:?} {slot}: {ratio:.2} < {minimum}");
+                }
+            }
         }
     }
 

@@ -12,6 +12,7 @@ pub(crate) enum Action {
     Close,
     NextTab,
     PreviousTab,
+    ReopenClosed,
     Settings,
     ZoomIn,
     ZoomOut,
@@ -43,6 +44,7 @@ pub(crate) const ACTIONS: &[Action] = &[
     Action::Close,
     Action::NextTab,
     Action::PreviousTab,
+    Action::ReopenClosed,
     Action::Settings,
     Action::ZoomIn,
     Action::ZoomOut,
@@ -82,6 +84,7 @@ impl Action {
             Open => (command, Key::O),
             Save => (command, Key::S),
             Close => (command, Key::W),
+            ReopenClosed => (shift, Key::T),
             Settings => (command, Key::Comma),
             ZoomIn => (command, Key::Plus),
             ZoomOut => (command, Key::Minus),
@@ -115,7 +118,7 @@ impl Action {
     fn group(self) -> usize {
         use Action::*;
         match self {
-            New | Open | Save | Close | NextTab | PreviousTab | Settings | ZoomIn | ZoomOut => 0,
+            New | Open | Save | Close | NextTab | PreviousTab | ReopenClosed | Settings | ZoomIn | ZoomOut => 0,
             Undo | Redo | Cut | Copy | Paste | SelectAll | DeleteLine | Comment => 1,
             Find | FocusReplace | NextMatch | PreviousMatch | Replace | ReplaceAll | Count => 2,
             HexCase | DimZeros | Ascii | Invisible => 3,
@@ -131,6 +134,7 @@ impl Action {
             Open => t.open_file,
             Save => t.save,
             Close => t.close,
+            ReopenClosed => if zh { "恢复最近关闭的标签" } else { "Reopen closed tab" },
             Settings => t.settings,
             ZoomIn => {
                 if zh {
@@ -483,6 +487,7 @@ impl LiteTextApp {
 
     pub(crate) fn shortcuts_blocked(&self) -> bool {
         self.show_settings
+            || self.text_diff.open
             || self.restoring()
             || !self.open_errors.is_empty() && !self.opening_files()
             || self.pending_batch.is_some()
@@ -504,6 +509,7 @@ impl LiteTextApp {
     /// operations still do.
     pub(crate) fn status_controls_blocked(&self) -> bool {
         self.show_settings
+            || self.text_diff.open
             || self.restoring()
             || !self.open_errors.is_empty() && !self.opening_files()
             || self.pending_batch.is_some()
@@ -549,6 +555,7 @@ impl LiteTextApp {
                 ZoomIn => self.zoom_workspace(1.0, ctx),
                 ZoomOut => self.zoom_workspace(-1.0, ctx),
                 New => self.new_document(),
+                ReopenClosed => self.reopen_closed_tab(),
                 Open => self.open_dialog(),
                 Save => save = true,
                 Close => {

@@ -21,6 +21,10 @@ mod shortcuts;
 mod line_commands;
 mod json_plugin;
 mod workspace_theme;
+mod notebook;
+mod recent_closed;
+mod undo_settings;
+mod text_diff;
 mod whitespace;
 mod terminal;
 mod updater;
@@ -48,6 +52,8 @@ mod scratch;
 #[cfg(test)]
 #[path = "settings_popup_tests.rs"]
 mod settings_popup_tests;
+#[cfg(test)]
+mod menu_selection_tests;
 #[cfg(test)]
 #[path = "status_bar_tests.rs"]
 mod status_bar_tests;
@@ -475,6 +481,12 @@ struct LiteTextApp {
     tab_close_mode: TabCloseMode,
     /// Show document tabs in a vertical sidebar instead of the top bar.
     vertical_tabs: bool,
+    /// Maximum retained undo steps; changes take effect only after confirmation.
+    undo_limit: usize,
+    #[serde(skip)]
+    undo_limit_input: Option<String>,
+    #[serde(skip)]
+    undo_limit_error: Option<String>,
     terminal: terminal::Settings,
     updates: updater::Settings,
     #[serde(skip)]
@@ -534,6 +546,10 @@ struct LiteTextApp {
     menu_conversion_open: bool,
     #[serde(skip)]
     show_curl_menu: bool,
+    #[serde(skip)]
+    recent_closed: recent_closed::State,
+    #[serde(skip)]
+    text_diff: text_diff::State,
     #[cfg(test)]
     #[serde(skip)]
     new_window_requested: bool,
@@ -640,6 +656,9 @@ impl Default for LiteTextApp {
             tab_mode: Default::default(),
             tab_close_mode: Default::default(),
             vertical_tabs: false,
+            undo_limit: 50,
+            undo_limit_input: None,
+            undo_limit_error: None,
             terminal: Default::default(),
             updates: Default::default(),
             diagnostics_settings: Default::default(),
@@ -669,6 +688,8 @@ impl Default for LiteTextApp {
             menu_whitespace_open: false,
             menu_conversion_open: false,
             show_curl_menu: false,
+            recent_closed: Default::default(),
+            text_diff: Default::default(),
             #[cfg(test)]
             new_window_requested: false,
             plugin_error: None,
@@ -912,6 +933,8 @@ enum MenuAction {
     Open,
     SaveAs,
     NewWindow,
+    ReopenClosed,
+    CompareText,
     Recent(PathBuf),
     Settings,
     FormatJson,
@@ -1010,6 +1033,7 @@ impl LiteTextApp {
             let validate = self.recovery_key.is_none() || external_change;
             self.recovery_key = None;
             recovery::store_buffers(&path, &self.files, self.active_id, validate)?;
+            self.scratch_snapshot_committed();
             self.recovery_key = Some(key);
             self.recovery_stamp = stamp(&path);
             self.remember_recovered_versions();
@@ -1346,23 +1370,23 @@ impl LiteTextApp {
         }
         #[cfg(test)]
         if let Some(path) = source {
-            let drafts = scratch::scan(self.scratch_root().as_deref());
-            let result = recovery::load(&path).map(|session| match session {
-                Some(session) => background_io::Restored {
-                    files: session.restore(),
-                    active: session.active_id,
-                    scratch_active: session.scratch_active().map(str::to_owned),
-                    scratch_meta: session.scratch_meta(),
-                    drafts,
+            let result = recovery::load(&path).and_then(|session| Ok(match session {
+                Some(session) => {
+                    let active = session.active_id;
+                    let scratch_active = session.scratch_active().map(str::to_owned);
+                    let scratch_meta = session.scratch_meta();
+                    let (files, leases) = session.restore_claimed()?;
+                    background_io::Restored {
+                        files, leases, active, scratch_active, scratch_meta,
+                        drafts: scratch::scan(self.scratch_root().as_deref()),
+                    }
                 },
                 None => background_io::Restored {
-                    files: Vec::new(),
-                    active: None,
-                    scratch_active: None,
-                    scratch_meta: Vec::new(),
-                    drafts,
+                    files: Vec::new(), leases: Default::default(), active: None,
+                    scratch_active: None, scratch_meta: Vec::new(),
+                    drafts: scratch::scan(self.scratch_root().as_deref()),
                 },
-            });
+            }));
             self.apply_restored(result);
             self.recent_files.retain(|p| p.exists());
             return;
@@ -1409,6 +1433,7 @@ impl LiteTextApp {
     fn close_tab(&mut self, id: u64) {
         if let Some(pos) = self.files.iter().position(|f| f.id == id && !f.pinned) {
             let file = self.files.remove(pos);
+            self.remember_closed(&file);
             self.retire_file(file);
             if self.active_id == Some(id) {
                 // 优先激活右侧邻位，否则最后一个（左侧）
@@ -1430,6 +1455,7 @@ impl LiteTextApp {
             if file.id == id || file.pinned {
                 kept.push(file);
             } else {
+                self.remember_closed(&file);
                 self.retire_file(file);
             }
         }
@@ -1447,7 +1473,8 @@ impl LiteTextApp {
                 if index >= pos || file.id == id || file.pinned {
                     kept.push(file);
                 } else {
-                    self.retire_file(file);
+                    self.remember_closed(&file);
+                self.retire_file(file);
                 }
             }
             self.files = kept;
@@ -1462,7 +1489,8 @@ impl LiteTextApp {
                 if index <= pos || file.id == id || file.pinned {
                     kept.push(file);
                 } else {
-                    self.retire_file(file);
+                    self.remember_closed(&file);
+                self.retire_file(file);
                 }
             }
             self.files = kept;
@@ -1791,6 +1819,7 @@ impl eframe::App for LiteTextApp {
                 .round()
                 .clamp(MIN_WORKSPACE_FONT_SIZE, MAX_WORKSPACE_FONT_SIZE)
         } else { 14.0 };
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("workspace_undo_limit"), self.undo_limit.clamp(20, 500)));
         self.poll_terminal();
         self.poll_updates();
         #[cfg(not(test))]
@@ -1909,6 +1938,7 @@ impl eframe::App for LiteTextApp {
         self.settings_window(ctx, pal);
         self.plugin_error_window(ctx);
         self.curl_target_menu(ctx, pal);
+        self.text_diff_window(ctx, pal);
         self.inspector_popup_window(ctx, pal);
         // Handle save after TextEdit so this frame's input is included.
         if cmd_s && let Some(id) = self.active_id {
@@ -1997,7 +2027,8 @@ impl LiteTextApp {
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         // Including the frame, longest label + one character on each side.
-                        let labels = [t.menu_open, t.save_as, new_window_label, &recent_label, &plugins_label, &whitespace_label, &conversion_label, t.settings];
+                        let labels = [t.menu_open, t.save_as, new_window_label, &recent_label, &plugins_label, t.settings,
+                            if self.lang == Lang::ZhCn { "恢复最近关闭的标签" } else { "Reopen closed tab" }];
                         let width = app_menu_width(ui, &labels, pal);
                         ui.set_width(width);
                         if app_menu_row(ui, t.menu_open, false, pal).on_hover_text(t.open_file).clicked() {
@@ -2011,6 +2042,9 @@ impl LiteTextApp {
                         if app_menu_row(ui, new_window_label, false, pal).clicked() {
                             action = Some(MenuAction::NewWindow);
                         }
+                        let reopen = ui.add_enabled_ui(self.can_reopen_closed() && !self.shortcuts_blocked(), |ui|
+                            app_menu_row(ui, if self.lang == Lang::ZhCn { "恢复最近关闭的标签" } else { "Reopen closed tab" }, false, pal)).inner;
+                        if reopen.clicked() { action = Some(MenuAction::ReopenClosed); }
                         app_menu_separator(ui, pal);
                         let recent = app_menu_row(ui, &recent_label, self.menu_recent_open, pal);
                         recent_row = recent.rect;
@@ -2027,26 +2061,6 @@ impl LiteTextApp {
                         if plugins.hovered() || plugins.clicked() {
                             self.menu_plugins_open = true;
                             self.menu_recent_open = false;
-                            self.menu_whitespace_open = false;
-                            self.menu_conversion_open = false;
-                        }
-                        app_menu_separator(ui, pal);
-                        let whitespace = app_menu_row(ui, &whitespace_label, self.menu_whitespace_open, pal);
-                        whitespace_row = whitespace.rect;
-                        if whitespace.hovered() || whitespace.clicked() {
-                            self.menu_whitespace_open = true;
-                            self.menu_conversion_open = false;
-                            self.menu_recent_open = false;
-                            self.menu_plugins_open = false;
-                        }
-                        app_menu_separator(ui, pal);
-                        let conversion = app_menu_row(ui, &conversion_label, self.menu_conversion_open, pal);
-                        conversion_row = conversion.rect;
-                        if conversion.hovered() || conversion.clicked() {
-                            self.menu_conversion_open = true;
-                            self.menu_whitespace_open = false;
-                            self.menu_recent_open = false;
-                            self.menu_plugins_open = false;
                         }
                         app_menu_separator(ui, pal);
                         if app_menu_row(ui, t.settings, false, pal).clicked() {
@@ -2062,10 +2076,67 @@ impl LiteTextApp {
         });
         let submenu_x = if opens_right { menu.response.rect.right() + 4.0 } else { menu.response.rect.left() - 4.0 };
         let mut submenu_rect = None;
-        if self.menu_conversion_open {
+        let mut child_rect = None;
+        let mut plugins_rect = None;
+        if self.menu_plugins_open {
+            let submenu = egui::Area::new(egui::Id::new("app_plugins_submenu"))
+                .order(egui::Order::Foreground)
+                .pivot(menu_pivot)
+                .fixed_pos(egui::pos2(submenu_x, plugins_row.top() - 6.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new().fill(pal.bg_panel)
+                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
+                        .corner_radius(8.0).inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            let curl_label = if self.lang == Lang::ZhCn { "curl解析  ›" } else { "Parse cURL  ›" };
+                            let compare_label = if self.lang == Lang::ZhCn { "文本对比…" } else { "Compare text…" };
+                            ui.set_width(app_menu_width(ui, &["Format JSON", "Format HTML", "Format Header", "Format Cookie", curl_label, compare_label, &conversion_label, &whitespace_label], pal));
+                            let enabled = !self.shortcuts_blocked() && self.active().is_some_and(|f| f.view == ViewMode::Text && !f.is_binary && f.draft_text.is_some());
+                            ui.add_enabled_ui(enabled, |ui| {
+                                if app_menu_row(ui, "Format JSON", false, pal).clicked() {
+                                    action = Some(MenuAction::FormatJson);
+                                }
+                                for tool in [web_tools::Action::Html, web_tools::Action::Header, web_tools::Action::Cookie] {
+                                    if app_menu_row(ui, tool.label(), false, pal).clicked() { action = Some(MenuAction::WebTool(tool)); }
+                                }
+                                app_menu_separator(ui, pal);
+                                if app_menu_row(ui, curl_label, false, pal).clicked() { action = Some(MenuAction::CurlMenu); }
+                            });
+                            ui.add_enabled_ui(enabled, |ui| {
+                                let conversion = app_menu_row(ui, &conversion_label, self.menu_conversion_open, pal);
+                                conversion_row = conversion.rect;
+                                if conversion.hovered() || conversion.clicked() {
+                                    self.menu_conversion_open = true;
+                                    self.menu_whitespace_open = false;
+                                }
+                                let whitespace = app_menu_row(ui, &whitespace_label, self.menu_whitespace_open, pal);
+                                whitespace_row = whitespace.rect;
+                                if whitespace.hovered() || whitespace.clicked() {
+                                    self.menu_whitespace_open = true;
+                                    self.menu_conversion_open = false;
+                                }
+                            });
+                            ui.add_enabled_ui(!self.shortcuts_blocked(), |ui| {
+                                let compare = app_menu_row(ui, compare_label, false, pal);
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("app_compare_text_rect"), compare.rect));
+                                if compare.clicked() { action = Some(MenuAction::CompareText); }
+                            });
+                        });
+                });
+            submenu_rect = Some(submenu.response.rect);
+            let bridge = submenu_bridge(plugins_row, submenu.response.rect);
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("app_plugins_submenu_rect"), submenu.response.rect);
+                d.insert_temp(egui::Id::new("app_plugins_bridge_rect"), bridge);
+            });
+            plugins_rect = Some(submenu.response.rect);
+        }
+        // Nested tools anchor to the plugin panel, not the top-level menu.
+        let child_x = plugins_rect.map_or(submenu_x, |rect| if opens_right { rect.right() + 4.0 } else { rect.left() - 4.0 });
+        if self.menu_plugins_open && self.menu_conversion_open {
             let submenu = egui::Area::new(egui::Id::new("app_conversion_submenu"))
                 .order(egui::Order::Foreground).pivot(menu_pivot)
-                .fixed_pos(egui::pos2(submenu_x, conversion_row.top() - 6.0))
+                .fixed_pos(egui::pos2(child_x, conversion_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
@@ -2083,7 +2154,7 @@ impl LiteTextApp {
                             });
                         });
                 });
-            submenu_rect = Some(submenu.response.rect);
+            child_rect = Some(submenu.response.rect);
             let bridge = submenu_bridge(conversion_row, submenu.response.rect);
             ctx.data_mut(|d| {
                 d.insert_temp(egui::Id::new("app_conversion_submenu_rect"), submenu.response.rect);
@@ -2093,10 +2164,10 @@ impl LiteTextApp {
                 !conversion_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) { self.menu_conversion_open = false; }
         }
-        if self.menu_whitespace_open {
+        if self.menu_plugins_open && self.menu_whitespace_open {
             let submenu = egui::Area::new(egui::Id::new("app_whitespace_submenu"))
                 .order(egui::Order::Foreground).pivot(menu_pivot)
-                .fixed_pos(egui::pos2(submenu_x, whitespace_row.top() - 6.0))
+                .fixed_pos(egui::pos2(child_x, whitespace_row.top() - 6.0))
                 .show(ctx, |ui| {
                     egui::Frame::new().fill(pal.bg_panel)
                         .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
@@ -2114,7 +2185,7 @@ impl LiteTextApp {
                             });
                         });
                 });
-            submenu_rect = Some(submenu.response.rect);
+            child_rect = Some(submenu.response.rect);
             let bridge = submenu_bridge(whitespace_row, submenu.response.rect);
             ctx.data_mut(|d| {
                 d.insert_temp(egui::Id::new("app_whitespace_submenu_rect"), submenu.response.rect);
@@ -2124,41 +2195,24 @@ impl LiteTextApp {
                 !whitespace_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
             }) { self.menu_whitespace_open = false; }
         }
-        if self.menu_plugins_open {
-            let submenu = egui::Area::new(egui::Id::new("app_plugins_submenu"))
-                .order(egui::Order::Foreground)
-                .pivot(menu_pivot)
-                .fixed_pos(egui::pos2(submenu_x, plugins_row.top() - 6.0))
-                .show(ctx, |ui| {
-                    egui::Frame::new().fill(pal.bg_panel)
-                        .stroke(Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.55)))
-                        .corner_radius(8.0).inner_margin(egui::Margin::same(6))
-                        .show(ui, |ui| {
-                            let curl_label = if self.lang == Lang::ZhCn { "curl解析  ›" } else { "Parse cURL  ›" };
-                            ui.set_width(app_menu_width(ui, &["Format JSON", "Format HTML", "Format Header", "Format Cookie", curl_label], pal));
-                            let enabled = !self.shortcuts_blocked() && self.active().is_some_and(|f| f.view == ViewMode::Text && !f.is_binary && f.draft_text.is_some());
-                            ui.add_enabled_ui(enabled, |ui| {
-                                if app_menu_row(ui, "Format JSON", false, pal).clicked() {
-                                    action = Some(MenuAction::FormatJson);
-                                }
-                                for tool in [web_tools::Action::Html, web_tools::Action::Header, web_tools::Action::Cookie] {
-                                    if app_menu_row(ui, tool.label(), false, pal).clicked() { action = Some(MenuAction::WebTool(tool)); }
-                                }
-                                app_menu_separator(ui, pal);
-                                if app_menu_row(ui, curl_label, false, pal).clicked() { action = Some(MenuAction::CurlMenu); }
-                            });
-                        });
-                });
-            submenu_rect = Some(submenu.response.rect);
-            let bridge = submenu_bridge(plugins_row, submenu.response.rect);
-            ctx.data_mut(|d| {
-                d.insert_temp(egui::Id::new("app_plugins_submenu_rect"), submenu.response.rect);
-                d.insert_temp(egui::Id::new("app_plugins_bridge_rect"), bridge);
-            });
+        if let Some(rect) = plugins_rect {
+            let bridge = submenu_bridge(plugins_row, rect);
+            let child_bridge = child_rect.map(|child| submenu_bridge(
+                if self.menu_conversion_open { conversion_row } else { whitespace_row }, child));
             if ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
-                !plugins_row.contains(p) && !submenu.response.rect.contains(p) && !bridge.contains(p)
-            }) { self.menu_plugins_open = false; }
+                !plugins_row.contains(p) && !rect.contains(p) && !bridge.contains(p)
+                    && !child_rect.is_some_and(|child| child.contains(p))
+                    && !child_bridge.is_some_and(|bridge| bridge.contains(p))
+            }) {
+                self.menu_plugins_open = false;
+                self.menu_conversion_open = false;
+                self.menu_whitespace_open = false;
+            }
         }
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("app_conversion_row_rect"), conversion_row);
+            d.insert_temp(egui::Id::new("app_whitespace_row_rect"), whitespace_row);
+        });
         if self.menu_recent_open {
             let submenu = egui::Area::new(egui::Id::new("app_recent_submenu"))
                 .order(egui::Order::Foreground)
@@ -2213,6 +2267,7 @@ impl LiteTextApp {
                 || (i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| {
                     !anchor.contains(p) && !menu.response.rect.contains(p)
                         && !submenu_rect.is_some_and(|rect| rect.contains(p))
+                        && !child_rect.is_some_and(|rect| rect.contains(p))
                 }))
         });
         if action.is_some() || dismiss {
@@ -2226,6 +2281,8 @@ impl LiteTextApp {
             Some(MenuAction::Open) => OPEN_REQUEST.store(true, Ordering::Relaxed),
             Some(MenuAction::SaveAs) => { self.save_as(); },
             Some(MenuAction::NewWindow) => self.open_new_window(),
+            Some(MenuAction::ReopenClosed) => self.reopen_closed_tab(),
+            Some(MenuAction::CompareText) => self.text_diff.open = true,
             Some(MenuAction::Recent(path)) => self.open_paths(vec![path]),
             Some(MenuAction::Settings) => { self.show_settings = true; self.shortcuts_page = false; self.workspace_theme_page = false; self.font_page = false; self.font_previews.clear(); },
             Some(MenuAction::FormatJson) if !self.shortcuts_blocked() => self.format_active_json(ctx),
@@ -2416,7 +2473,7 @@ impl LiteTextApp {
                                         egui::StrokeKind::Inside,
                                     );
                                 }
-                                if dirty { p.rect_filled(rect.shrink(1.0), 6.0, pal.danger.gamma_multiply(if active { 0.12 } else { 0.08 })); }
+                                if dirty { p.rect_filled(rect.shrink(1.0), 6.0, pal.accent.gamma_multiply(if active { 0.15 } else { 0.05 })); }
                                 paint_tab_title(
                                     &p,
                                     rect,
@@ -2489,7 +2546,7 @@ impl LiteTextApp {
                                     egui::StrokeKind::Inside,
                                 );
                                 if self.files.iter().any(|f| f.id == drag_id && f.has_unsaved_changes()) {
-                                    p2.rect_filled(float_rect.shrink(1.0), 6.0, pal.danger.gamma_multiply(0.12));
+                                    p2.rect_filled(float_rect.shrink(1.0), 6.0, pal.accent.gamma_multiply(0.15));
                                 }
                                 paint_tab_title(
                                     &p2,
@@ -2849,6 +2906,80 @@ impl LiteTextApp {
                                         }
                                     });
                                 });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    let zh = self.lang == Lang::ZhCn;
+                                    ui.label(RichText::new(if zh { "撤销步数" } else { "Undo steps" }).size(13.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let input = self.undo_limit_input.get_or_insert_with(|| self.undo_limit.to_string());
+                                        let (control, _) = ui.allocate_exact_size(egui::vec2(SETTINGS_SELECT_WIDTH, 26.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(control, 6.0, pal.bg_elevated);
+                                        // Symmetric inset keeps the number centered in the
+                                        // entire 190-point control even while icons are visible.
+                                        let input_rect = control.shrink2(egui::vec2(50.0, 2.0));
+                                        let response = ui.put(input_rect,
+                                            egui::TextEdit::singleline(input)
+                                                .font(FontId::proportional(13.0))
+                                                .horizontal_align(egui::Align::Center)
+                                                .vertical_align(egui::Align::Center)
+                                                .frame(false).margin(egui::Margin::ZERO)
+                                                .hint_text("50"))
+                                            .on_hover_text(if zh { "20–500 步 · 输入后确认生效" } else { "20–500 steps · Confirm to apply" });
+                                        let changed = input.trim().parse::<usize>().ok() != Some(self.undo_limit);
+                                        let mut apply = false;
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(egui::Id::new("undo_limit_control_rect"), control);
+                                            d.insert_temp(egui::Id::new("undo_limit_input_rect"), response.rect);
+                                            d.remove::<egui::Rect>(egui::Id::new("undo_limit_confirm_rect"));
+                                            d.remove::<egui::Rect>(egui::Id::new("undo_limit_cancel_rect"));
+                                        });
+                                        if changed {
+                                            for (confirm, offset) in [(false, 36.0), (true, 14.0)] {
+                                                let rect = egui::Rect::from_center_size(
+                                                    egui::pos2(control.right() - offset, control.center().y), egui::vec2(20.0, 22.0));
+                                                let button = ui.interact(rect, egui::Id::new(("undo_limit_action", confirm)), egui::Sense::click())
+                                                    .on_hover_text(match (confirm, zh) {
+                                                        (true, true) => "确认修改", (false, true) => "取消修改",
+                                                        (true, false) => "Apply", (false, false) => "Cancel",
+                                                    }).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                                let color = if confirm { pal.accent } else if button.hovered() { pal.danger } else { pal.text_faint };
+                                                if button.hovered() { ui.painter().rect_filled(rect.shrink(1.0), 4.0, color.gamma_multiply(0.12)); }
+                                                let center = rect.center();
+                                                let stroke = Stroke::new(1.5_f32, color);
+                                                if confirm {
+                                                    ui.painter().line_segment([center + egui::vec2(-4.5, 0.0), center + egui::vec2(-1.0, 3.5)], stroke);
+                                                    ui.painter().line_segment([center + egui::vec2(-1.0, 3.5), center + egui::vec2(5.0, -3.5)], stroke);
+                                                } else {
+                                                    ui.painter().line_segment([center - egui::vec2(3.5, 3.5), center + egui::vec2(3.5, 3.5)], stroke);
+                                                    ui.painter().line_segment([center + egui::vec2(-3.5, 3.5), center + egui::vec2(3.5, -3.5)], stroke);
+                                                }
+                                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(if confirm { "undo_limit_confirm_rect" } else { "undo_limit_cancel_rect" }), rect));
+                                                if button.clicked() {
+                                                    if confirm { apply = true; }
+                                                    else { *input = self.undo_limit.to_string(); self.undo_limit_error = None; }
+                                                }
+                                            }
+                                        } else { self.undo_limit_error = None; }
+                                        if apply {
+                                            match input.trim().parse::<usize>() {
+                                                Ok(value) if (20..=500).contains(&value) => {
+                                                    self.undo_limit = value;
+                                                    *input = value.to_string();
+                                                    self.undo_limit_error = None;
+                                                }
+                                                _ => self.undo_limit_error = Some(if zh {
+                                                    "请输入 20 到 500 之间的整数"
+                                                } else {
+                                                    "Enter an integer from 20 to 500"
+                                                }.to_owned()),
+                                            }
+                                        }
+                                    });
+                                });
+                                if let Some(error) = &self.undo_limit_error {
+                                    ui.label(RichText::new(error).size(11.0).color(pal.danger));
+                                }
                             });
                             ui.add_space(8.0);
                             settings_card(ui, pal, |ui| {
@@ -3761,10 +3892,15 @@ fn dropdown<S: Clone + PartialEq + 'static>(
     // 弹层列表
     if open {
         let area_id = id.with("popup");
+        let long_list = options.len() > 10;
+        let popup_height = 300.0_f32.min((ui.ctx().screen_rect().height() - 32.0).max(80.0));
+        let popup_y = if long_list && rect.bottom() + popup_height + 12.0 > ui.ctx().screen_rect().bottom() {
+            (rect.top() - popup_height - 12.0).max(ui.ctx().screen_rect().top() + 8.0)
+        } else { rect.bottom() + 4.0 };
         egui::Area::new(area_id)
-            .fixed_pos(egui::pos2(rect.left(), rect.bottom() + 4.0))
+            .fixed_pos(egui::pos2(rect.left(), popup_y))
             .order(egui::Order::Foreground)
-            .default_size([width, 0.0])
+            .default_size([width, if long_list { popup_height + 8.0 } else { 0.0 }])
             // The list floats over settings/document text. egui's fade-in
             // multiplies the frame's opacity, so both texts overlap while it
             // fades; popups here must be opaque from their first visible frame.
@@ -3777,6 +3913,7 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
                         ui.set_min_width(width - 8.0);
+                        let mut rows = |ui: &mut egui::Ui| {
                         for (name, value) in &options {
                             let is_selected = *name == selected;
                             let (r, rresp) = ui.allocate_exact_size(
@@ -3809,6 +3946,17 @@ fn dropdown<S: Clone + PartialEq + 'static>(
                                 ui.memory_mut(|m| m.close_popup());
                             }
                         }
+                        };
+                        if long_list {
+                            // Area retains its measured size between frames;
+                            // don't let an early tiny measurement constrain the
+                            // scroll viewport forever (max_height alone cannot grow it).
+                            ui.set_min_height(popup_height);
+                            ui.set_height(popup_height);
+                            let output = egui::ScrollArea::vertical().id_salt(id.with("options_scroll"))
+                                .max_height(popup_height).auto_shrink([false, true]).show(ui, &mut rows);
+                            ui.ctx().data_mut(|d| d.insert_temp(id.with("options_viewport"), output.inner_rect));
+                        } else { rows(ui); }
                     });
             });
 
@@ -4283,6 +4431,7 @@ fn hex_view(
                             }
                         }
 
+                        crate::notebook::paint_hex_row(&p, file.editor_state.tools.workspace.as_ref(), rect);
                         // 整行内容：单个 LayoutJob 保证列对齐
                         let mut job = LayoutJob::default();
                         job.append(
@@ -4665,7 +4814,8 @@ mod tests {
                             ..Default::default()
                         }, |ctx| app.top_bar(ctx, pal));
                         output.shapes.iter().any(|shape| matches!(&shape.shape,
-                            egui::Shape::Rect(rect) if rect.fill == pal.danger.gamma_multiply(if mode == "inactive" { 0.08 } else { 0.12 })))
+                            egui::Shape::Rect(rect) if rect.fill == pal.accent.gamma_multiply(if mode == "inactive" { 0.05 } else { 0.15 })
+                                && (mode != "dragging" || (rect.rect.height() - 24.0).abs() < 0.1)))
                     };
                     assert!(!tinted(&mut app), "new empty tab: {mode}");
                     let original = "content\n".repeat(if large { 40_000 } else { 1 });
@@ -4691,6 +4841,33 @@ mod tests {
     }
 
     #[test]
+    fn unsaved_tab_tints_follow_theme_in_both_layouts_and_pinned_groups() {
+        for preset in [workspace_theme::Preset::DarkPlus, workspace_theme::Preset::LightPlus,
+            workspace_theme::Preset::Dracula, workspace_theme::Preset::GruvboxDark,
+            workspace_theme::Preset::GitHubLight] {
+            let theme = workspace_theme::WorkspaceTheme { preset, ..Default::default() };
+            let pal = theme.palette(None);
+            for vertical in [false, true] {
+                for pinned in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut app = LiteTextApp { vertical_tabs: vertical, ..Default::default() };
+                    app.new_document(); let id = app.active_id.unwrap();
+                    app.active_mut().unwrap().draft_text = Some("modified".into());
+                    app.active_mut().unwrap().sync_draft();
+                    if pinned { app.toggle_pin(id); }
+                    let output = ctx.run(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0,720.0))),
+                        ..Default::default()
+                    }, |ctx| { app.top_bar(ctx, &pal); app.vertical_tab_panel(ctx, &pal); });
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(rect) if rect.fill == pal.accent.gamma_multiply(0.15))),
+                        "{preset:?}: vertical={vertical} pinned={pinned}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn saved_file_tab_gains_subtle_background_when_modified_and_clears_after_save() {
         for pal in [&DARK, &LIGHT] {
             let dir = tempfile::tempdir().unwrap();
@@ -4703,17 +4880,17 @@ mod tests {
             let render = |app: &mut LiteTextApp| ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO, egui::vec2(1080.0, 720.0))), ..Default::default() }, |ctx| app.top_bar(ctx, pal));
             let tinted = |output: egui::FullOutput, opacity| output.shapes.iter().any(|s| matches!(&s.shape,
-                egui::Shape::Rect(r) if r.fill == pal.danger.gamma_multiply(opacity)));
-            assert!(!tinted(render(&mut app), 0.12));
+                egui::Shape::Rect(r) if r.fill == pal.accent.gamma_multiply(opacity)));
+            assert!(!tinted(render(&mut app), 0.15));
             let file = app.active_mut().unwrap();
             file.draft_text = Some("modified".to_owned()); file.sync_draft();
-            assert!(tinted(render(&mut app), 0.12));
+            assert!(tinted(render(&mut app), 0.15));
             app.new_document();
-            assert!(tinted(render(&mut app), 0.08));
+            assert!(tinted(render(&mut app), 0.05));
             recovery::save_document(app.files.iter_mut().find(|f| f.id == id).unwrap(), &path).unwrap();
-            assert!(!tinted(render(&mut app), 0.08));
+            assert!(!tinted(render(&mut app), 0.05));
             app.active_id = Some(id);
-            assert!(!tinted(render(&mut app), 0.12));
+            assert!(!tinted(render(&mut app), 0.15));
         }
     }
 
