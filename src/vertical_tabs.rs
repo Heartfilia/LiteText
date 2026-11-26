@@ -105,11 +105,14 @@ impl LiteTextApp {
         painter.rect_filled(rect, 5.0, if active { pal.bg_window } else if response.hovered() { pal.bg_elevated } else { pal.bg_panel });
         if dirty { painter.rect_filled(rect, 5.0, pal.accent.gamma_multiply(if active { 0.15 } else { 0.05 })); }
         if active { painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 2.0, pal.accent); }
-        let title_rect = egui::Rect::from_min_max(rect.min + egui::vec2(6.0, 0.0), rect.max - egui::vec2(6.0, 0.0));
+        let button_close = !pinned && self.tab_close_mode.allows_button()
+            && crate::tab_close_button::show(ui, rect, id, pal).clicked();
+        let inset = if !pinned && self.tab_close_mode.allows_button() { 26.0 } else { 6.0 };
+        let title_rect = egui::Rect::from_min_max(rect.min + egui::vec2(6.0, 0.0), rect.max - egui::vec2(inset, 0.0));
         crate::paint_tab_title(&painter, title_rect, &title, if active { pal.text_main } else { pal.text_faint });
         let mut action = None;
         if !pinned {
-            if (self.tab_close_mode.allows_double() && response.double_clicked())
+            if button_close || (self.tab_close_mode.allows_double() && response.double_clicked())
                 || (self.tab_close_mode.allows_middle() && response.clicked_by(egui::PointerButton::Middle)) {
                 action = Some(TabAction::Close(id));
             }

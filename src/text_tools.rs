@@ -3334,7 +3334,7 @@ mod tests {
     #[test]
     fn text_toolbar_buttons_toggle_and_precede_view_switch() {
         let ctx = egui::Context::default();
-        let mut app = crate::LiteTextApp::default();
+        let mut app = crate::LiteTextApp { vertical_tabs: false, ..Default::default() };
         app.new_document();
         let mut wrap_pos = None;
         for frame in 0..4 {

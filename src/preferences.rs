@@ -18,6 +18,7 @@ struct Preferences {
     scratch_dir: Option<PathBuf>,
     tab_mode: crate::whitespace::TabMode,
     tab_close_mode: crate::TabCloseMode,
+    #[serde(default)]
     vertical_tabs: bool,
     undo_limit: usize,
     workspace_font: Option<crate::fonts::Choice>,
@@ -240,7 +241,7 @@ mod tests {
         let path = temp.path().join("preferences.json");
         let mut app = LiteTextApp::default();
         app.preferences.path_override = Some(path.clone());
-        assert!(!app.vertical_tabs);
+        assert!(app.vertical_tabs);
 
         for enabled in [true, false] {
             app.vertical_tabs = enabled;
@@ -254,6 +255,22 @@ mod tests {
             restored.load_preferences().unwrap();
             assert_eq!(restored.vertical_tabs, enabled);
         }
+    }
+
+    #[test]
+    fn fresh_install_defaults_vertical_but_saved_horizontal_is_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preferences.json");
+        let mut app = LiteTextApp::default();
+        app.preferences.path_override = Some(path.clone());
+        app.load_preferences().unwrap();
+        assert!(app.vertical_tabs);
+        app.vertical_tabs = false;
+        app.save_preferences(true).unwrap();
+        let mut restored = LiteTextApp::default();
+        restored.preferences.path_override = Some(path);
+        restored.load_preferences().unwrap();
+        assert!(!restored.vertical_tabs);
     }
 
     #[test]

@@ -145,6 +145,17 @@ pub(crate) fn paint_unfocused_selection(ui: &egui::Ui, output: &mut egui::text_e
     output.cursor_range = Some(cursor);
 }
 
+/// Protect the editor on the first frame an overlay appears (egui hit tests
+/// against the previous frame's areas). Navigation must not collapse selection.
+pub(crate) fn minimap_pointer(ui: &egui::Ui, viewport: egui::Rect, file: u64, find_open: bool) -> bool {
+    let mut rect = egui::Rect::from_min_max(egui::pos2(viewport.right() - crate::minimap::WIDTH, viewport.top()), viewport.max);
+    if find_open && let Some(find) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("find_overlay_rect", file)))) {
+        rect.min.y = rect.min.y.max(find.bottom() + 4.0);
+    }
+    ui.input(|input| input.pointer.press_origin().is_some_and(|pos| rect.contains(pos))
+        && (input.pointer.primary_down() || input.pointer.button_released(egui::PointerButton::Primary)))
+}
+
 /// ScrollArea includes the frozen gutter in its viewport, but TextEdit does not
 /// know that it is covered. Reserve that width on the left of its reveal target.
 /// Only reveal on cursor/edit changes, so manual scrolling can leave it offscreen.
@@ -201,6 +212,11 @@ pub(crate) struct EditorState {
     pub(crate) syntax_cache: std::sync::Arc<std::sync::Mutex<crate::workspace_theme::SyntaxCache>>,
     pub(crate) line_ending: crate::line_endings::LineEnding,
     pub(crate) composing: bool,
+    pub(crate) minimap: crate::minimap::Preview,
+    pub(crate) minimap_rows: Vec<usize>,
+    pub(crate) minimap_rows_key: Option<(usize, u64, u32)>,
+    /// Source editors enable this explicitly; Markdown split keeps it off.
+    pub(crate) minimap_enabled: bool,
 }
 
 impl EditorState {
@@ -503,6 +519,7 @@ fn show_impl(
     let mut viewport_offset = egui::Vec2::ZERO;
     let mut depth_action = None;
     let mut depth_offset = None;
+    let mut minimap_galley: Option<std::sync::Arc<egui::Galley>> = None;
     let mut scroll_area = egui::ScrollArea::both()
         .id_salt(("draft_scroll", file_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -591,6 +608,13 @@ fn show_impl(
                 });
             // Propagate the full text extent to the scroll area, not just the viewport-sized child.
             let mut output = editor_output.inner;
+            if state.minimap_enabled && minimap_pointer(ui, viewport_clip, file_id, tools.find_open)
+                && let Some(saved) = previous
+            {
+                output.state.cursor.set_char_range(Some(saved));
+                output.state.clone().store(ui.ctx(), editor_id);
+            }
+            if state.minimap_enabled { minimap_galley = Some(output.galley.clone()); }
             crate::notebook::paint_rows(&rule_painter, rule_slot, tools.workspace.as_ref(),
                 &output.galley, output.galley_pos, rule_viewport);
             // egui collapses a text selection on any pointer press, including
@@ -617,7 +641,11 @@ fn show_impl(
             } else {
                 crate::text_tools::paint_selected_text(ui, &output, ui.visuals().selection.stroke.color);
             }
-            ui.set_min_width(gutter_w + EDITOR_LEFT_PADDING + output.galley.size().x + if tools.whitespace { 24.0 } else { 12.0 });
+            // Reserve the full tail from the outset, independent of hover or
+            // animation. Short documents still fit without a horizontal bar.
+            let minimap_tail = if state.minimap_enabled && !tools.wrap { crate::minimap::WIDTH } else { 0.0 };
+            ui.set_min_width(gutter_w + EDITOR_LEFT_PADDING + output.galley.size().x
+                + if tools.whitespace { 24.0 } else { 12.0 } + minimap_tail);
             if focus {
                 output.response.request_focus();
             }
@@ -1061,7 +1089,37 @@ fn show_impl(
             }
             ui.set_min_height(state.fold_scroll_extent);
         });
-    let scroll_output = finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    let mut scroll_output = finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    if state.minimap_enabled && let Some(galley) = minimap_galley {
+        let cache_key = egui::Id::new(("text_minimap_layout", file_id));
+        let layout_key = (std::sync::Arc::as_ptr(&galley) as usize, galley.size().x.to_bits(), galley.size().y.to_bits());
+        if changed || ui.ctx().data(|d| d.get_temp::<(usize,u32,u32)>(cache_key)) != Some(layout_key) {
+            state.minimap.invalidate();
+            ui.ctx().data_mut(|d| d.insert_temp(cache_key, layout_key));
+        }
+        let viewport = scroll_output.inner_rect;
+        let mut rect = egui::Rect::from_min_max(
+            egui::pos2((viewport.right() - crate::minimap::WIDTH).max(gutter.right() + 8.0), viewport.top()), viewport.max);
+        if let Some(find) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("find_overlay_rect", file_id))))
+            .filter(|_| tools.find_open)
+            && rect.intersects(find) { rect.min.y = rect.min.y.max(find.bottom() + 4.0); }
+        let rows_key = (galley.rows.len(), state.folds.generation, galley.size().y.to_bits());
+        if state.minimap_rows_key != Some(rows_key) {
+            state.minimap_rows = galley.rows.iter().enumerate().filter(|(_, row)| row.rect.height() >= 1.0).map(|(index, _)| index).collect();
+            state.minimap_rows_key = Some(rows_key);
+        }
+        if let Some(y) = state.minimap.show(ui, egui::Id::new(("text_minimap", file_id)), rect,
+            state.minimap_rows.len(), scroll_output.state.offset.y, scroll_output.content_size.y, viewport.height(), pal,
+            |index| {
+                let row = &galley.rows[state.minimap_rows[index]];
+                crate::minimap::MiniLine::from_glyphs(row, &galley.job, pal.text_main)
+            }) {
+            scroll_output.state = egui::scroll_area::State::default();
+            scroll_output.state.offset = egui::vec2(viewport_offset.x, y);
+            scroll_output.state.store(ui.ctx(), scroll_output.id);
+            ui.ctx().request_repaint();
+        }
+    }
     ui.ctx().data_mut(|data| {
         data.insert_temp(
             egui::Id::new(("editor_scroll_y", file_id)),

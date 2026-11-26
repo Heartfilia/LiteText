@@ -1,4 +1,66 @@
 use super::*;
+use crate::TabCloseMode;
+
+#[test]
+fn close_tab_settings_offer_all_six_modes_with_unclipped_labels() {
+    for lang in Lang::ALL {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut app = LiteTextApp { lang, ..Default::default() };
+        let id = egui::Id::new("settings_tab_close_mode");
+        let run = |app: &mut LiteTextApp| ctx.run(input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.shortcuts_ui(ui, &crate::DARK));
+        });
+        let t = tr(lang);
+        let modes = [
+            (TabCloseMode::DoubleClick, t.close_tab_double),
+            (TabCloseMode::MiddleClick, t.close_tab_middle),
+            (TabCloseMode::DoubleOrMiddle, t.close_tab_both),
+            (TabCloseMode::Button, t.close_tab_button),
+            (TabCloseMode::ButtonOrDouble, t.close_tab_button_double),
+            (TabCloseMode::ButtonOrMiddle, t.close_tab_button_middle),
+        ];
+        for (mode, label) in modes {
+            assert_eq!(mode.label(lang), label);
+            app.tab_close_mode = mode;
+            let output = run(&mut app);
+            let chip = ctx.data(|d| d.get_temp::<egui::Rect>(id.with("button_rect"))).unwrap();
+            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                _ => None,
+            }).expect("selected mode must be painted");
+            assert!(text.galley.size().x + 56.0 <= chip.width() + 1.0);
+            ctx.memory_mut(|m| m.open_popup(id));
+            run(&mut app);
+            run(&mut app);
+            let option = ctx.data(|d| {
+                d.get_temp::<egui::Rect>(id.with(("option_rect", label.to_owned())))
+            }).expect("all six modes must appear in the dropdown");
+            app.tab_close_mode = TabCloseMode::DoubleClick;
+            for pressed in [true, false] {
+                let _ = ctx.run(input(vec![
+                    egui::Event::PointerMoved(option.center()),
+                    egui::Event::PointerButton {
+                        pos: option.center(), button: egui::PointerButton::Primary,
+                        pressed, modifiers: Modifiers::NONE,
+                    },
+                ]), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.shortcuts_ui(ui, &crate::DARK));
+                });
+            }
+            assert_eq!(app.tab_close_mode, mode);
+        }
+        if lang == Lang::En {
+            assert_eq!(t.close_tab_button, "Button");
+            assert_eq!(t.close_tab_button_double, "Button + double-click");
+            assert_eq!(t.close_tab_button_middle, "Button + middle-click");
+        } else {
+            assert_eq!(t.close_tab_button, "标签按钮关闭");
+            assert_eq!(t.close_tab_button_double, "标签按钮+双击关闭");
+            assert_eq!(t.close_tab_button_middle, "标签按钮+中键关闭");
+        }
+    }
+}
 
 #[test]
 fn escape_exits_continuous_marker_without_removing_marks() {
@@ -634,19 +696,12 @@ fn shortcuts_page_uses_at_most_two_columns_and_keeps_labels_next_to_controls() {
                     _ => None,
                 })
                 .expect("tab-close label must be painted");
-            let chip = output
-                .shapes
-                .iter()
-                .find_map(|shape| match &shape.shape {
-                    egui::Shape::Rect(rect)
-                        if (rect.rect.width() - 190.0).abs() < 1.0
-                            && (rect.rect.height() - 26.0).abs() < 1.0 =>
-                    {
-                        Some(rect.rect)
-                    }
-                    _ => None,
-                })
-                .expect("tab-close chip must be painted");
+            let chip = ctx.data(|d| {
+                d.get_temp::<egui::Rect>(
+                    egui::Id::new("settings_tab_close_mode").with("button_rect"),
+                )
+            }).expect("tab-close chip must be painted");
+            assert!(chip.width() >= 230.0);
             assert!(
                 chip.left() - label_right <= 40.0,
                 "close-tab label and options drifted apart: {label_right} vs {}",

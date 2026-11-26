@@ -35,7 +35,7 @@ fn general_and_terminal_selectors_share_width_and_centered_values() {
         let output = draw(&ctx, &mut app, pal, vec![]);
         for (id, label) in [
             ("settings_lang", app.lang.native_name()),
-            ("settings_tab_layout", "水平"),
+            ("settings_tab_layout", "垂直"),
             ("settings_terminal", "系统默认"),
         ] {
             let rect = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id).with("button_rect"))).unwrap();
@@ -374,18 +374,8 @@ fn shortcuts_page_offers_tab_close_modes_below_the_back_button() {
             "the tab-close row belongs below the back button"
         );
         assert_eq!(option_text(&output, "双击关闭").y, label.y);
-        let chip = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect)
-                    if (rect.rect.width() - 190.0).abs() < 1.0
-                        && (rect.rect.height() - 26.0).abs() < 1.0 =>
-                {
-                    Some(rect.rect)
-                }
-                _ => None,
-            })
+        let chip = ctx.data(|d| d.get_temp::<egui::Rect>(
+            egui::Id::new("settings_tab_close_mode").with("button_rect")))
             .expect("tab-close chip must be painted");
         click(&ctx, &mut app, pal, chip.center());
         let mut opened = None;

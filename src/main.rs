@@ -47,6 +47,12 @@ mod encoding_ui;
 mod reload;
 mod pinned_tabs;
 mod vertical_tabs;
+mod tab_close_button;
+mod minimap;
+#[cfg(test)]
+mod minimap_hex_tests;
+#[cfg(test)]
+mod minimap_text_tests;
 mod diagnostics;
 mod markdown;
 mod scratch;
@@ -176,20 +182,30 @@ pub(crate) enum TabCloseMode {
     MiddleClick,
     /// Either gesture.
     DoubleOrMiddle,
+    Button,
+    ButtonOrDouble,
+    ButtonOrMiddle,
 }
 
 impl TabCloseMode {
     pub(crate) fn allows_double(self) -> bool {
-        matches!(self, Self::DoubleClick | Self::DoubleOrMiddle)
+        matches!(self, Self::DoubleClick | Self::DoubleOrMiddle | Self::ButtonOrDouble)
     }
 
     pub(crate) fn allows_middle(self) -> bool {
-        matches!(self, Self::MiddleClick | Self::DoubleOrMiddle)
+        matches!(self, Self::MiddleClick | Self::DoubleOrMiddle | Self::ButtonOrMiddle)
+    }
+
+    pub(crate) fn allows_button(self) -> bool {
+        matches!(self, Self::Button | Self::ButtonOrDouble | Self::ButtonOrMiddle)
     }
 
     pub(crate) fn label(self, lang: Lang) -> &'static str {
         let t = tr(lang);
         match self {
+            Self::Button => t.close_tab_button,
+            Self::ButtonOrDouble => t.close_tab_button_double,
+            Self::ButtonOrMiddle => t.close_tab_button_middle,
             Self::DoubleClick => t.close_tab_double,
             Self::MiddleClick => t.close_tab_middle,
             Self::DoubleOrMiddle => t.close_tab_both,
@@ -481,6 +497,8 @@ struct LiteTextApp {
     /// Pointer gesture that closes a normal tab; pinned tabs stay protected.
     tab_close_mode: TabCloseMode,
     /// Show document tabs in a vertical sidebar instead of the top bar.
+    /// Legacy settings without this field keep the original horizontal layout.
+    #[serde(default)]
     vertical_tabs: bool,
     /// Maximum retained undo steps; changes take effect only after confirmation.
     undo_limit: usize,
@@ -658,7 +676,7 @@ impl Default for LiteTextApp {
             scratch: scratch::State::default(),
             tab_mode: Default::default(),
             tab_close_mode: Default::default(),
-            vertical_tabs: false,
+            vertical_tabs: true,
             undo_limit: 50,
             undo_limit_input: None,
             undo_limit_error: None,
@@ -2481,9 +2499,14 @@ impl LiteTextApp {
                                     );
                                 }
                                 if dirty { p.rect_filled(rect.shrink(1.0), 6.0, pal.accent.gamma_multiply(if active { 0.15 } else { 0.05 })); }
+                                let button_close = self.tab_close_mode.allows_button()
+                                    && tab_close_button::show(ui, rect, id, pal).clicked();
+                                let title_rect = if self.tab_close_mode.allows_button() {
+                                    egui::Rect::from_min_max(rect.min, rect.max - egui::vec2(22.0, 0.0))
+                                } else { rect };
                                 paint_tab_title(
                                     &p,
-                                    rect,
+                                    title_rect,
                                     &title,
                                     if active { pal.text_main } else { pal.text_faint },
                                 );
@@ -2497,7 +2520,7 @@ impl LiteTextApp {
                                     && resp.double_clicked();
                                 let close_by_middle = self.tab_close_mode.allows_middle()
                                     && resp.clicked_by(egui::PointerButton::Middle);
-                                if close_by_double || close_by_middle {
+                                if button_close || close_by_double || close_by_middle {
                                     action = Some(TabAction::Close(id));
                                 }
                                 resp.context_menu(|menu| {
@@ -4195,6 +4218,7 @@ fn welcome_screen(ui: &mut egui::Ui, app: &mut LiteTextApp, pal: &Palette) {
 }
 
 fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: bool, lang: Lang) {
+    file.editor_state.minimap_enabled = !markdown::is_markdown(file) || file.markdown_mode == markdown::Mode::Source;
     if let Some(render) = &file.editor_state.tools.workspace {
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, render.colors.background);
     }
@@ -4371,6 +4395,12 @@ fn hex_view(
     );
 
     let total_rows = file.bytes.len().div_ceil(HEX_BYTES_PER_ROW);
+    let minimap_enabled = !markdown::is_markdown(file)
+        || file.markdown_mode == markdown::Mode::Source;
+    let minimap_id = ui.make_persistent_id(("hex_minimap", file.id));
+    // The overview is navigation only: even its first-frame press must not
+    // accidentally select a byte in the rows painted underneath its Area.
+    let selection_before = *selection;
     // 右侧留出间距：避免内容滚动条与 Inspector 分隔条重叠导致光标样式抖动
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -4380,7 +4410,8 @@ fn hex_view(
             bottom: 0,
         })
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let scroll_output = egui::ScrollArea::both()
+                .id_salt(("hex_rows", file.id))
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_height, total_rows, |ui, range| {
@@ -4392,6 +4423,16 @@ fn hex_view(
                             bottom: 0,
                         })
                         .show(ui, |ui| {
+                            let content_width = if opts.show_ascii {
+                                ascii_x + HEX_BYTES_PER_ROW as f32 * char_w
+                            } else {
+                                (ADDR_CHARS + HEX_CHARS) * char_w
+                            };
+                            // Only expose horizontal scrolling when the last
+                            // byte/ASCII column would sit under the overview.
+                            // Padding lets it scroll fully clear of the overlay.
+                            let navigation_width = if minimap_enabled { minimap::WIDTH } else { 0.0 };
+                            ui.set_min_width(content_width + navigation_width);
                             for row in range {
                         let start = row * HEX_BYTES_PER_ROW;
                         let end = (start + HEX_BYTES_PER_ROW).min(file.bytes.len());
@@ -4569,6 +4610,70 @@ fn hex_view(
                     }
                 });
             });
+            if minimap_enabled {
+                // inner_rect excludes the vertical scrollbar; the frozen header
+                // lives outside the ScrollArea and therefore outside this rect.
+                let viewport = scroll_output.inner_rect;
+                let overlay_rect = egui::Rect::from_min_max(
+                    egui::pos2((viewport.right() - minimap::WIDTH).max(viewport.left()), viewport.top()),
+                    viewport.max,
+                );
+                let cache_id = minimap_id.with("cache");
+                let revision = (
+                    file.content_revision,
+                    file.editor_state.large.revision,
+                    file.bytes.len(),
+                    opts.show_ascii,
+                );
+                let (mut preview, previous_revision) = ui.ctx().data_mut(|data| {
+                    (
+                        data.remove_temp::<minimap::Preview>(cache_id).unwrap_or_default(),
+                        data.get_temp::<(u64, u64, usize, bool)>(minimap_id.with("revision")),
+                    )
+                });
+                if previous_revision != Some(revision) {
+                    preview.invalidate();
+                }
+                let requested_y = preview.show(
+                    ui,
+                    minimap_id,
+                    overlay_rect,
+                    total_rows,
+                    scroll_output.state.offset.y,
+                    scroll_output.content_size.y,
+                    viewport.height(),
+                    pal,
+                    |row| {
+                        let bytes = file.bytes.len().saturating_sub(row * HEX_BYTES_PER_ROW)
+                            .min(HEX_BYTES_PER_ROW);
+                        let mut text = format!("{:08X} ", row * HEX_BYTES_PER_ROW);
+                        for byte in &file.bytes[row * HEX_BYTES_PER_ROW..row * HEX_BYTES_PER_ROW + bytes] {
+                            use std::fmt::Write;
+                            let _ = write!(text, "{byte:02X} ");
+                        }
+                        minimap::MiniLine::from_chars(text.chars())
+                    },
+                );
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(cache_id, preview);
+                    data.insert_temp(minimap_id.with("revision"), revision);
+                });
+                let overlay_press = ui.input(|input| {
+                    input.pointer.press_origin().is_some_and(|origin| overlay_rect.contains(origin))
+                        && (input.pointer.primary_down()
+                            || input.pointer.button_released(egui::PointerButton::Primary))
+                });
+                if overlay_press {
+                    *selection = selection_before;
+                    *drag_anchor = None;
+                }
+                if let Some(offset) = requested_y {
+                    let mut state = egui::scroll_area::State::default();
+                    state.offset = egui::vec2(scroll_output.state.offset.x, offset);
+                    state.store(ui.ctx(), scroll_output.id);
+                    ui.ctx().request_repaint();
+                }
+            }
         });
 }
 
@@ -4807,7 +4912,7 @@ mod tests {
                 for mode in ["active", "inactive", "dragging"] {
                     let dir = tempfile::tempdir().unwrap();
                     let path = dir.path().join("document.txt");
-                    let mut app = LiteTextApp::default();
+                    let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
                     app.new_document();
                     let id = app.active_id.unwrap();
                     app.new_document();
@@ -4880,7 +4985,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("document.txt");
             std::fs::write(&path, b"original").unwrap();
-            let mut app = LiteTextApp::default();
+            let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
             app.open_paths(vec![path.clone()]);
             let id = app.active_id.unwrap();
             let ctx = egui::Context::default();
@@ -5153,7 +5258,7 @@ mod tests {
     fn double_click_empty_tab_strip_creates_only_when_space_is_available() {
         for count in [0, 1, 2, 20] {
             let ctx = egui::Context::default();
-            let mut app = LiteTextApp::default();
+            let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
             for _ in 0..count { app.new_document(); }
             let original_ids: Vec<_> = app.files.iter().map(|f| f.id).collect();
             let mut frame = 0;
@@ -5196,12 +5301,16 @@ mod tests {
             (TabCloseMode::DoubleClick, true, false),
             (TabCloseMode::MiddleClick, false, true),
             (TabCloseMode::DoubleOrMiddle, true, true),
+            (TabCloseMode::Button, false, false),
+            (TabCloseMode::ButtonOrDouble, true, false),
+            (TabCloseMode::ButtonOrMiddle, false, true),
         ];
         for (mode, double_closes, middle_closes) in modes {
             for middle in [false, true] {
                 let ctx = egui::Context::default();
                 setup_fonts(&ctx);
                 let mut app = LiteTextApp {
+                    vertical_tabs: false,
                     tab_close_mode: mode,
                     ..Default::default()
                 };
@@ -5269,7 +5378,7 @@ mod tests {
     fn tab_bar_scrolls_horizontally_with_mouse_wheel_only_when_hovered() {
         let scroll_distance = |pointer: egui::Pos2, delta: egui::Vec2, count: usize| {
             let ctx = egui::Context::default();
-            let mut app = LiteTextApp::default();
+            let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
             for _ in 0..count {
                 app.new_document();
             }
@@ -5387,6 +5496,7 @@ mod tests {
         setup_fonts(&ctx);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let mut app = LiteTextApp {
+            vertical_tabs: false,
             show_menu: true,
             recent_files: vec![path.clone()],
             ..Default::default()

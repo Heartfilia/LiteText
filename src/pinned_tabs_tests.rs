@@ -53,6 +53,7 @@ fn pin_and_unpin_menu_moves_only_target_preserves_selection_and_buffer() {
         for lang in [Lang::ZhCn, Lang::En] {
             let dir = tempfile::tempdir().unwrap();
             let mut app = LiteTextApp {
+                vertical_tabs: false,
                 lang,
                 recovery_path_override: Some(dir.path().join("session.json")),
                 ..Default::default()
@@ -152,6 +153,7 @@ fn repeated_menu_unpin_uses_one_tab_partition_per_pass_including_last_pinned_tab
             let ctx = egui::Context::default();
             crate::setup_fonts(&ctx);
             let mut app = LiteTextApp {
+                vertical_tabs: false,
                 lang,
                 recovery_path_override: Some(dir.path().join("session.json")),
                 ..Default::default()
@@ -230,7 +232,7 @@ fn repeated_menu_unpin_uses_one_tab_partition_per_pass_including_last_pinned_tab
 fn pinned_region_is_compact_bounded_and_scrolls_independently_from_normal_tabs() {
     for width in [400.0, 800.0, 1440.0] {
         let ctx = egui::Context::default();
-        let mut app = LiteTextApp::default();
+        let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
         for index in 0..30 {
             app.new_document();
             if index < 12 {
@@ -287,7 +289,7 @@ fn pinned_region_is_compact_bounded_and_scrolls_independently_from_normal_tabs()
 fn singleton_pinned_region_has_no_extra_minimum_width_and_title_is_centered() {
     for width in [400.0, 800.0, 1440.0] {
         let ctx = egui::Context::default();
-        let mut app = LiteTextApp::default();
+        let mut app = LiteTextApp { vertical_tabs: false, ..Default::default() };
         app.new_document();
         let id = app.active_id.unwrap();
         for _ in 0..3 {
@@ -405,6 +407,7 @@ fn normal_reordering_keeps_pinned_order_and_close_requires_unpinning_first() {
 fn pinned_tabs_ignore_double_click_shortcut_and_bulk_close_until_unpinned() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = LiteTextApp {
+        vertical_tabs: false,
         recovery_path_override: Some(dir.path().join("session.json")),
         ..Default::default()
     };

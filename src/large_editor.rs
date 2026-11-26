@@ -813,6 +813,7 @@ pub(crate) fn show(
     let mut viewport_offset = egui::Vec2::ZERO;
     let mut depth_action = None;
     let mut depth_offset = None;
+    let mut minimap_galley: Option<(usize, std::sync::Arc<egui::Galley>)> = None;
     if let Some((start, end)) = state.selection {
         state.selection = Some((start.min(count - 1), end.min(count - 1)));
     }
@@ -1071,6 +1072,14 @@ pub(crate) fn show(
                     output
                 })
                 .inner;
+            let minimap_pointer = state.minimap_enabled && editor::minimap_pointer(ui, viewport_clip, file_id, tools.find_open);
+            if minimap_pointer && let Some(saved) = previous {
+                output.state.cursor.set_char_range(Some(saved)); output.state.clone().store(ui.ctx(), id);
+            }
+            if state.minimap_enabled {
+                let first_visual = state.large.visual_starts.get(window.start).copied().unwrap_or(window.start);
+                minimap_galley = Some((first_visual, output.galley.clone()));
+            }
             crate::notebook::paint_rows(&rule_painter, rule_slot, tools.workspace.as_ref(),
                 &output.galley, output.galley_pos, rule_viewport);
             // egui collapses a selection on any pointer press, including the
@@ -1123,7 +1132,7 @@ pub(crate) fn show(
                     if row.ends_with_newline { logical += 1; }
                 }
             } else { folds.paint_summaries(ui, &output.galley, output.galley_pos, window.start, pal); }
-            if output.response.has_focus()
+            if output.response.has_focus() && !minimap_pointer
                 && (output.response.clicked()
                     || output.response.changed()
                     || pointer_down
@@ -1172,7 +1181,11 @@ pub(crate) fn show(
                 else { index + char_start }
             });
             ui.expand_to_include_rect(egui::Rect::from_min_size(origin, egui::vec2(
-                content_w,
+                content_w.max(if state.minimap_enabled && !tools.wrap {
+                    let columns = if long_lines { columns(&state.large.window) } else { state.large.max_columns };
+                    let actual_width = columns as f32 * digit_w + gutter_w + if tools.whitespace { 32.0 } else { 20.0 };
+                    actual_width + crate::minimap::WIDTH
+                } else { 0.0 }),
                 (24.0 + state.large.visual_starts.last().copied().unwrap_or(count) as f32
                     * row_height).max(state.fold_scroll_extent),
             )));
@@ -1479,7 +1492,45 @@ pub(crate) fn show(
                 ui.ctx().request_repaint();
             }
         });
-    let scroll_output = editor::finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    let mut scroll_output = editor::finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
+    if state.minimap_enabled {
+        let cache_key = egui::Id::new(("large_minimap_revision", file_id));
+        let revision = (state.large.revision, state.large.fold_generation, state.large.visual_width,
+            state.large.window_lines.start, pal.text_main, pal.bg_window,
+            state.tools.workspace.as_ref().map(|render| render.colors.keyword));
+        if changed || ui.ctx().data(|d| d.get_temp::<(u64,Option<u64>,Option<u32>,usize,egui::Color32,egui::Color32,Option<egui::Color32>)>(cache_key)) != Some(revision) {
+            state.minimap.invalidate(); ui.ctx().data_mut(|d| d.insert_temp(cache_key, revision));
+        }
+        let viewport = scroll_output.inner_rect;
+        let mut rect = egui::Rect::from_min_max(
+            egui::pos2((viewport.right() - crate::minimap::WIDTH).max(gutter.right() + 8.0), viewport.top()), viewport.max);
+        if let Some(find) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("find_overlay_rect", file_id))))
+            .filter(|_| tools.find_open)
+            && rect.intersects(find) { rect.min.y = rect.min.y.max(find.bottom() + 4.0); }
+        let visual_total = state.large.visual_starts.last().copied().unwrap_or(0).max(1);
+        if let Some(y) = state.minimap.show(ui, egui::Id::new(("text_minimap", file_id)), rect,
+            visual_total, scroll_output.state.offset.y, scroll_output.content_size.y, viewport.height(), pal,
+            |visual| {
+                if let Some((first, galley)) = &minimap_galley
+                    && let Some(index) = visual.checked_sub(*first)
+                    && index < 160
+                    && let Some(row) = galley.rows.iter().filter(|row| row.rect.height() >= 1.0).nth(index)
+                { return crate::minimap::MiniLine::from_glyphs(row, &galley.job, pal.text_main); }
+                let line = state.large.visible_lines.partition_point(|&line| state.large.visual_starts[line] <= visual)
+                    .saturating_sub(1);
+                let Some(&logical) = state.large.visible_lines.get(line) else { return crate::minimap::MiniLine::default(); };
+                let range = &state.large.ranges[logical];
+                crate::minimap::MiniLine::from_chars(text[range.clone()].char_indices().map(|(offset, ch)| {
+                    if tools.marks.iter().any(|mark| mark.color == crate::text_tools::CONCEAL
+                        && mark.range.contains(&(range.start + offset))) { '▪' } else { ch }
+                }))
+            }) {
+            let x = scroll_output.state.offset.x;
+            scroll_output.state = egui::scroll_area::State::default();
+            scroll_output.state.offset = egui::vec2(x, y); scroll_output.state.store(ui.ctx(), scroll_output.id);
+            ui.ctx().request_repaint();
+        }
+    }
     #[cfg(test)]
     ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("editor_scroll_geometry", file_id)), (scroll_output.id, scroll_output.state.offset, scroll_output.inner_rect)));
     #[cfg(test)]

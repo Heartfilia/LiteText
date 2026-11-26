@@ -233,6 +233,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::setup_fonts(&ctx);
             let mut app = crate::LiteTextApp {
+                vertical_tabs: false,
                 lang,
                 show_menu: true,
                 ..Default::default()

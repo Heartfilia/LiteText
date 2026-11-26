@@ -755,14 +755,22 @@ impl LiteTextApp {
                 (t.close_tab_double.to_owned(), crate::TabCloseMode::DoubleClick),
                 (t.close_tab_middle.to_owned(), crate::TabCloseMode::MiddleClick),
                 (t.close_tab_both.to_owned(), crate::TabCloseMode::DoubleOrMiddle),
+                (t.close_tab_button.to_owned(), crate::TabCloseMode::Button),
+                (t.close_tab_button_double.to_owned(), crate::TabCloseMode::ButtonOrDouble),
+                (t.close_tab_button_middle.to_owned(), crate::TabCloseMode::ButtonOrMiddle),
             ];
+            let selector_width = options.iter().map(|(label, _)| {
+                ui.painter().layout_no_wrap(
+                    label.clone(), egui::FontId::proportional(13.0), pal.text_main,
+                ).size().x + 56.0
+            }).fold(230.0_f32, f32::max);
             if let Some(mode) = crate::dropdown(
                 ui,
                 pal,
                 egui::Id::new("settings_tab_close_mode"),
                 self.tab_close_mode.label(self.lang).to_owned(),
                 options,
-                190.0,
+                selector_width,
             ) {
                 self.tab_close_mode = mode;
                 ui.ctx().request_repaint();

@@ -178,16 +178,16 @@ fn settings_dropdown_really_selects_tab_layout() {
             egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
         ]);
     }
-    assert!(!app.vertical_tabs, "opening the dropdown must not change the layout");
+    assert!(app.vertical_tabs, "opening the dropdown must not change the new-install default");
     for frame in 0..3 { render(&mut app, 6.0 + frame as f64 * 0.1, vec![]); }
-    let option = ctx.data(|d| d.get_temp::<egui::Rect>(id.with(("option_rect", "垂直")))).unwrap();
+    let option = ctx.data(|d| d.get_temp::<egui::Rect>(id.with(("option_rect", "水平")))).unwrap();
     for (index, pressed) in [true, false].into_iter().enumerate() {
         render(&mut app, 7.0 + index as f64 * 0.02, vec![
             egui::Event::PointerMoved(option.center()),
             egui::Event::PointerButton { pos: option.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
         ]);
     }
-    assert!(app.vertical_tabs);
+    assert!(!app.vertical_tabs);
 }
 
 #[test]
