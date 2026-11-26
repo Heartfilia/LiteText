@@ -23,6 +23,7 @@ mod json_plugin;
 mod workspace_theme;
 mod notebook;
 mod recent_closed;
+mod rename_draft;
 mod undo_settings;
 mod text_diff;
 mod whitespace;
@@ -549,6 +550,8 @@ struct LiteTextApp {
     #[serde(skip)]
     recent_closed: recent_closed::State,
     #[serde(skip)]
+    rename_draft: Option<rename_draft::Pending>,
+    #[serde(skip)]
     text_diff: text_diff::State,
     #[cfg(test)]
     #[serde(skip)]
@@ -689,6 +692,7 @@ impl Default for LiteTextApp {
             menu_conversion_open: false,
             show_curl_menu: false,
             recent_closed: Default::default(),
+            rename_draft: None,
             text_diff: Default::default(),
             #[cfg(test)]
             new_window_requested: false,
@@ -927,6 +931,7 @@ enum TabAction {
     OpenFolder(u64),
     Reload(u64),
     Pin(u64),
+    Rename(u64),
 }
 
 enum MenuAction {
@@ -1044,10 +1049,9 @@ impl LiteTextApp {
 
     fn recovery_path(&self) -> Option<PathBuf> {
         #[cfg(test)]
-        if let Some(path) = &self.recovery_path_override {
-            return Some(path.clone());
-        }
-        recovery::session_path()
+        { self.recovery_path_override.clone() }
+        #[cfg(not(test))]
+        { recovery::session_path() }
     }
 
     fn backup_or_report(&mut self) -> bool {
@@ -1107,20 +1111,21 @@ impl LiteTextApp {
     }
 
     fn closing_ids(&self, action: &TabAction) -> Vec<u64> {
-        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) => return Vec::new() };
+        let target = match action { TabAction::Close(id) | TabAction::CloseOthers(id) | TabAction::CloseLeft(id) | TabAction::CloseRight(id) => *id, TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) | TabAction::Rename(_) => return Vec::new() };
         let Some(pos) = self.files.iter().position(|f| f.id == target) else { return Vec::new() };
         self.files.iter().enumerate().filter(|(i, f)| !f.pinned && match action {
             TabAction::Close(_) => f.id == target,
             TabAction::CloseOthers(_) => f.id != target,
             TabAction::CloseLeft(_) => *i < pos,
             TabAction::CloseRight(_) => *i > pos,
-            TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) => false,
+            TabAction::OpenFolder(_) | TabAction::Reload(_) | TabAction::Pin(_) | TabAction::Rename(_) => false,
         }).map(|(_, f)| f.id).collect()
     }
 
     fn apply_tab_action(&mut self, action: TabAction) {
         match action {
             TabAction::Pin(id) => { self.toggle_pin(id); self.backup_or_report(); return; }
+            TabAction::Rename(id) => { self.request_rename_draft(id); return; }
             TabAction::Reload(id) => { self.request_reload(id, false); return; }
             TabAction::Close(id) => self.close_tab(id),
             TabAction::CloseOthers(id) => self.close_others(id),
@@ -1359,9 +1364,10 @@ impl LiteTextApp {
 
     /// 启动时恢复上次会话：从磁盘重读文件内容，磁盘上已不存在的标签丢弃。
     fn restore_session(&mut self) {
+        #[cfg(not(test))]
         let source = new_window::restore_path();
         #[cfg(test)]
-        let source = self.recovery_path_override.clone().or(source);
+        let source = self.recovery_path_override.clone();
         #[cfg(not(test))]
         if let Some(path) = source {
             let scratch = self.scratch_root();
@@ -1939,6 +1945,7 @@ impl eframe::App for LiteTextApp {
         self.plugin_error_window(ctx);
         self.curl_target_menu(ctx, pal);
         self.text_diff_window(ctx, pal);
+        self.rename_draft_window(ctx, pal);
         self.inspector_popup_window(ctx, pal);
         // Handle save after TextEdit so this frame's input is included.
         if cmd_s && let Some(id) = self.active_id {

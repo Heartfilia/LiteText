@@ -49,7 +49,7 @@ pub(crate) fn toolbar(
                 } else {
                     color
                 };
-                paint_icon(p, rect, color, action);
+                paint_icon(p, rect, color, if action == 1 && file.editor_state.tools.pen == Some(CONCEAL) { 10 } else { action });
             })
         };
         ui.ctx().data_mut(|d| {
@@ -87,7 +87,7 @@ pub(crate) fn toolbar(
                                     let selected = file.editor_state.tools.pen == Some(index);
                                     let button = marker_icon_button(
                                         ui,
-                                        1,
+                                        if index == CONCEAL { 10 } else { 1 },
                                         name,
                                         pen_color(index),
                                         selected,
@@ -104,6 +104,9 @@ pub(crate) fn toolbar(
                                         file.editor_state.tools.pen =
                                             if selected { None } else { Some(index) };
                                         file.editor_state.tools.pen_menu = false;
+                                        if let Some(text) = file.draft_text.as_deref() {
+                                            file.editor_state.tools.mark_selection(text, file.editor_state.cursor);
+                                        }
                                     }
                                     let clear = marker_icon_button(
                                         ui,
@@ -211,6 +214,13 @@ fn paint_icon_scaled(
                 stroke,
             ));
             line([-6.0, 7.0], [-1.0, 7.0]);
+        }
+        10 => {
+            // Solid nib/body distinguishes the opaque cover from translucent pens.
+            p.add(egui::Shape::convex_polygon(vec![
+                point(-5.0, 2.0), point(2.0, -5.0), point(6.0, -1.0), point(-1.0, 6.0),
+            ], color, egui::Stroke::NONE));
+            p.rect_filled(egui::Rect::from_min_max(point(-6.0, 6.0), point(0.0, 8.0)), 0.5, color);
         }
         2 => {
             p.text(
@@ -1109,6 +1119,9 @@ pub(crate) struct Mark {
     pub color: usize,
 }
 
+/// Visual-only concealment, not redaction: source text and copying are unchanged.
+pub(crate) const CONCEAL: usize = 5;
+
 pub(crate) fn pen_color(index: usize) -> egui::Color32 {
     let colors = [
         (220, 91, 91),
@@ -1116,6 +1129,7 @@ pub(crate) fn pen_color(index: usize) -> egui::Color32 {
         (91, 170, 110),
         (88, 150, 220),
         (169, 115, 210),
+        (128, 128, 128), // Neutral palette icon; the actual cover follows the theme.
     ];
     let (r, g, b) = colors[index];
     egui::Color32::from_rgb(r, g, b)
@@ -1556,17 +1570,20 @@ pub(crate) fn layout_window(
                 .workspace
                 .as_ref()
                 .map_or(pal.accent.gamma_multiply(0.2), |r| r.colors.search),
+            false,
         ));
     }
     // Marker colors take priority over search backgrounds, with exact boundaries.
-    highlights.extend(
-        tools
-            .marks
-            .iter()
-            .filter_map(|m| local(&m.range).map(|r| (r, pen_color(m.color).gamma_multiply(0.30)))),
-    );
+    let cover = tools.workspace.as_ref().map_or(pal.text_main, |r| r.colors.text).to_opaque();
+    highlights.extend(tools.marks.iter().filter_map(|m| {
+        local(&m.range).map(|r| (r, if m.color == CONCEAL {
+            cover
+        } else {
+            pen_color(m.color).gamma_multiply(0.30)
+        }, m.color == CONCEAL))
+    }));
     let mut events = Vec::with_capacity(highlights.len() * 2 + 2);
-    for (index, (range, _)) in highlights.iter().enumerate() {
+    for (index, (range, _, _)) in highlights.iter().enumerate() {
         events.push((range.start, true, index));
         events.push((range.end, false, index));
     }
@@ -1600,6 +1617,15 @@ pub(crate) fn layout_window(
             if let Some(&index) = active.last() {
                 format.background = highlights[index].1;
             }
+            if active.iter().any(|&index| highlights[index].2) {
+                // Transparent glyph quads retain cursor geometry and can be recolored
+                // by the selection painter. Unlike same-color glyphs, even italic
+                // overhang outside the background rectangle cannot leak ink.
+                format.color = egui::Color32::TRANSPARENT;
+                format.background = cover;
+                format.underline = egui::Stroke::NONE;
+                format.strikethrough = egui::Stroke::NONE;
+            }
             job.sections.push(egui::text::LayoutSection {
                 leading_space: 0.0,
                 byte_range: start..position,
@@ -1623,6 +1649,66 @@ pub(crate) fn layout_window(
     job
 }
 
+/// Recolor only selected glyph quads in this frame, never the cached galley.
+/// TextEdit already inserts its selection background above the opaque cover.
+/// Keep retained (unfocused) selections usable as well as active mouse drags.
+pub(crate) fn paint_selected_text(
+    ui: &egui::Ui,
+    output: &egui::text_edit::TextEditOutput,
+    color: egui::Color32,
+) {
+    let Some(cursor) = output.state.cursor.char_range() else {
+        return;
+    };
+    let selection = cursor.primary.index.min(cursor.secondary.index)
+        ..cursor.primary.index.max(cursor.secondary.index);
+    if selection.is_empty() {
+        return;
+    }
+    ui.ctx().graphics_mut(|graphics| {
+        let list = graphics.entry(ui.layer_id());
+        let indices: Vec<_> = list
+            .all_entries()
+            .enumerate()
+            .filter_map(|(index, shape)| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.pos == output.galley_pos
+                        && text.galley.text() == output.galley.text() =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect();
+        for index in indices {
+            list.mutate_shape(egui::layers::ShapeIdx(index), |shape| {
+                let egui::Shape::Text(text) = &mut shape.shape else {
+                    return;
+                };
+                let galley = std::sync::Arc::make_mut(&mut text.galley);
+                let mut offset = 0;
+                for row in &mut galley.rows {
+                    let start = selection.start.saturating_sub(offset).min(row.glyphs.len());
+                    let end = selection.end.saturating_sub(offset).min(row.glyphs.len());
+                    if start < end {
+                        let glyphs = row.glyphs.iter().enumerate()
+                            .filter(|(_, glyph)| !glyph.uv_rect.is_nothing());
+                        let range = row.visuals.glyph_vertex_range.clone();
+                        for ((index, _), quad) in glyphs.zip(row.visuals.mesh.vertices[range].as_chunks_mut::<4>().0) {
+                            if start <= index && index < end {
+                                for vertex in quad {
+                                    vertex.color = color;
+                                }
+                            }
+                        }
+                    }
+                    offset += row.char_count_including_newline();
+                }
+            });
+        }
+    });
+}
+
 /// Paint whitespace hints over existing glyph positions; source and cursor offsets stay intact.
 pub(crate) fn paint_whitespace(
     ui: &egui::Ui,
@@ -1638,6 +1724,11 @@ pub(crate) fn paint_whitespace(
             continue;
         }
         for (index, glyph) in row.glyphs.iter().enumerate() {
+            // Conceal formatting also covers whitespace overlays; otherwise
+            // dots/arrows would leak through the opaque visual mask.
+            if (glyph.section_index as usize) < galley.job.sections.len()
+                && galley.job.sections[glyph.section_index as usize].format.color == egui::Color32::TRANSPARENT
+            { continue; }
             let hint = match glyph.chr {
                 ' ' => "·",
                 '\t' => "→",
@@ -1661,7 +1752,10 @@ pub(crate) fn paint_whitespace(
             else if tail.starts_with('\n') { Some(false) }
             else { None }
         });
-        if row.ends_with_newline || boundary_ending.is_some() {
+        let concealed_end = row.glyphs.last().is_some_and(|glyph|
+            galley.job.sections.get(glyph.section_index as usize)
+                .is_some_and(|section| section.format.color == egui::Color32::TRANSPARENT));
+        if (row.ends_with_newline || boundary_ending.is_some()) && !concealed_end {
             let crlf = boundary_ending.unwrap_or_else(|| row.glyphs.last().is_some_and(|g| g.chr == '\r'));
             let marker = pos + row.rect.right_center().to_vec2();
             painter.text(
@@ -2215,6 +2309,19 @@ mod tests {
                 color: 2
             }]
         );
+        // The sixth pen can apply the already-retained editor selection, and
+        // its dedicated eraser must leave ordinary markers alone.
+        app.active_mut().unwrap().draft_text = Some("abcdef".into());
+        app.active_mut().unwrap().editor_state.cursor = cursor(0, 2);
+        let conceal = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("pen_color_rect", id, CONCEAL)))).unwrap();
+        click(&mut app, conceal.center());
+        assert_eq!(app.active().unwrap().editor_state.tools.pen, Some(CONCEAL));
+        assert!(app.active().unwrap().editor_state.tools.marks.contains(&Mark { range: 0..2, color: CONCEAL }));
+        click(&mut app, rect.center());
+        run(&mut app, vec![]);
+        let clear_conceal = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("pen_clear_rect", id, CONCEAL)))).unwrap();
+        click(&mut app, clear_conceal.center());
+        assert_eq!(app.active().unwrap().editor_state.tools.marks, [Mark { range: 2..4, color: 2 }]);
         let all = ctx
             .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("pen_clear_all_rect", id))))
             .unwrap();
@@ -2897,6 +3004,118 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0..1, 0), (1..4, 0), (4..5, 4)]
         );
+    }
+
+    #[test]
+    fn conceal_pen_icon_is_solid_not_an_outline() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| { egui::CentralPanel::default().show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0,24.0), egui::Sense::hover());
+            paint_icon(ui.painter(), rect, egui::Color32::WHITE, 10);
+        }); });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Path(path) if path.closed && path.fill == egui::Color32::WHITE)));
+    }
+
+    #[test]
+    fn conceal_window_offsets_edits_and_clear_preserve_original() {
+        let original = "前缀\n中🙂secret尾";
+        let offset = "前缀\n".len();
+        let mut tools = Tools { pen: Some(CONCEAL), find_open: true,
+            current: Some(offset..original.len()), ..Default::default() };
+        tools.mark_selection(original, cursor(3, 12));
+        for pal in [&crate::DARK, &crate::LIGHT] {
+            let job = layout_window(&original[offset..], egui::FontId::monospace(14.0), pal,
+                200.0, &tools, offset);
+            assert_eq!(job.text, &original[offset..]);
+            for section in &job.sections {
+                assert_eq!(section.format.color, egui::Color32::TRANSPARENT);
+                assert_eq!(section.format.background.a(), 255);
+                assert_eq!(section.format.background, pal.text_main.to_opaque());
+                assert_eq!(section.format.underline, egui::Stroke::NONE);
+            }
+        }
+        tools.apply_edit(0..0, 4);
+        assert_eq!(tools.marks[0].range.start, offset + 4);
+        tools.apply_edit(offset + 4..offset + 7, 0);
+        assert_eq!(tools.marks[0].range.end, original.len() + 1);
+        tools.marks.retain(|mark| mark.color != CONCEAL);
+        assert!(tools.marks.is_empty());
+        let job = layout(original, egui::FontId::monospace(14.0), &crate::DARK,
+            200.0, &tools);
+        assert!(job.sections.iter().all(|s| s.format.color != egui::Color32::TRANSPARENT));
+        assert_eq!(original, "前缀\n中🙂secret尾");
+    }
+
+    #[test]
+    fn conceal_both_editors_reveal_only_selection_copy_original_and_rehide() {
+        for large in [false, true] {
+            for pal in [&crate::DARK, &crate::LIGHT] {
+                for workspace in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut app = crate::LiteTextApp::default();
+                    app.new_document();
+                    let original = format!("abcdef secret\n{}", "padding\n".repeat(if large { 35_000 } else { 0 }));
+                    let file = app.active_mut().unwrap();
+                    file.draft_text = Some(original.clone());
+                    file.editor_state.tools.pen = Some(CONCEAL);
+                    file.editor_state.tools.mark_selection(&original, cursor(0, 6));
+                    file.editor_state.tools.pen = None;
+                    if workspace {
+                        crate::workspace_theme::configure(file, &Default::default(), std::ptr::eq(pal, &crate::DARK));
+                    }
+                    let id = egui::Id::new(if large { "large_editor" } else { "draft_editor" }).with(file.id);
+                    let draw = |app: &mut crate::LiteTextApp, events| {
+                        ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))), events, ..Default::default() }, |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                crate::draft_editor(ui, app.active_mut().unwrap(), pal, true, crate::i18n::Lang::En);
+                            });
+                        })
+                    };
+                    draw(&mut app, vec![]);
+                    ctx.memory_mut(|m| m.request_focus(id));
+                    for selection in [0..0, 1..3, 0..0] {
+                        app.active_mut().unwrap().editor_state.pending_selection = Some(selection.clone());
+                        let frame = draw(&mut app, vec![]);
+                        let painted = frame.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text().starts_with("abcdef secret") => Some(&text.galley),
+                            _ => None,
+                        }).unwrap();
+                        let row = &painted.rows[0];
+                        let quads = row.visuals.mesh.vertices[row.visuals.glyph_vertex_range.clone()].as_chunks::<4>().0;
+                        for (index, quad) in quads.iter().take(6).enumerate() {
+                            assert_eq!(quad[0].color.a() != 0, selection.contains(&index), "large={large} workspace={workspace} index={index}");
+                        }
+                        assert!(row.visuals.mesh.vertices[..row.visuals.glyph_vertex_range.start].iter().any(|v| v.color.a() == 255));
+                        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(original.as_str()));
+                    }
+                    // Exercise a real mouse drag over the concealed text too.
+                    let frame = draw(&mut app, vec![]);
+                    let (pos, galley) = frame.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text().starts_with("abcdef secret") => Some((t.pos, &t.galley)), _ => None,
+                    }).unwrap();
+                    let point = |column| pos + egui::vec2(galley.rows[0].x_offset(column), galley.rows[0].rect.center().y);
+                    draw(&mut app, vec![egui::Event::PointerMoved(point(1)), egui::Event::PointerButton { pos: point(1), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+                    draw(&mut app, vec![egui::Event::PointerMoved(point(3))]);
+                    draw(&mut app, vec![egui::Event::PointerButton { pos: point(3), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+                    let frame = draw(&mut app, vec![]);
+                    let painted = frame.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text().starts_with("abcdef secret") => Some(&t.galley), _ => None,
+                    }).unwrap();
+                    let row = &painted.rows[0];
+                    for (index, quad) in row.visuals.mesh.vertices[row.visuals.glyph_vertex_range.clone()].as_chunks::<4>().0.iter().take(6).enumerate() {
+                        assert_eq!(quad[0].color.a() != 0, (1..3).contains(&index));
+                    }
+                    let frame = draw(&mut app, vec![egui::Event::Copy]);
+                    assert!(frame.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "bc")));
+                    app.active_mut().unwrap().editor_state.tools.marks.clear();
+                    let frame = draw(&mut app, vec![]);
+                    let galley = frame.shapes.iter().find_map(|s| match &s.shape { egui::Shape::Text(t) if t.galley.text().starts_with("abcdef secret") => Some(&t.galley), _ => None }).unwrap();
+                    let row = &galley.rows[0];
+                    assert!(row.visuals.mesh.vertices[row.visuals.glyph_vertex_range.clone()].iter().all(|v| v.color.a() != 0));
+                }
+            }
+        }
     }
 
     #[test]

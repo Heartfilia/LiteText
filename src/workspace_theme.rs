@@ -865,60 +865,7 @@ impl Render {
         ui: &egui::Ui,
         output: &egui::text_edit::TextEditOutput,
     ) {
-        if !output.response.has_focus() {
-            return;
-        }
-        let Some(cursor) = output.state.cursor.char_range() else {
-            return;
-        };
-        let selection = cursor.primary.index.min(cursor.secondary.index)
-            ..cursor.primary.index.max(cursor.secondary.index);
-        if selection.is_empty() {
-            return;
-        }
-        ui.ctx().graphics_mut(|graphics| {
-            let list = graphics.entry(ui.layer_id());
-            let indices: Vec<_> = list
-                .all_entries()
-                .enumerate()
-                .filter_map(|(index, shape)| match &shape.shape {
-                    egui::Shape::Text(text)
-                        if text.pos == output.galley_pos
-                            && text.galley.text() == output.galley.text() =>
-                    {
-                        Some(index)
-                    }
-                    _ => None,
-                })
-                .collect();
-            for index in indices {
-                list.mutate_shape(egui::layers::ShapeIdx(index), |shape| {
-                    let egui::Shape::Text(text) = &mut shape.shape else {
-                        return;
-                    };
-                    let galley = Arc::make_mut(&mut text.galley);
-                    let mut offset = 0;
-                    for row in &mut galley.rows {
-                        let start = selection.start.saturating_sub(offset).min(row.glyphs.len());
-                        let end = selection.end.saturating_sub(offset).min(row.glyphs.len());
-                        if start < end {
-                            let left = row.x_offset(start);
-                            let right = row.x_offset(end);
-                            let range = row.visuals.glyph_vertex_range.clone();
-                            for quad in row.visuals.mesh.vertices[range].as_chunks_mut::<4>().0 {
-                                let center = quad.iter().map(|v| v.pos.x).sum::<f32>() / 4.0;
-                                if left <= center && center < right {
-                                    for vertex in quad {
-                                        vertex.color = self.colors.selected_text;
-                                    }
-                                }
-                            }
-                        }
-                        offset += row.char_count_including_newline();
-                    }
-                });
-            }
-        });
+        crate::text_tools::paint_selected_text(ui, output, self.colors.selected_text);
     }
 }
 

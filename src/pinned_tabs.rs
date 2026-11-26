@@ -67,6 +67,11 @@ impl LiteTextApp {
         if pin.clicked() {
             action = Some(TabAction::Pin(id));
         }
+        if file.is_untitled() {
+            let rename = menu.button(if zh { "重命名…" } else { "Rename…" });
+            menu.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("rename_tab_rect", id)), rename.rect));
+            if rename.clicked() { action = Some(TabAction::Rename(id)); }
+        }
         menu.separator();
         let has_path = !file.path.as_os_str().is_empty();
         if menu

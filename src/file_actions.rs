@@ -96,7 +96,10 @@ impl LiteTextApp {
         let name = source
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("{}.txt", file.name));
+            .unwrap_or_else(|| {
+                if std::path::Path::new(&file.name).extension().is_some() { file.name.clone() }
+                else { format!("{}.{}", file.name, if crate::markdown::is_markdown(file) { "md" } else { "txt" }) }
+            });
         Some((directory, name))
     }
 
@@ -222,6 +225,20 @@ mod tests {
             recovery_path_override: Some(dir.join("session.json")),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn renamed_draft_save_dialog_uses_title_and_keeps_save_as_semantics() {
+        let mut app = LiteTextApp::default(); app.new_document();
+        let id = app.active_id.unwrap();
+        app.rename_draft_to(id, "接口记录.md").unwrap();
+        assert_eq!(app.save_target_defaults(id).unwrap().1, "接口记录.md");
+        assert!(app.active().unwrap().path.as_os_str().is_empty());
+        app.rename_draft_to(id, "接口记录").unwrap();
+        assert_eq!(app.save_target_defaults(id).unwrap().1, "接口记录.txt");
+        app.save_as_target_override = Some(None);
+        assert!(!app.save_file(id));
+        assert!(app.active().unwrap().path.as_os_str().is_empty());
     }
 
     #[test]

@@ -59,6 +59,8 @@ const DRAFT_META_FILE: &str = ".litetext-drafts.json";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct DraftMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default)]
     pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,7 +166,7 @@ pub(crate) fn scan(root: Option<&Path>) -> Vec<Draft> {
         let entry = meta.get(file_name);
         drafts.push(Draft {
             lease,
-            name: display_name(file_name),
+            name: entry.and_then(|meta| meta.name.clone()).unwrap_or_else(|| display_name(file_name)),
             language_override: entry
                 .and_then(|meta| meta.language.clone())
                 .or_else(|| markdown_override(&path)),
@@ -471,7 +473,7 @@ impl LiteTextApp {
                 let path = file.scratch_path.as_ref()?;
                 if path.parent() != Some(root.as_path()) || !self.scratch.leases.contains_key(&crate::linkage::resolved(path)) { return None; }
                 Some((path.file_name()?.to_str()?.to_owned(), DraftMeta {
-                    pinned: file.pinned, language: file.language_override.clone(), markdown_mode: Some(file.markdown_mode),
+                    name: Some(file.name.clone()), pinned: file.pinned, language: file.language_override.clone(), markdown_mode: Some(file.markdown_mode),
                 }))
             }).collect();
         let Ok(local_bytes) = serde_json::to_vec(&(root.clone(), &local)) else { return; };
@@ -667,7 +669,7 @@ impl LiteTextApp {
             };
             match write {
                 Ok(()) => {
-                    if untitled && untitled_number(&name).is_some()
+                    if untitled && previous.as_deref() != Some(path.as_path()) && untitled_number(&name).is_some()
                         && let Some(file_name) = path.file_name().and_then(|name| name.to_str())
                         && draft_stem(file_name) != draft_stem(&name)
                     {
@@ -822,7 +824,8 @@ pub(crate) fn restore_scratch_meta(&mut self, meta: &[recovery::ScratchMeta]) {
         let found = self
             .files
             .iter()
-            .position(|file| file.is_untitled() && draft_stem(&file.name) == stem);
+            .position(|file| file.is_untitled() && (draft_stem(&file.name) == stem
+                || file.scratch_path.as_ref().and_then(|path| path.file_name()).is_some_and(|name| name == entry.file_name.as_str())));
         if let Some(index) = found {
             let file = &mut self.files[index];
             file.pinned = entry.pinned;
@@ -893,7 +896,8 @@ pub(crate) fn restore_scratch_meta(&mut self, meta: &[recovery::ScratchMeta]) {
     }
     pinned_drafts.sort_by_key(|file| {
         meta.iter()
-            .position(|entry| draft_stem(&entry.file_name) == draft_stem(&file.name))
+            .position(|entry| draft_stem(&entry.file_name) == draft_stem(&file.name)
+                || file.scratch_path.as_ref().and_then(|path| path.file_name()).is_some_and(|name| name == entry.file_name.as_str()))
             .unwrap_or(usize::MAX)
     });
     let insert_at = rest

@@ -488,6 +488,7 @@ impl LiteTextApp {
     pub(crate) fn shortcuts_blocked(&self) -> bool {
         self.show_settings
             || self.text_diff.open
+            || self.rename_draft.is_some()
             || self.restoring()
             || !self.open_errors.is_empty() && !self.opening_files()
             || self.pending_batch.is_some()
@@ -510,6 +511,7 @@ impl LiteTextApp {
     pub(crate) fn status_controls_blocked(&self) -> bool {
         self.show_settings
             || self.text_diff.open
+            || self.rename_draft.is_some()
             || self.restoring()
             || !self.open_errors.is_empty() && !self.opening_files()
             || self.pending_batch.is_some()
@@ -528,6 +530,15 @@ impl LiteTextApp {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("app_keymap_managed"), true));
         if self.shortcuts_blocked() {
             return false;
+        }
+        if self.active().is_some_and(|file| file.editor_state.tools.pen.is_some() || file.editor_state.tools.pen_menu)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            if let Some(file) = self.active_mut() {
+                file.editor_state.tools.pen = None;
+                file.editor_state.tools.pen_menu = false;
+            }
+            ctx.request_repaint();
         }
         let mut save = false;
         for &action in ACTIONS {

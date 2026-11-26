@@ -614,6 +614,8 @@ fn show_impl(
             paint_unfocused_selection(ui, &mut output);
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
+            } else {
+                crate::text_tools::paint_selected_text(ui, &output, ui.visuals().selection.stroke.color);
             }
             ui.set_min_width(gutter_w + EDITOR_LEFT_PADDING + output.galley.size().x + if tools.whitespace { 24.0 } else { 12.0 });
             if focus {

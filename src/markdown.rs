@@ -10,6 +10,8 @@ use egui::{Color32, FontFamily, FontId, Stroke};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[path = "markdown_table_ops.rs"]
+mod table_ops;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Mode {
@@ -37,6 +39,8 @@ impl Mode {
 #[derive(Clone, Default)]
 pub(crate) struct State {
     pub(crate) editing: Option<Editing>,
+    /// Live tables keep their grid while only one source cell is editable.
+    pub(crate) cell_editing: Option<CellEditing>,
     /// Open "insert table" size picker, kept across frames while its window is
     /// visible.
     pub(crate) table_picker: Option<TablePicker>,
@@ -89,6 +93,17 @@ pub(crate) struct Editing {
     /// Character offset within `text` where the click landed. Applied once
     /// before the first frame so editing starts at the clicked position.
     cursor: Option<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CellEditing {
+    table: usize,
+    row: usize,
+    column: usize,
+    source: Range<usize>,
+    text: String,
+    committed: String,
+    focus: bool,
 }
 
 /// Small modal-style size picker opened from the live-render context menu.
@@ -567,6 +582,13 @@ pub(crate) fn live_editor(
     let body = body_size(file);
     let avail = ui.available_width().max(240.0);
     let mut editing = file.markdown.editing.take();
+    let mut cell_editing = file.markdown.cell_editing.take();
+    // External undo/source edits are authoritative; never replay a stale cell.
+    if cell_editing.as_ref().is_some_and(|edit| {
+        text.get(edit.source.clone()) != Some(edit.committed.as_str())
+    }) {
+        cell_editing = None;
+    }
     // While a paragraph is edited, an unfinished fence must not be parsed as
     // a code block: that would hide every following block until the user
     // types the space that completes it. Mask the markers in a same-length
@@ -673,6 +695,23 @@ pub(crate) fn live_editor(
                         if inside_edit {
                             continue;
                         }
+                        if matches!(block.kind, Kind::Table) && !is_editing {
+                            let response = live_table(ui, raw, block.range.start, content, body, pal,
+                                file_id, lang, highlight.as_ref().and_then(|range| block_highlight(block, raw, range)).as_ref(),
+                                &mut cell_editing, &mut pending);
+                            if cell_editing.is_some() { editing = None; }
+                            if pending.is_some() { changed = true; }
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| data.insert_temp(
+                                egui::Id::new(("markdown_block", file_id, block.range.start)), response.rect));
+                            if let Some(byte) = jump.filter(|_| target == Some(index)) {
+                                ui.scroll_to_rect_animation(match_band(response.rect, &text, block, byte),
+                                    Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+                            }
+                            response.context_menu(|menu| insert_context_menu(menu, lang, block.range.end,
+                                (block.range.start, block.range.end), &mut insert_action, &mut table_picker, Some(raw)));
+                            continue;
+                        }
                         if is_editing {
                             let edit = editing.as_mut().expect("checked above");
                             let edit_id = egui::Id::new((
@@ -753,7 +792,13 @@ pub(crate) fn live_editor(
                                 }
                             }
                             let mut layouter = |ui: &egui::Ui, text: &str, width: f32| {
-                                let job = if code {
+                                let job = if matches!(block.kind, Kind::Table) {
+                                    let layout = table_layout(ui, text, body, pal, None);
+                                    let mut job = plain_job(text, FontId::proportional(body), pal.text_main, f32::INFINITY);
+                                    let height = (layout.height() / line_ranges(text).len().max(1) as f32).max(body * BODY_LINE_HEIGHT);
+                                    for section in &mut job.sections { section.format.line_height = Some(height); }
+                                    job
+                                } else if code {
                                     code_body_edit_job(text, &language, body, width, pal)
                                 } else { editing_job_for(
                                     text,
@@ -806,6 +851,22 @@ pub(crate) fn live_editor(
                                         bottom: frame_bottom,
                                     })
                                     .show(ui, |ui| {
+                                        let table = matches!(block.kind, Kind::Table);
+                                        if table {
+                                            ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+                                            let height = table_layout(ui, &edit.text, body, pal, None).height();
+                                            return egui::ScrollArea::horizontal()
+                                                .id_salt(("markdown_table_edit_scroll", file_id, block.range.start))
+                                                .auto_shrink([false, true])
+                                                .show(ui, |ui| {
+                                                    ui.set_min_height(height);
+                                                    egui::TextEdit::multiline(&mut edit.text)
+                                                        .id(edit_id).font(edit_font).text_color(pal.text_main)
+                                                        .frame(false).margin(egui::Margin::ZERO)
+                                                        .desired_width((content - 2.0 * side as f32).max(24.0))
+                                                        .desired_rows(1).layouter(&mut layouter).show(ui)
+                                                }).inner;
+                                        }
                                         egui::TextEdit::multiline(body_text.as_mut().unwrap_or(&mut edit.text))
                                             .id(edit_id)
                                             .font(edit_font)
@@ -1053,7 +1114,9 @@ pub(crate) fn live_editor(
                                 let cursor = editing_cursor_from_click(
                                     ui,
                                     raw,
-                                    pos - response.rect.min,
+                                    pos - response.rect.min + egui::vec2(if matches!(block.kind, Kind::Table) {
+                                        ui.ctx().data(|data| data.get_temp::<f32>(egui::Id::new(("markdown_table_offset", file_id, block.range.start)))).unwrap_or(0.0)
+                                    } else { 0.0 }, 0.0),
                                     &block.kind,
                                     content,
                                     body,
@@ -1144,6 +1207,14 @@ pub(crate) fn live_editor(
     if let Some((range, replacement)) = pending {
         let new_len = replacement.len();
         text.replace_range(range.clone(), &replacement);
+        if let Some(edit) = cell_editing.as_mut() {
+            let delta = new_len as isize - range.len() as isize;
+            if edit.source == range {
+                edit.source.end = range.start + new_len;
+            } else if edit.source.start >= range.end {
+                edit.source = edit.source.start.saturating_add_signed(delta)..edit.source.end.saturating_add_signed(delta);
+            }
+        }
         if fence_focus.is_none()
             && let Some(edit) = editing.as_mut()
         {
@@ -1302,9 +1373,16 @@ pub(crate) fn live_editor(
             }
         }
     }
+    if let Some(edit) = cell_editing.as_ref() {
+        cursor_line = text[..edit.source.start.min(text.len())].bytes().filter(|byte| *byte == b'\n').count();
+    }
     file.editor_state.cursor_line = cursor_line;
     file.editor_state.selected_characters = selected;
+    if editing.is_some() || paste_changed {
+        cell_editing = None;
+    }
     file.markdown.editing = editing;
+    file.markdown.cell_editing = cell_editing;
     file.markdown.table_picker = table_picker;
     file.markdown.toc_target = toc_target;
     file.markdown.outline = outline;
@@ -1691,9 +1769,8 @@ fn parse(text: &str) -> Vec<Block> {
             index = end;
             continue;
         }
-        if trimmed.contains('|')
-            && index + 1 < lines.len()
-            && table_separator(&text[lines[index + 1].0..lines[index + 1].1])
+        if index + 1 < lines.len()
+            && table_start(raw, &text[lines[index + 1].0..lines[index + 1].1])
         {
             let mut end = index + 2;
             while end < lines.len() && text[lines[end].0..lines[end].1].contains('|') {
@@ -1735,6 +1812,8 @@ fn parse(text: &str) -> Vec<Block> {
                 || list_marker(candidate_trimmed).is_some()
                 || candidate_trimmed.starts_with('<') && candidate_trimmed.ends_with('>')
                 || image_line(candidate_trimmed).is_some()
+                || end + 1 < lines.len()
+                    && table_start(candidate, &text[lines[end + 1].0..lines[end + 1].1])
             {
                 break;
             }
@@ -1857,11 +1936,329 @@ fn html_attribute(tag: &str, name: &str) -> Option<String> {
     }
 }
 
-fn table_separator(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.contains('|')
-        && trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-        && trimmed.chars().filter(|c| *c == '-').count() >= 3
+/// Byte ranges into the original row: escaped pipes and paired code spans
+/// never split cells. No normalized copy is written back to the draft.
+fn table_cells(line: &str) -> Vec<Range<usize>> {
+    let mut pipes = Vec::new();
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => { i = (i + 2).min(bytes.len()); }
+            b'`' => {
+                if let Some((len, _, _)) = backtick_span(&line[i..]) { i += len; }
+                else { i += bytes[i..].iter().take_while(|b| **b == b'`').count(); }
+            }
+            b'|' => { pipes.push(i); i += 1; }
+            _ => { i += 1; }
+        }
+    }
+    let mut ranges = Vec::with_capacity(pipes.len() + 1);
+    let mut start = 0;
+    for end in pipes { ranges.push(start..end); start = end + 1; }
+    ranges.push(start..line.len());
+    if ranges.len() > 1 && line[ranges[0].clone()].trim().is_empty() { ranges.remove(0); }
+    if ranges.len() > 1 && line[ranges.last().unwrap().clone()].trim().is_empty() { ranges.pop(); }
+    for range in &mut ranges {
+        let cell = &line[range.clone()];
+        let lead = cell.len() - cell.trim_start().len();
+        let len = cell.trim().len();
+        range.start += lead;
+        range.end = range.start + len;
+    }
+    ranges
+}
+
+fn table_alignments(line: &str) -> Option<Vec<egui::Align>> {
+    table_cells(line).into_iter().map(|range| {
+        let cell = &line[range];
+        let dashes = cell.strip_prefix(':').unwrap_or(cell);
+        let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+        (dashes.len() >= 3 && dashes.bytes().all(|b| b == b'-')).then_some(
+            if cell.starts_with(':') && cell.ends_with(':') { egui::Align::Center }
+            else if cell.ends_with(':') { egui::Align::RIGHT }
+            else { egui::Align::LEFT }
+        )
+    }).collect()
+}
+
+fn table_start(header: &str, separator: &str) -> bool {
+    header.contains('|') && table_alignments(separator)
+        .is_some_and(|align| align.len() == table_cells(header).len())
+}
+
+struct TableCellLayout {
+    source: Range<usize>,
+    galley: std::sync::Arc<egui::Galley>,
+}
+struct TableLayout {
+    rows: Vec<Vec<TableCellLayout>>,
+    columns: Vec<f32>,
+    align: Vec<egui::Align>,
+    row_height: f32,
+}
+impl TableLayout {
+    fn width(&self) -> f32 { self.columns.iter().sum() }
+    fn height(&self) -> f32 { self.rows.len() as f32 * self.row_height }
+}
+
+fn table_cell_job(raw: &str, range: Range<usize>, header: bool, body: f32,
+    pal: &Palette, highlight: Option<&Range<usize>>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let font = if header { FontId::new(body, FontFamily::Name("brand".into())) }
+        else { FontId::proportional(body) };
+    let base = egui::TextFormat { font_id: font.clone(), color: pal.text_main, ..Default::default() };
+    push_inline_fmt(&mut job, &raw[range.clone()], &base, pal, highlight, range.start);
+    if job.sections.is_empty() { job.append("", 0.0, base); }
+    apply_body_line_height(&mut job, &font);
+    job
+}
+
+fn table_layout(ui: &egui::Ui, raw: &str, body: f32, pal: &Palette,
+    highlight: Option<&Range<usize>>) -> TableLayout {
+    let lines = line_ranges(raw);
+    let align = lines.get(1).and_then(|&(s, e)| table_alignments(&raw[s..e])).unwrap_or_default();
+    let mut columns = vec![48.0_f32; align.len()];
+    let mut rows = Vec::new();
+    let mut row_height = body * BODY_LINE_HEIGHT + 14.0;
+    for (index, &(start, end)) in lines.iter().enumerate() {
+        if index == 1 || (index > 1 && raw[start..end].trim().is_empty()) { continue; }
+        let mut cells = table_cells(&raw[start..end]);
+        cells.resize(align.len(), end-start..end-start);
+        cells.truncate(align.len());
+        let row = cells.into_iter().enumerate().map(|(column, range)| {
+            let source = start + range.start..start + range.end;
+            let job = table_cell_job(raw, source.clone(), index == 0, body, pal, highlight);
+            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+            columns[column] = columns[column].max(galley.size().x + 20.0);
+            row_height = row_height.max(galley.size().y + 14.0);
+            TableCellLayout { source, galley }
+        }).collect();
+        rows.push(row);
+    }
+    // Editing exposes the separator too; reserve enough room for every source
+    // row without changing the following block's position on entry.
+    if !rows.is_empty() {
+        row_height = row_height.max(lines.len() as f32 * body * BODY_LINE_HEIGHT / rows.len() as f32);
+        // egui rounds each TextEdit source row to whole points. Reserve the
+        // same total in the grid, including fractional editor font sizes.
+        let per_source = (row_height * rows.len() as f32 / lines.len() as f32).ceil();
+        row_height = per_source * lines.len() as f32 / rows.len() as f32;
+    }
+    TableLayout { rows, columns, align, row_height }
+}
+
+/// Serialize only the edited cell. Existing escapes are retained byte-for-byte;
+/// new pipes (including pasted ones) cannot turn into column separators.
+fn table_cell_source(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut slashes = 0;
+    for ch in text.chars() {
+        if ch == '|' && slashes % 2 == 0 { result.push('\\'); }
+        result.push(if ch == '\r' || ch == '\n' { ' ' } else { ch });
+        slashes = if ch == '\\' { slashes + 1 } else { 0 };
+    }
+    // With no padding before the row delimiter, an odd trailing slash would
+    // escape that delimiter and merge the following column into this one.
+    if slashes % 2 != 0 { result.push('\\'); }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_table(ui: &mut egui::Ui, raw: &str, table: usize, width: f32, body: f32,
+    pal: &Palette, file_id: u64, lang: Lang, highlight: Option<&Range<usize>>, editing: &mut Option<CellEditing>,
+    pending: &mut Option<(Range<usize>, String)>) -> egui::Response {
+    let layout = table_layout(ui, raw, body, pal, highlight);
+    ui.add_space(5.0);
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+    let scroll = egui::ScrollArea::horizontal()
+        .id_salt(("markdown_table_scroll", file_id, table))
+        .drag_to_scroll(false).auto_shrink([false, true])
+        .max_width(width)
+        .show(ui, |ui| {
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(layout.width(), layout.height()), egui::Sense::hover());
+            paint_table(ui, &layout, rect.min, pal);
+            let mut next = None;
+            let mut finish = false;
+            let mut structural = None;
+            for (row, cells) in layout.rows.iter().enumerate() {
+                let mut x = rect.left();
+                for (column, _cell) in cells.iter().enumerate() {
+                    let cell_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, rect.top() + row as f32 * layout.row_height),
+                        egui::vec2(layout.columns[column], layout.row_height));
+                    x += layout.columns[column];
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| data.insert_temp(
+                        egui::Id::new(("markdown_cell", file_id, table, row, column)), cell_rect));
+                    let active = editing.as_ref().is_some_and(|edit|
+                        edit.table == table && edit.row == row && edit.column == column);
+                    if active {
+                        let edit = editing.as_mut().unwrap();
+                        let id = egui::Id::new(("markdown_cell_edit", file_id, table, row, column));
+                        let focused = ui.memory(|memory| memory.has_focus(id));
+                        if ui.input(|input| input.key_pressed(egui::Key::Escape)) { finish = true; }
+                        if focused && !ui.input(|input| input.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))) {
+                            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Escape)) { finish = true; }
+                            let backwards = ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                            if backwards || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+                                let count = layout.rows.len() * layout.columns.len();
+                                let current = row * layout.columns.len() + column;
+                                let index = if backwards { (current + count - 1) % count } else { (current + 1) % count };
+                                next = Some((index / layout.columns.len(), index % layout.columns.len()));
+                            }
+                        }
+                        // Cover just the active glyphs, never the grid lines.
+                        ui.painter().rect_filled(cell_rect.shrink(1.0), 0.0,
+                            if row == 0 { pal.bg_elevated } else { pal.bg_inset });
+                        let font = if row == 0 { FontId::new(body, FontFamily::Name("brand".into())) }
+                            else { FontId::proportional(body) };
+                        crate::undo_settings::configure(ui.ctx(), id, &edit.text);
+                        // Use the exact preview origin and body line metrics;
+                        // ui.put over a tall cell otherwise centers a natural
+                        // font row differently from the rendered table galley.
+                        let free = (layout.columns[column] - 20.0 - _cell.galley.size().x).max(0.0);
+                        let offset = match layout.align[column] { egui::Align::Center => free * 0.5, egui::Align::Max => free, _ => 0.0 };
+                        let origin = cell_rect.min + egui::vec2(10.0 + offset, 7.0);
+                        let edit_rect = egui::Rect::from_min_size(origin,
+                            egui::vec2((cell_rect.right() - origin.x - 4.0).max(12.0), _cell.galley.size().y));
+                        let mut layouter = |ui: &egui::Ui, text: &str, _width: f32| {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.wrap.max_width = f32::INFINITY;
+                            let base = egui::TextFormat {
+                                font_id: font.clone(), color: pal.text_main,
+                                line_height: Some(body * BODY_LINE_HEIGHT), ..Default::default()
+                            };
+                            // Keep paired inline syntax rendered while the raw
+                            // characters remain available for caret/undo. An
+                            // incomplete delimiter falls back to visible source.
+                            push_inline_editing(&mut job, text, &base, pal);
+                            if job.sections.is_empty() { job.append("", 0.0, base); }
+                            apply_body_line_height(&mut job, &font);
+                            ui.fonts(|fonts| fonts.layout_job(job))
+                        };
+                        let output = ui.put(edit_rect,
+                            egui::TextEdit::singleline(&mut edit.text).id(id).font(font.clone())
+                                .text_color(pal.text_main).frame(false).margin(egui::Margin::ZERO)
+                                .vertical_align(egui::Align::TOP)
+                                .layouter(&mut layouter).desired_width(edit_rect.width()));
+                        let cell_menu_open = output.context_menu_opened();
+                        output.context_menu(|menu| {
+                            if let Some(action) = table_structure_menu(menu, file_id, table, row, column,
+                                layout.rows.len(), layout.columns.len(), lang) { structural = Some((row, column, action)); }
+                        });
+                        if edit.focus { output.request_focus(); edit.focus = false; }
+                        if output.changed() {
+                            let replacement = table_cell_source(&edit.text);
+                            edit.committed = replacement.clone();
+                            *pending = Some((edit.source.clone(), replacement));
+                        }
+                        if focused && !cell_menu_open && ui.input(|input| input.pointer.any_pressed())
+                            && ui.input(|input| input.pointer.interact_pos().is_some_and(|pos| !cell_rect.contains(pos))) {
+                            finish = true;
+                        }
+                    } else {
+                        let hit = ui.interact(cell_rect, egui::Id::new(("markdown_cell_hit", file_id, table, row, column)), egui::Sense::click());
+                        if hit.clicked() { next = Some((row, column)); }
+                        hit.context_menu(|menu| {
+                            if let Some(action) = table_structure_menu(menu, file_id, table, row, column,
+                                layout.rows.len(), layout.columns.len(), lang) { structural = Some((row, column, action)); }
+                        });
+                    }
+                }
+            }
+            if let Some((row, column, action)) = structural
+                && let Some(replacement) = table_ops::edit(raw, row, column, action)
+            {
+                    *pending = Some((table..table + raw.len(), replacement));
+                    *editing = None;
+                    next = None;
+                    ui.ctx().request_repaint();
+            }
+            if finish { *editing = None; }
+            if let Some((row, column)) = next {
+                let source = layout.rows[row][column].source.clone();
+                *editing = Some(CellEditing { table, row, column,
+                    text: raw[source.clone()].to_owned(),
+                    committed: raw[source.clone()].to_owned(),
+                    source: table + source.start..table + source.end, focus: true });
+                ui.ctx().request_repaint();
+            }
+            response
+        });
+    ui.ctx().data_mut(|data| data.insert_temp(
+        egui::Id::new(("markdown_table_offset", file_id, table)), scroll.state.offset.x));
+    ui.add_space(6.0);
+    scroll.inner
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_structure_menu(ui: &mut egui::Ui, file: u64, table: usize, row: usize, column: usize,
+    rows: usize, columns: usize, lang: Lang) -> Option<table_ops::Action> {
+    let zh = lang == Lang::ZhCn;
+    let mut action = None;
+    for (kind, label, entries) in [
+        ("row", if zh { "插入行" } else { "Insert row" }, [
+            (if zh { "上方插入一行" } else { "Insert row above" }, table_ops::Action::RowAbove),
+            (if zh { "下方插入一行" } else { "Insert row below" }, table_ops::Action::RowBelow)]),
+        ("column", if zh { "插入列" } else { "Insert column" }, [
+            (if zh { "左侧插入一列" } else { "Insert column left" }, table_ops::Action::ColumnLeft),
+            (if zh { "右侧插入一列" } else { "Insert column right" }, table_ops::Action::ColumnRight)]),
+    ] {
+        let response = ui.menu_button(label, |menu| {
+            for (index, (label, value)) in entries.into_iter().enumerate() {
+                let response = menu.button(label);
+                menu.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("table_insert_action", file, table, kind, index)), response.rect));
+                if response.clicked() { action = Some(value); menu.close_menu(); }
+            }
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("table_insert_menu", file, table, kind)), response.response.rect));
+    }
+    ui.separator();
+    let delete_row = ui.add_enabled(row > 0 || rows > 1,
+        egui::Button::new(if zh { "删除当前行" } else { "Delete current row" }));
+    let delete_column = ui.add_enabled(columns > 1,
+        egui::Button::new(if zh { "删除当前列" } else { "Delete current column" }));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(egui::Id::new(("table_delete_row", file, table)), delete_row.rect);
+        d.insert_temp(egui::Id::new(("table_delete_column", file, table)), delete_column.rect);
+    });
+    if delete_row.clicked() { action = Some(table_ops::Action::DeleteRow); }
+    if delete_column.clicked() { action = Some(table_ops::Action::DeleteColumn); }
+    if action.is_some() { ui.close_menu(); }
+    let _ = column;
+    action
+}
+
+fn paint_table(ui: &egui::Ui, layout: &TableLayout, origin: egui::Pos2, pal: &Palette) {
+    let rect = egui::Rect::from_min_size(origin, egui::vec2(layout.width(), layout.height()));
+    ui.painter().rect_filled(rect, 0.0, pal.bg_inset);
+    let stroke = Stroke::new(1.0, pal.text_faint.gamma_multiply(0.35));
+    for (row_index, row) in layout.rows.iter().enumerate() {
+        let y = origin.y + row_index as f32 * layout.row_height;
+        if row_index == 0 {
+            ui.painter().rect_filled(egui::Rect::from_min_size(origin, egui::vec2(layout.width(), layout.row_height)), 0.0, pal.bg_elevated);
+        }
+        if y + layout.row_height >= ui.clip_rect().top() && y <= ui.clip_rect().bottom() {
+            let mut x = origin.x;
+            for (column, cell) in row.iter().enumerate() {
+                let free = (layout.columns[column] - 20.0 - cell.galley.size().x).max(0.0);
+                let offset = match layout.align[column] { egui::Align::Center => free * 0.5, egui::Align::Max => free, _ => 0.0 };
+                ui.painter().galley(egui::pos2(x + 10.0 + offset, y + 7.0), cell.galley.clone(), pal.text_main);
+                x += layout.columns[column];
+            }
+            ui.painter().line_segment([egui::pos2(origin.x, y), egui::pos2(rect.right(), y)], stroke);
+        }
+    }
+    let mut x = origin.x;
+    for width in layout.columns.iter().chain(std::iter::once(&0.0)) {
+        ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+        x += width;
+    }
+    ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
 }
 
 fn heading_text(raw: &str) -> String {
@@ -3639,6 +4036,29 @@ fn push_inline_editing(
     }
 }
 
+/// Translate a rendered cell cursor through the source-preserving inline
+/// parser, never through hidden delimiters or link destinations.
+fn table_visible_cursor_byte(raw: &str, cursor: usize, body: f32, pal: &Palette) -> usize {
+    let mut job = egui::text::LayoutJob::default();
+    let base = egui::TextFormat {
+        font_id: FontId::proportional(body), color: pal.text_main, ..Default::default()
+    };
+    push_inline_editing(&mut job, raw, &base, pal);
+    debug_assert_eq!(job.text, raw);
+    let mut visible = 0;
+    let mut end = 0;
+    for section in &job.sections {
+        if section.format.color == Color32::TRANSPARENT { continue; }
+        for (byte, ch) in raw[section.byte_range.clone()].char_indices() {
+            let byte = section.byte_range.start + byte;
+            if visible == cursor { return byte; }
+            visible += 1;
+            end = byte + ch.len_utf8();
+        }
+    }
+    end
+}
+
 /// Map a click inside a rendered block back to a character offset in its raw
 /// Markdown. The editing layout keeps every source character, so a galley hit
 /// test is enough.
@@ -3651,6 +4071,28 @@ fn editing_cursor_from_click(
     body: f32,
     pal: &Palette,
 ) -> usize {
+    if matches!(kind, Kind::Table) {
+        let layout = table_layout(ui, raw, body, pal, None);
+        if layout.rows.is_empty() { return 0; }
+        let row = (((relative.y - 5.0).max(0.0) / layout.row_height) as usize).min(layout.rows.len() - 1);
+        let mut x = 0.0;
+        for (column, cell) in layout.rows[row].iter().enumerate() {
+            let right = x + layout.columns[column];
+            if relative.x <= right || column + 1 == layout.columns.len() {
+                let free = (layout.columns[column] - 20.0 - cell.galley.size().x).max(0.0);
+                let aligned = match layout.align[column] { egui::Align::Center => free * 0.5, egui::Align::Max => free, _ => 0.0 };
+                let cursor = cell.galley.cursor_from_pos(egui::vec2(relative.x - x - 10.0 - aligned, 0.0)).ccursor.index;
+                // The source-preserving inline job identifies hidden syntax
+                // explicitly. Matching characters greedily against raw text can
+                // otherwise land in a hidden URL containing the same words.
+                let cell_raw = &raw[cell.source.clone()];
+                let byte = table_visible_cursor_byte(cell_raw, cursor, body, pal);
+                return raw[..cell.source.start + byte].chars().count();
+            }
+            x = right;
+        }
+        return 0;
+    }
     let (top, _) = editing_space(kind, body);
     let (width, inset) = match kind {
         Kind::Quote | Kind::Callout(_) => (
@@ -3769,17 +4211,7 @@ fn block_natural_width(
                 ),
             ) + 20.0
         }
-        Kind::Table => {
-            galley_width(
-                ui,
-                plain_job(
-                    raw.trim_end(),
-                    FontId::monospace(body - 1.5),
-                    pal.text_main,
-                    f32::INFINITY,
-                ),
-            ) + 16.0
-        }
+        Kind::Table => table_layout(ui, raw, body, pal, None).width(),
         Kind::Html => galley_width(
             ui,
             plain_job(
@@ -4127,16 +4559,7 @@ fn measure_block(
             galley_height(ui, job).max(row_height) + 18.0 + code_lang_height(body)
         }
         Kind::Rule => 16.0,
-        Kind::Table => {
-            let text = raw.trim_end();
-            let job = plain_job(
-                text,
-                FontId::monospace(body - 1.5),
-                pal.text_main,
-                if nowrap { f32::INFINITY } else { width - 16.0 },
-            );
-            galley_height(ui, job) + 16.0
-        }
+        Kind::Table => table_layout(ui, raw, body, pal, None).height() + 11.0,
         Kind::Html => {
             let job = plain_job(
                 raw.trim(),
@@ -4317,7 +4740,6 @@ fn render_block(
             let rect = ui.max_rect();
             // A non-wrapping block may be wider than the reading column; its
             // background must follow the full content, not the clip width.
-            let wide = egui::Rect::from_min_size(rect.min, egui::vec2(content_width, rect.height()));
             match &block.kind {
                 Kind::Blank => {}
                 Kind::Heading(level) => {
@@ -4497,23 +4919,27 @@ fn render_block(
                     );
                 }
                 Kind::Table => {
-                    ui.painter().rect_filled(wide, 4.0, pal.bg_inset);
+                    let layout = table_layout(ui, raw, body, pal, hit.as_ref());
                     ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::Label::new(plain_job_highlighted(
-                                raw.trim_end(),
-                                FontId::monospace(body - 1.5),
-                                pal.text_main,
-                                if nowrap { f32::INFINITY } else { width - 16.0 },
-                                hit.clone(),
-                                pal,
-                            ))
-                            .selectable(false),
-                        );
-                    });
-                    ui.add_space(6.0);
+                    if !nowrap && layout.width() > width {
+                        // Floating bars do not change measured block height.
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+                        let scroll = egui::ScrollArea::horizontal()
+                            .id_salt(("markdown_table_scroll", file_id, block.range.start))
+                            .drag_to_scroll(false)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(layout.width(), layout.height()), egui::Sense::hover());
+                                paint_table(ui, &layout, rect.min, pal);
+                            });
+                        ui.ctx().data_mut(|data| data.insert_temp(
+                            egui::Id::new(("markdown_table_offset", file_id, block.range.start)), scroll.state.offset.x));
+                    } else {
+                        ui.ctx().data_mut(|data| data.insert_temp(
+                            egui::Id::new(("markdown_table_offset", file_id, block.range.start)), 0.0_f32));
+                        paint_table(ui, &layout, rect.min + egui::vec2(0.0, 5.0), pal);
+                    }
                 }
                 Kind::Html => {
                     ui.add(
@@ -4611,6 +5037,289 @@ fn line_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_parser_preserves_cells_alignment_and_source() {
+        for newline in ["\n", "\r\n"] {
+            for outer in [false, true] {
+                let row = |s: &str| if outer { format!("| {s} |") } else { s.to_owned() };
+                let text = [row("中文 | **标题** | 数量"), row(":--- | :---: | ---:"),
+                    row(r"甲\|乙 | ``a|b`` | *二*")].join(newline);
+                let original = text.clone();
+                let blocks = parse(&text);
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].kind, Kind::Table);
+                assert_eq!(&text[blocks[0].range.clone()], text);
+                assert_eq!(table_alignments(&row(":--- | :---: | ---:")).unwrap(),
+                    [egui::Align::LEFT, egui::Align::Center, egui::Align::RIGHT]);
+                let last = text.lines().last().unwrap();
+                let cells: Vec<_> = table_cells(last).into_iter().map(|r| &last[r]).collect();
+                assert_eq!(cells, [r"甲\|乙", "``a|b``", "*二*"]);
+                assert_eq!(text, original);
+            }
+        }
+        for invalid in ["a | b\n--- | --", "a | b\n---", "a | b\n:--: | ---", "a | b\n--- | --- | ---"] {
+            assert!(!parse(invalid).iter().any(|b| b.kind == Kind::Table), "{invalid}");
+        }
+        assert_eq!(parse("paragraph\na | b\n--- | ---\nx | y")[1].kind, Kind::Table);
+    }
+
+    #[test]
+    fn table_live_click_edit_keeps_following_layout_and_source() {
+        for font_size in [12.5, 16.0, 28.5] {
+            for row in ["甲乙 | value".to_owned(), format!("{} | value", "宽内容".repeat(80))] {
+                let source = format!("中文 | Right\n:--- | ---:\n{row}\n\nFollowing paragraph.");
+                let ctx = egui::Context::default();
+                crate::setup_fonts(&ctx);
+                let mut app = markdown_app();
+                let file = app.active_mut().unwrap();
+                file.draft_text = Some(source.clone());
+                file.sync_draft();
+                file.editor_state.font_size = font_size;
+                file.markdown_mode = Mode::Live;
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let id = app.active_id.unwrap();
+                let rect = |at| ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("markdown_block", id, at)))).unwrap();
+                let following = source.find("Following").unwrap();
+                let before = rect(following);
+                click(&ctx, &mut app, rect(0).min + egui::vec2(20.0, 15.0));
+                assert!(app.active().unwrap().markdown.cell_editing.is_some());
+                assert!(app.active().unwrap().markdown.editing.is_none());
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                assert!((before.top() - rect(following).top()).abs() < 1.1,
+                    "font {font_size}: before {before:?}, after {:?}", rect(following));
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(source.as_str()));
+                draw(&ctx, &mut app, vec![egui::Event::Key {
+                    key: egui::Key::Escape, physical_key: None, pressed: true,
+                    repeat: false, modifiers: egui::Modifiers::NONE,
+                }]);
+                draw(&ctx, &mut app, vec![]);
+                assert!(app.active().unwrap().markdown.cell_editing.is_none());
+                assert!((before.top() - rect(following).top()).abs() < 1.1);
+                assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(source.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn table_inline_code_stays_styled_until_a_backtick_is_deleted() {
+        let ctx = egui::Context::default(); crate::setup_fonts(&ctx);
+        let mut app = markdown_app();
+        let source = "| API | Note |\n| --- | --- |\n| `https://api.example.com` | keep |";
+        let file = app.active_mut().unwrap(); file.draft_text = Some(source.into()); file.sync_draft(); file.markdown_mode = Mode::Live;
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let id = app.active_id.unwrap();
+        let cell = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_cell", id, 0usize, 1usize, 0usize)))).unwrap();
+        click(&ctx, &mut app, cell.center());
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let inspect = |output: egui::FullOutput| output.shapes.iter().rev().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().contains("https://api.example.com") && text.galley.text().starts_with('`') => Some(text.galley.job.clone()), _ => None,
+        }).unwrap();
+        let job = inspect(draw(&ctx, &mut app, vec![]));
+        assert!(job.sections.iter().filter(|section| job.text[section.byte_range.clone()].contains('`'))
+            .all(|section| section.format.color == Color32::TRANSPARENT));
+        assert!(job.sections.iter().any(|section| section.format.font_id.family == FontFamily::Monospace
+            && section.format.background != Color32::TRANSPARENT));
+        let edit_id = egui::Id::new(("markdown_cell_edit", id, 0usize, 1usize, 0usize));
+        let mut state = egui::TextEdit::load_state(&ctx, edit_id).unwrap();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(1)))); state.store(&ctx, edit_id);
+        draw(&ctx, &mut app, vec![egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true,
+            repeat: false, modifiers: Default::default() }]);
+        let result = draw(&ctx, &mut app, vec![]);
+        assert!(result.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "https://api.example.com`"
+                && text.galley.job.sections.iter().all(|s| s.format.color != Color32::TRANSPARENT))));
+        assert!(app.active().unwrap().draft_text.as_deref().unwrap().contains("| https://api.example.com` | keep |"));
+    }
+
+    #[test]
+    fn table_cell_glyph_baselines_stay_put_on_entry() {
+        for size in [12.5, 16.0, 22.0, 28.5] {
+            for row in [0usize, 1] {
+                let ctx = egui::Context::default(); crate::setup_fonts(&ctx);
+                let mut app = markdown_app();
+                let source = "| Header中文 | Other |\n| --- | --- |\n| value中文 | end |";
+                let file = app.active_mut().unwrap(); file.draft_text = Some(source.into()); file.sync_draft();
+                file.markdown_mode = Mode::Live; file.editor_state.font_size = size;
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let label = if row == 0 { "Header中文" } else { "value中文" };
+                let positions = |output: egui::FullOutput| {
+                    output.shapes.iter().rev().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => Some(text.galley.rows.iter()
+                            .flat_map(|r| r.glyphs.iter().map(|g| text.pos + g.pos.to_vec2())).collect::<Vec<_>>()),
+                        _ => None,
+                    }).unwrap()
+                };
+                let before = positions(draw(&ctx, &mut app, vec![]));
+                let id = app.active_id.unwrap();
+                let cell = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_cell", id, 0usize, row, 0usize)))).unwrap();
+                click(&ctx, &mut app, cell.center());
+                for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+                let after = positions(draw(&ctx, &mut app, vec![]));
+                assert_eq!(before.len(), after.len());
+                for (a,b) in before.iter().zip(after) { assert!(a.distance(b) < 0.25, "size={size} row={row}: {a:?} -> {b:?}"); }
+            }
+        }
+    }
+
+    #[test]
+    fn table_right_click_insert_submenu_changes_column_count() {
+        let ctx = egui::Context::default(); crate::setup_fonts(&ctx);
+        let mut app = markdown_app();
+        let file = app.active_mut().unwrap(); file.draft_text = Some("| A | B |\n| --- | --- |\n| one | two |".into());
+        file.sync_draft(); file.markdown_mode = Mode::Live;
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let id = app.active_id.unwrap();
+        let cell = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_cell", id, 0usize, 1usize, 0usize)))).unwrap();
+        for pressed in [true, false] { draw(&ctx, &mut app, vec![egui::Event::PointerMoved(cell.center()), egui::Event::PointerButton {
+            pos: cell.center(), button: egui::PointerButton::Secondary, pressed, modifiers: Default::default(),
+        }]); }
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let submenu = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("table_insert_menu", id, 0usize, "column")))).unwrap();
+        for _ in 0..4 { draw(&ctx, &mut app, vec![egui::Event::PointerMoved(submenu.center())]); }
+        let action = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("table_insert_action", id, 0usize, "column", 1usize)))).unwrap();
+        click(&ctx, &mut app, action.center());
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let source = app.active().unwrap().draft_text.as_deref().unwrap();
+        assert_eq!(table_cells(source.lines().next().unwrap()).len(), 3, "{source}");
+        assert!(source.contains("one")); assert!(source.contains("two"));
+    }
+
+    #[test]
+    fn table_right_click_delete_targets_the_clicked_cell_and_preserves_surroundings() {
+        for active in [false, true] {
+            let ctx = egui::Context::default(); crate::setup_fonts(&ctx);
+            let mut app = markdown_app();
+            let source = "before\n\n| A | B |\n| --- | --- |\n| keep | one |\n| remove | two |\n\nafter";
+            let start = source.find("| A").unwrap();
+            let file = app.active_mut().unwrap(); file.draft_text = Some(source.into()); file.sync_draft(); file.markdown_mode = Mode::Live;
+            for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+            let id = app.active_id.unwrap();
+            let cell = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("markdown_cell", id, start, 2usize, 1usize)))).unwrap();
+            if active { click(&ctx, &mut app, cell.center()); for _ in 0..3 { draw(&ctx, &mut app, vec![]); } }
+            for pressed in [true, false] { draw(&ctx, &mut app, vec![egui::Event::PointerMoved(cell.center()), egui::Event::PointerButton {
+                pos: cell.center(), button: egui::PointerButton::Secondary, pressed, modifiers: Default::default(),
+            }]); }
+            for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+            let row = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("table_delete_row", id, start)))).unwrap();
+            click(&ctx, &mut app, row.center());
+            for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+            let result = app.active().unwrap().draft_text.as_deref().unwrap();
+            assert!(result.starts_with("before\n\n| A | B |")); assert!(result.ends_with("\n\nafter"));
+            assert!(result.contains("| keep | one |")); assert!(!result.contains("remove"), "active={active}: {result}");
+            assert!(parse(result).iter().any(|block| matches!(block.kind, Kind::Table)));
+        }
+    }
+
+    #[test]
+    fn table_cell_live_input_tab_escape_preserves_other_source_bytes() {
+        let source = "| 中文 | **Right** |\r\n| :--- | ---: |\r\n| 甲\\|乙 | `二` |\r\n\r\nFollowing.";
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        let mut app = markdown_app();
+        let file = app.active_mut().unwrap();
+        file.draft_text = Some(source.to_owned());
+        file.sync_draft();
+        file.markdown_mode = Mode::Live;
+        for _ in 0..3 { draw(&ctx, &mut app, vec![]); }
+        let id = app.active_id.unwrap();
+        let cell = ctx.data(|data| data.get_temp::<egui::Rect>(
+            egui::Id::new(("markdown_cell", id, 0usize, 1usize, 0usize)))).unwrap();
+        click(&ctx, &mut app, cell.center());
+        draw(&ctx, &mut app, vec![]);
+        assert!(app.active().unwrap().markdown.editing.is_none());
+        assert_eq!(app.active().unwrap().markdown.cell_editing.as_ref().unwrap().text, r"甲\|乙");
+        draw(&ctx, &mut app, vec![egui::Event::Text("新|字".into())]);
+        let edited = app.active().unwrap().draft_text.clone().unwrap();
+        assert!(edited.contains(r"新\|字"), "{edited:?}");
+        assert!(edited.starts_with("| 中文 | **Right** |\r\n| :--- | ---: |\r\n| "));
+        assert!(edited.ends_with(" | `二` |\r\n\r\nFollowing."));
+        assert_eq!(parse(&edited)[0].kind, Kind::Table);
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None,
+            pressed: true, repeat: false, modifiers };
+        let command = egui::Modifiers { command: true, mac_cmd: true, ..Default::default() };
+        draw(&ctx, &mut app, vec![]);
+        draw(&ctx, &mut app, vec![key(egui::Key::Z, command)]);
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(source));
+        assert!(app.active().unwrap().markdown.cell_editing.is_some());
+        draw(&ctx, &mut app, vec![egui::Event::Text("新|字".into())]);
+        let edited = app.active().unwrap().draft_text.clone().unwrap();
+        draw(&ctx, &mut app, vec![key(egui::Key::Tab, egui::Modifiers::NONE)]);
+        draw(&ctx, &mut app, vec![]);
+        let next = app.active().unwrap().markdown.cell_editing.as_ref().unwrap();
+        assert_eq!((next.row, next.column, next.text.as_str()), (1, 1, "`二`"));
+        assert_eq!(&edited[next.source.clone()], "`二`");
+        draw(&ctx, &mut app, vec![key(egui::Key::Tab, egui::Modifiers::SHIFT)]);
+        draw(&ctx, &mut app, vec![]);
+        assert_eq!(app.active().unwrap().markdown.cell_editing.as_ref().unwrap().column, 0);
+        draw(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert!(app.active().unwrap().markdown.cell_editing.is_none());
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(edited.as_str()));
+        assert_eq!(table_cell_source(r"中\|文|值\\|末"), r"中\|文\|值\\\|末");
+        click(&ctx, &mut app, cell.center());
+        draw(&ctx, &mut app, vec![]);
+        draw(&ctx, &mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(app.active().unwrap().markdown.cell_editing.is_none());
+        assert_eq!(app.active().unwrap().draft_text.as_deref(), Some(edited.as_str()));
+        assert_eq!(table_cell_source("末\\"), "末\\\\");
+        assert_eq!(table_cells(&format!("{}|next", table_cell_source("末\\"))).len(), 2);
+    }
+
+    #[test]
+    fn table_click_mapping_skips_hidden_link_destinations() {
+        for cell in ["[x](world)world", "[x](abc)abc", "[x](hello world) world", "[中](中文)中文", "**[x](world)**world"] {
+            let suffix = if cell.ends_with("中文") { "中文" } else if cell.ends_with("abc") { "abc" } else { "world" };
+            let expected = cell.rfind(suffix).unwrap();
+            let visible_prefix = inline_job(&cell[..expected], FontId::proportional(16.0), crate::DARK.text_main,
+                &crate::DARK, f32::INFINITY, None).text.chars().count();
+            assert_eq!(table_visible_cursor_byte(cell, visible_prefix, 16.0, &crate::DARK), expected, "{cell}");
+            assert_eq!(table_visible_cursor_byte(cell, visible_prefix + suffix.chars().count(), 16.0, &crate::DARK), cell.len(), "{cell}");
+        }
+    }
+
+    #[test]
+    fn table_header_is_bold_and_cells_render_inline_styles() {
+        let pal = crate::DARK;
+        let text = "中文 *强调* `code` [link](target)";
+        let job = table_cell_job(text, 0..text.len(), true, 16.0, &pal, None);
+        assert_eq!(job.text, "中文 强调 code link");
+        assert!(job.sections.iter().filter(|s| !matches!(s.format.font_id.family, FontFamily::Monospace))
+            .all(|s| s.format.font_id.family == FontFamily::Name("brand".into())));
+        let text = r"甲\|乙 **粗体**";
+        assert_eq!(table_cell_job(text, 0..text.len(), false, 16.0, &pal, None).text, "甲|乙 粗体");
+    }
+
+    #[test]
+    fn table_grid_measurement_click_and_long_table_are_consistent() {
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        let text = "| 中文 | Right |\n| :--- | ---: |\n| 甲乙 | **value** |";
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let pal = crate::DARK;
+                let body = 16.0;
+                let block = parse(text).remove(0);
+                let layout = table_layout(ui, text, body, &pal, None);
+                assert_eq!(layout.rows.len(), 2);
+                assert_eq!(layout.rows[1][1].galley.text(), "value");
+                let height = measure_block(ui, &block, text, 160.0, &pal, body, &Images::default(), false);
+                assert_eq!(height, measure_block(ui, &block, text, 160.0, &pal, body, &Images::default(), true));
+                let (lines, _) = line_layout(ui, text, &pal, 160.0, body, &Images::default(), true);
+                assert!((lines.iter().sum::<f32>() - height).abs() < 0.01);
+                let cursor = editing_cursor_from_click(ui, text,
+                    egui::vec2(10.0, 5.0 + layout.row_height + 7.0), &Kind::Table, 160.0, body, &pal);
+                assert_eq!(char_to_byte(text, cursor), text.find("甲乙").unwrap());
+                let (response, _) = render_block(ui, &block, text, 160.0, &pal, body, &Images::default(), false, None, Lang::ZhCn, true, 1);
+                assert!((response.rect.height() - height).abs() < 1.0, "{} vs {height}", response.rect.height());
+                let long = format!("a | b\n--- | ---\n{}", "中文 | `a|b`\n".repeat(2000));
+                let long = long.trim_end();
+                let layout = table_layout(ui, long, body, &pal, None);
+                assert_eq!(layout.rows.len(), 2001);
+                assert!(layout.height().is_finite());
+                assert_eq!(parse(long).len(), 1);
+            });
+        });
+    }
 
     #[test]
     fn markdown_extension_is_recognised_by_the_workspace_theme() {
@@ -8576,8 +9285,20 @@ mod tests {
                 lines += 1;
             }
         }
-        // Code and table both stay on one long line.
-        assert!(lines >= 2, "preview long lines were not measured: {lines}");
+        // Code is visible; a grid row below the viewport is intentionally
+        // culled. Validate the table's non-wrapping galley independently.
+        assert!(lines >= 1, "preview long lines were not measured: {lines}");
+        let source = app.active().unwrap().draft_text.as_ref().unwrap();
+        let table = parse(source).into_iter().find(|b| b.kind == Kind::Table).unwrap();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let layout = table_layout(ui, &source[table.range.clone()], cjk, &crate::DARK, None);
+                assert_eq!(layout.rows[1][0].galley.rows.len(), 1);
+                let expected = inline_job(long, FontId::proportional(cjk), crate::DARK.text_main,
+                    &crate::DARK, f32::INFINITY, None).text;
+                assert_eq!(layout.rows[1][0].galley.text(), expected);
+            });
+        });
         // The page is the scrollable width, not just the widest block: it must
         // keep one whole CJK glyph of blank space past the longest line.
         assert!(

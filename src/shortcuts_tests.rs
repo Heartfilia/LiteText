@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn escape_exits_continuous_marker_without_removing_marks() {
+    for pen in [0, crate::text_tools::CONCEAL] {
+        let ctx = egui::Context::default(); let mut app = LiteTextApp::default(); app.new_document();
+        let file = app.active_mut().unwrap(); file.draft_text = Some("marked".into());
+        file.editor_state.tools.pen = Some(pen); file.editor_state.tools.pen_menu = true;
+        file.editor_state.tools.marks.push(crate::text_tools::Mark { range: 0..6, color: pen });
+        let _ = ctx.run(egui::RawInput { events: vec![egui::Event::Key {
+            key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE,
+        }], ..Default::default() }, |ctx| { app.handle_shortcuts(ctx); });
+        let file = app.active().unwrap();
+        assert!(file.editor_state.tools.pen.is_none()); assert!(!file.editor_state.tools.pen_menu);
+        assert_eq!(file.editor_state.tools.marks, vec![crate::text_tools::Mark { range: 0..6, color: pen }]);
+        assert_eq!(file.draft_text.as_deref(), Some("marked"));
+    }
+}
+
+#[test]
 fn workspace_zoom_accepts_plus_equals_is_bounded_persistent_and_configurable() {
     let ctx = egui::Context::default();
     let mut app = LiteTextApp::default();

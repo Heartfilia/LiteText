@@ -1102,6 +1102,8 @@ pub(crate) fn show(
             editor::paint_unfocused_selection(ui, &mut output);
             if let Some(render) = &tools.workspace {
                 render.paint_selected_text(ui, &output);
+            } else {
+                crate::text_tools::paint_selected_text(ui, &output, ui.visuals().selection.stroke.color);
             }
             if focus {
                 output.response.request_focus();
