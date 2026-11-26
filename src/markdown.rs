@@ -2236,7 +2236,7 @@ fn table_structure_menu(ui: &mut egui::Ui, file: u64, table: usize, row: usize, 
 fn paint_table(ui: &egui::Ui, layout: &TableLayout, origin: egui::Pos2, pal: &Palette) {
     let rect = egui::Rect::from_min_size(origin, egui::vec2(layout.width(), layout.height()));
     ui.painter().rect_filled(rect, 0.0, pal.bg_inset);
-    let stroke = Stroke::new(1.0, pal.text_faint.gamma_multiply(0.35));
+    let stroke = Stroke::new(1.0_f32, pal.text_faint.gamma_multiply(0.35));
     for (row_index, row) in layout.rows.iter().enumerate() {
         let y = origin.y + row_index as f32 * layout.row_height;
         if row_index == 0 {
