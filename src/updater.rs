@@ -1348,7 +1348,12 @@ impl LiteTextApp {
             ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("update_install_hint_rect"), hint.rect));
         }
         if !self.updater.message.is_empty() {
-            let status = ui.add(egui::Label::new(egui::RichText::new(&self.updater.message).small()).wrap());
+            let has_new_version = self.updater.release.as_ref()
+                .is_some_and(|release| is_newer(&release.tag_name, VERSION).unwrap_or(false));
+            let status_text = egui::RichText::new(&self.updater.message)
+                .size(14.0)
+                .color(if has_new_version { egui::Color32::from_rgb(48, 160, 92) } else { pal.text_main });
+            let status = ui.add(egui::Label::new(status_text).wrap());
             ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("update_status_rect"), status.rect));
         }
         if VERSION == "dev" {

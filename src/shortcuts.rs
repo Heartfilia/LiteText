@@ -616,6 +616,18 @@ impl LiteTextApp {
                     if let Some(file) = self.active_mut() {
                         match action {
                             Find | FocusReplace => {
+                                if action == Find && !file.editor_state.tools.find_open
+                                    && let Some(cursor) = file.editor_state.cursor
+                                    && cursor.primary.index != cursor.secondary.index
+                                    && let Some(text) = file.draft_text.as_deref()
+                                {
+                                    let start = cursor.primary.index.min(cursor.secondary.index);
+                                    let end = cursor.primary.index.max(cursor.secondary.index);
+                                    let byte = |index| if file.editor_state.large.active && file.editor_state.large.indexed_len == Some(text.len()) {
+                                        file.editor_state.large.byte_for_char(text, index)
+                                    } else { crate::text_tools::byte_at(text, index) };
+                                    file.editor_state.tools.query = text.get(byte(start)..byte(end)).unwrap_or_default().to_owned();
+                                }
                                 file.editor_state.tools.find_open = true;
                                 file.editor_state.tools.focus_find = Some(action == FocusReplace);
                             }

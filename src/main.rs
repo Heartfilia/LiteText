@@ -3238,7 +3238,7 @@ impl LiteTextApp {
                     .iter()
                     .filter(|font| !zh || font.chinese)
                     .collect();
-                let sample_text = if zh { "【中文】[Aa 012]" } else { "[Aa 012]" };
+                let sample_groups = ["【简中 繁體】", "[Eng 01]", "[良い]", "[한국인]"];
                 for font in visible.iter().copied() {
                     let selected = self.workspace_font.as_ref().is_some_and(|choice| {
                         choice.family == font.family && choice.path == font.path
@@ -3309,34 +3309,23 @@ impl LiteTextApp {
                         // dropped only when there is no room or the font lacks the
                         // sample glyphs (the name alone still identifies the row).
                         let sample_left = left + name_width + GAP;
+                        let mut cursor = sample_left;
                         let sample_room = rect.right() - LEFT - sample_left;
-                        if sample_room > 30.0
-                            && let Some(handle) = self
-                                .font_previews
-                                .texture(ui.ctx(), sample_text, &font.path, font.index)
-                                .or_else(|| {
-                                    self.font_previews.texture(
-                                        ui.ctx(),
-                                        if zh { "中文" } else { "Aa 012" },
-                                        &font.path,
-                                        font.index,
-                                    )
-                                })
-                        {
-                            let mut size = egui::vec2(handle.aspect_ratio() * HEIGHT, HEIGHT);
-                            if size.x > sample_room {
-                                size *= sample_room / size.x;
+                        if sample_room > 30.0 {
+                            let gap = 6.0;
+                            let mut remaining = sample_room;
+                            for sample in sample_groups {
+                                let Some(handle) = self.font_previews.texture(ui.ctx(), sample, &font.path, font.index) else { continue; };
+                                if remaining <= 20.0 { break; }
+                                let size = (egui::vec2(handle.aspect_ratio() * HEIGHT, HEIGHT) * 0.82)
+                                    .min(egui::vec2(remaining, HEIGHT));
+                                let image = egui::Rect::from_min_size(
+                                    egui::pos2(cursor, rect.center().y - size.y * 0.5), size);
+                                painter.image(handle.id(), image,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    pal.text_faint);
+                                cursor += size.x + gap; remaining -= size.x + gap;
                             }
-                            let image = egui::Rect::from_min_size(
-                                egui::pos2(sample_left, rect.center().y - size.y * 0.5),
-                                size,
-                            );
-                            painter.image(
-                                handle.id(),
-                                image,
-                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                pal.text_faint,
-                            );
                         }
                     }
                     ui.ctx().data_mut(|d| {

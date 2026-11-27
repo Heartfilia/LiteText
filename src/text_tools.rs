@@ -637,6 +637,22 @@ pub(crate) fn find_bar(
         || (!managed
             && crate::shortcuts::take_binding(ui.ctx(), crate::shortcuts::Action::Find.binding()));
     if shortcut {
+        // Opening find from a non-empty editor selection should seed the query
+        // once. Keep the existing query when the bar is already open/focused.
+        if !file.editor_state.tools.find_open
+            && let Some(cursor) = file.editor_state.cursor
+            && cursor.primary.index != cursor.secondary.index
+            && let Some(text) = file.draft_text.as_deref()
+        {
+            let start = cursor.primary.index.min(cursor.secondary.index);
+            let end = cursor.primary.index.max(cursor.secondary.index);
+            let byte = |index| {
+                if file.editor_state.large.active && file.editor_state.large.indexed_len == Some(text.len()) {
+                    file.editor_state.large.byte_for_char(text, index)
+                } else { byte_at(text, index) }
+            };
+            file.editor_state.tools.query = text.get(byte(start)..byte(end)).unwrap_or_default().to_owned();
+        }
         file.editor_state.tools.find_open = true;
     }
     if !file.editor_state.tools.find_open {
@@ -3265,6 +3281,34 @@ mod tests {
             );
             assert_eq!(file.draft_text.as_deref(), Some(original.as_str()));
         }
+    }
+
+    #[test]
+    fn find_shortcut_seeds_nonempty_selection_once() {
+        let ctx = egui::Context::default(); crate::setup_fonts(&ctx);
+        let mut app = crate::LiteTextApp::default(); app.new_document();
+        let file = app.active_mut().unwrap(); file.draft_text = Some("before selected text after".into());
+        file.editor_state.cursor = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(7), egui::text::CCursor::new(20)));
+        let _ = ctx.run(egui::RawInput { events: vec![egui::Event::Key {
+            key: egui::Key::F, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }], ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, crate::Lang::En));
+        });
+        assert_eq!(app.active().unwrap().editor_state.tools.query, "selected text");
+        assert!(app.active().unwrap().editor_state.tools.find_open);
+        app.active_mut().unwrap().editor_state.tools.query = "custom".into();
+        app.active_mut().unwrap().editor_state.tools.find_open = true;
+        app.active_mut().unwrap().editor_state.cursor = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0), egui::text::CCursor::new(6)));
+        let _ = ctx.run(egui::RawInput { events: vec![egui::Event::Key {
+            key: egui::Key::F, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }], ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::draft_editor(ui, app.active_mut().unwrap(), &crate::DARK, false, crate::Lang::En));
+        });
+        assert_eq!(app.active().unwrap().editor_state.tools.query, "custom");
     }
 
     #[test]

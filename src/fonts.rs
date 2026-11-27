@@ -556,8 +556,9 @@ impl Previews {
         Some(bytes)
     }
 
-    /// A cheap clone of the texture holding `text` set in the font at `path`,
-    /// or `None` when the font has no glyphs for it.
+    /// Rasterize a sample only when the selected face contains every glyph.
+    /// Callers may request independent groups so one missing script does not
+    /// hide the other groups in the same preview row.
     pub(crate) fn texture(
         &mut self,
         ctx: &egui::Context,
