@@ -212,11 +212,13 @@ pub(crate) struct EditorState {
     pub(crate) syntax_cache: std::sync::Arc<std::sync::Mutex<crate::workspace_theme::SyntaxCache>>,
     pub(crate) line_ending: crate::line_endings::LineEnding,
     pub(crate) composing: bool,
+    pub(crate) context_plugin: Option<crate::plugin_menu::Action>,
     pub(crate) minimap: crate::minimap::Preview,
     pub(crate) minimap_rows: Vec<usize>,
     pub(crate) minimap_rows_key: Option<(usize, u64, u32)>,
     /// Source editors enable this explicitly; Markdown split keeps it off.
     pub(crate) minimap_enabled: bool,
+    pub(crate) minimap_persistent: bool,
 }
 
 impl EditorState {
@@ -1029,6 +1031,12 @@ fn show_impl(
                     changed = true;
                     menu.close_menu();
                 }
+                if line_layout.is_none() && !text.is_empty()
+                    && let Some(action) = crate::plugin_menu::submenu(menu, file_id, true, t.plugins == "插件") {
+                    state.context_plugin = Some(action);
+                    state.cursor = output.state.cursor.char_range();
+                    menu.close_menu();
+                }
                 let jump_range = bytes.clone().or_else(|| {
                     let cursor = output.state.cursor.char_range()?;
                     (cursor.primary.index == cursor.secondary.index)
@@ -1077,7 +1085,10 @@ fn show_impl(
                 let galley = ui.fonts(|fonts| fonts.layout_job((*output.galley.job).clone()));
                 let galley = state.folds.layout(galley, 0);
                 let delta = galley.rows[row_index].rect.top() - output.galley.rows[row_index].rect.top();
-                let offset = depth_scroll_offset(viewport, delta, galley.size().y + 24.0);
+                let height = galley.size().y + if line_layout.is_none() {
+                    12.0 + viewport.height() * 0.5
+                } else { 24.0 };
+                let offset = depth_scroll_offset(viewport, delta, height);
                 depth_offset = Some(offset);
                 // Batch folding may remove most of the document, including
                 // nodes above this header. Keep the real document origin and
@@ -1088,6 +1099,14 @@ fn show_impl(
                 ui.ctx().request_repaint();
             }
             ui.set_min_height(state.fold_scroll_extent);
+            if line_layout.is_none() {
+                // Use the real folded/wrapped galley, not the viewport-sized
+                // TextEdit response: short and empty documents must not overflow.
+                // Split view keeps its shared source/preview extent unchanged.
+                ui.expand_to_include_rect(egui::Rect::from_min_size(origin, egui::vec2(
+                    0.0, output.galley.size().y + 12.0 + viewport.height() * 0.5,
+                )));
+            }
         });
     let mut scroll_output = finish_fold_scroll(ui.ctx(), scroll_output, depth_offset.or((fold_pointer || fold_selection).then_some(viewport_offset)));
     if state.minimap_enabled && let Some(galley) = minimap_galley {
@@ -1108,6 +1127,7 @@ fn show_impl(
             state.minimap_rows = galley.rows.iter().enumerate().filter(|(_, row)| row.rect.height() >= 1.0).map(|(index, _)| index).collect();
             state.minimap_rows_key = Some(rows_key);
         }
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("text_minimap", file_id)).with("persistent"), state.minimap_persistent));
         if let Some(y) = state.minimap.show(ui, egui::Id::new(("text_minimap", file_id)), rect,
             state.minimap_rows.len(), scroll_output.state.offset.y, scroll_output.content_size.y, viewport.height(), pal,
             |index| {
@@ -1231,6 +1251,10 @@ fn apply_line_heights(job: &mut egui::text::LayoutJob, heights: &[f32], fonts: &
     }
     job.sections = sections;
 }
+
+#[cfg(test)]
+#[path = "editor_scroll_tail_tests.rs"]
+mod scroll_tail_tests;
 
 #[cfg(test)]
 mod tests {

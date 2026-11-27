@@ -49,6 +49,7 @@ mod pinned_tabs;
 mod vertical_tabs;
 mod tab_close_button;
 mod minimap;
+mod plugin_menu;
 #[cfg(test)]
 mod minimap_hex_tests;
 #[cfg(test)]
@@ -506,6 +507,9 @@ struct LiteTextApp {
     undo_limit_input: Option<String>,
     #[serde(skip)]
     undo_limit_error: Option<String>,
+    /// Preview minimap behavior: false reveals on hover, true stays visible.
+    #[serde(default)]
+    minimap_persistent: bool,
     terminal: terminal::Settings,
     updates: updater::Settings,
     #[serde(skip)]
@@ -680,6 +684,7 @@ impl Default for LiteTextApp {
             undo_limit: 50,
             undo_limit_input: None,
             undo_limit_error: None,
+            minimap_persistent: false,
             terminal: Default::default(),
             updates: Default::default(),
             diagnostics_settings: Default::default(),
@@ -1844,6 +1849,7 @@ impl eframe::App for LiteTextApp {
                 .clamp(MIN_WORKSPACE_FONT_SIZE, MAX_WORKSPACE_FONT_SIZE)
         } else { 14.0 };
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("workspace_undo_limit"), self.undo_limit.clamp(20, 500)));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_view_persistent"), self.minimap_persistent));
         self.poll_terminal();
         self.poll_updates();
         #[cfg(not(test))]
@@ -1958,6 +1964,7 @@ impl eframe::App for LiteTextApp {
                 }
             });
 
+        self.execute_context_plugin(ctx);
         self.observe_diagnostics();
         self.settings_window(ctx, pal);
         self.plugin_error_window(ctx);
@@ -2933,6 +2940,19 @@ impl LiteTextApp {
                                             self.tab_drag_id = None;
                                             self.reveal_tab = self.active_id;
                                             ui.ctx().request_repaint();
+                                        }
+                                    });
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    let zh = self.lang == Lang::ZhCn;
+                                    ui.label(RichText::new(if zh { "预览视图常驻" } else { "Persistent preview" }).size(13.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let options = vec![(if zh { "否" } else { "No" }.to_owned(), false), (if zh { "是" } else { "Yes" }.to_owned(), true)];
+                                        if let Some(value) = dropdown(ui, pal, egui::Id::new("settings_minimap_persistent"),
+                                            if self.minimap_persistent { options[1].0.clone() } else { options[0].0.clone() }, options, SETTINGS_SELECT_WIDTH) {
+                                            self.minimap_persistent = value; ui.ctx().request_repaint();
                                         }
                                     });
                                 });
@@ -4207,6 +4227,7 @@ fn welcome_screen(ui: &mut egui::Ui, app: &mut LiteTextApp, pal: &Palette) {
 }
 
 fn draft_editor(ui: &mut egui::Ui, file: &mut LoadedFile, pal: &Palette, focus: bool, lang: Lang) {
+    file.editor_state.minimap_persistent = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("preview_view_persistent"))).unwrap_or(false);
     file.editor_state.minimap_enabled = !markdown::is_markdown(file) || file.markdown_mode == markdown::Mode::Source;
     if let Some(render) = &file.editor_state.tools.workspace {
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, render.colors.background);
@@ -4384,8 +4405,7 @@ fn hex_view(
     );
 
     let total_rows = file.bytes.len().div_ceil(HEX_BYTES_PER_ROW);
-    let minimap_enabled = !markdown::is_markdown(file)
-        || file.markdown_mode == markdown::Mode::Source;
+    let minimap_enabled = !markdown::is_markdown(file) || file.markdown_mode == markdown::Mode::Source;
     let minimap_id = ui.make_persistent_id(("hex_minimap", file.id));
     // The overview is navigation only: even its first-frame press must not
     // accidentally select a byte in the rows painted underneath its Area.
@@ -4623,6 +4643,8 @@ fn hex_view(
                 if previous_revision != Some(revision) {
                     preview.invalidate();
                 }
+                let persistent = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("preview_view_persistent"))).unwrap_or(false);
+                ui.ctx().data_mut(|d| d.insert_temp(minimap_id.with("persistent"), persistent));
                 let requested_y = preview.show(
                     ui,
                     minimap_id,

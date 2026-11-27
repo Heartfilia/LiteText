@@ -104,7 +104,8 @@ impl Preview {
         };
         let end = start + span_rows;
         ui.ctx().data_mut(|data| data.insert_temp(id.with("minimap_sample_range"), start..end));
-        let pointer_near = ui.input(|input| input.pointer.hover_pos().is_some_and(|pos|
+        let persistent = ui.ctx().data(|d| d.get_temp::<bool>(id.with("persistent"))).unwrap_or(false);
+        let pointer_near = persistent || ui.input(|input| input.pointer.hover_pos().is_some_and(|pos|
             rect.expand2(Vec2::new(18.0, 0.0)).contains(pos)));
         let dragging = self.grab_offset.is_some() && ui.input(|input| input.pointer.primary_down());
         let progress = ui.ctx().animate_bool_with_time(id.with("minimap_reveal"), pointer_near || dragging, 0.18);
@@ -170,7 +171,10 @@ impl Preview {
                         target = Some(geometry.scroll_at(pointer.y, offset));
                 }
                 let painter = overlay.painter().with_clip_rect(area.intersect(clip));
-                let ink = alpha(pal.text_main, (24.0 * progress) as u8);
+                // Light canvases need stronger translucent ink; keep dark previews subdued.
+                // Apply the same opacity to syntax colors without changing their hue.
+                let text_opacity = if pal.dark { 24.0 } else { 100.0 };
+                let ink = alpha(pal.text_main, (text_opacity * progress) as u8);
                 let column = 2.2_f32;
                 let row_height = rect.height() / self.cache.len().max(1) as f32;
                 for (index, line) in self.cache.iter().enumerate() {
@@ -187,7 +191,7 @@ impl Preview {
                             let color = line.colors.get(index).copied().unwrap_or(pal.text_main);
                             job.append(&ch.to_string(), 0.0, egui::TextFormat {
                                 font_id: egui::FontId::monospace(MINI_FONT_SIZE),
-                                color: alpha(color, (24.0 * progress) as u8), ..Default::default()
+                                color: alpha(color, (text_opacity * progress) as u8), ..Default::default()
                             });
                         }
                         let galley = painter.layout_job(job);
@@ -203,12 +207,12 @@ impl Preview {
                     painter.rect_filled(
                         geometry.thumb,
                         2.0,
-                        alpha(pal.text_faint, ((if active { 12.0 } else { 7.0 }) * progress) as u8),
+                        alpha(pal.text_faint, ((if !pal.dark { 20.0 } else if active { 12.0 } else { 7.0 }) * progress) as u8),
                     );
                     painter.rect_stroke(
                         geometry.thumb,
                         2.0,
-                        Stroke::new(1.0_f32, alpha(pal.text_faint, (38.0 * progress) as u8)),
+                        Stroke::new(1.0_f32, alpha(pal.text_faint, ((if pal.dark { 38.0 } else { 80.0 }) * progress) as u8)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -300,6 +304,83 @@ mod tests {
             assert_eq!(sample.colors[0], Color32::RED);
             assert_eq!(sample.colors[4], Color32::WHITE);
         }); });
+    }
+
+    fn assert_theme_text_shapes(pal: &Palette, text_alpha: u8, outline_alpha: u8, fill_alpha: u8) {
+        let ctx = egui::Context::default();
+        let id = Id::new("theme-minimap");
+        ctx.data_mut(|data| data.insert_temp(id.with("persistent"), true));
+        let mut preview = Preview::default();
+        let syntax = [Color32::from_rgb(190, 60, 90), Color32::from_rgb(40, 100, 190)];
+        let mut draw = |hover: bool| ctx.run(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 400.0))),
+            time: Some(ctx.input(|input| input.time) + 0.05),
+            events: vec![egui::Event::PointerMoved(if hover { rect().center() } else { Pos2::ZERO })],
+            ..Default::default()
+        }, |ctx| { egui::CentralPanel::default().show(ctx, |ui| {
+            let mut job = egui::text::LayoutJob::default();
+            for (ch, color) in ["l", "e"].into_iter().zip(syntax) {
+                job.append(ch, 0.0, egui::TextFormat::simple(egui::FontId::monospace(14.0), color));
+            }
+            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+            let highlighted = MiniLine::from_glyphs(&galley.rows[0], &galley.job, pal.text_main);
+            preview.show(ui, id, rect(), 1000, 400.0, 1000.0, 200.0, pal, |index| {
+                if index % 2 == 0 { highlighted.clone() } else { MiniLine::from_chars("plain".chars()) }
+            });
+        }); });
+        for _ in 0..8 { let _ = draw(false); }
+        for hover in [false, true] {
+            // Fully revealed persistent previews must not brighten abruptly on hover.
+            let output = draw(hover);
+            let texts: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            }).collect();
+            assert!(!texts.is_empty(), "exercise actual miniature TextShapes");
+            let mut syntax_count = 0;
+            let mut plain_count = 0;
+            let mut vertex_count = 0;
+            let mut opaque_vertices = 0;
+            for text in texts {
+                assert_eq!(text.fallback_color, alpha(pal.text_main, text_alpha));
+                let expected: Vec<_> = match text.galley.text() {
+                    "le" => { syntax_count += 1; syntax.map(|color| alpha(color, text_alpha)).to_vec() }
+                    "plain" => { plain_count += 1; vec![alpha(pal.text_main, text_alpha)] }
+                    other => panic!("unexpected miniature text: {other}"),
+                };
+                assert_eq!(text.galley.job.sections.iter().map(|section| section.format.color).collect::<Vec<_>>(),
+                    if expected.len() == 1 { vec![expected[0]; 5] } else { expected.clone() });
+                for vertex in text.galley.rows.iter().flat_map(|row| &row.visuals.mesh.vertices) {
+                    assert!(expected.contains(&vertex.color), "real glyph mesh must retain tinted syntax colors");
+                    vertex_count += 1;
+                    opaque_vertices += usize::from(vertex.color.a() == 255);
+                }
+            }
+            assert!(syntax_count > 0 && plain_count > 0);
+            assert!(vertex_count > 0, "measure rendered glyphs, not only layout metadata");
+            let opaque_ratio = opaque_vertices as f32 / vertex_count as f32;
+            assert_eq!(opaque_ratio, 0.0, "minimap glyphs must remain translucent");
+            let thumb_rect = Geometry::new(rect(), 400.0, 1000.0, 200.0).thumb;
+            let thumb_shapes: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(shape) if shape.rect == thumb_rect => Some(shape),
+                _ => None,
+            }).collect();
+            let expected_fill = if pal.dark && hover { 12 } else { fill_alpha };
+            assert!(thumb_shapes.iter().any(|shape| shape.fill == alpha(pal.text_faint, expected_fill)));
+            assert!(thumb_shapes.iter().any(|shape| shape.stroke.color == alpha(pal.text_faint, outline_alpha)));
+            assert!(thumb_shapes.iter().all(|shape| shape.fill.a() < 255 && shape.stroke.color.a() < 255));
+        }
+    }
+
+    #[test]
+    fn light_text_shapes_preserve_syntax_hues_with_visible_translucent_ink_and_thumb() {
+        assert_theme_text_shapes(&crate::LIGHT, 100, 80, 20);
+    }
+
+    #[test]
+    fn dark_text_shapes_keep_existing_low_opacity_and_translucent_thumb() {
+        // Hover only changes the existing dark fill from 7 to 12.
+        assert_theme_text_shapes(&crate::DARK, 24, 38, 7);
     }
 
     #[test]

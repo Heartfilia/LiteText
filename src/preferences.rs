@@ -21,6 +21,8 @@ struct Preferences {
     #[serde(default)]
     vertical_tabs: bool,
     undo_limit: usize,
+    #[serde(default)]
+    minimap_persistent: bool,
     workspace_font: Option<crate::fonts::Choice>,
     terminal: crate::terminal::Settings,
     updates: crate::updater::Settings,
@@ -47,6 +49,7 @@ impl Preferences {
             tab_close_mode: app.tab_close_mode,
             vertical_tabs: app.vertical_tabs,
             undo_limit: app.undo_limit.clamp(20, 500),
+            minimap_persistent: app.minimap_persistent,
             workspace_font: app.workspace_font.clone(),
             terminal: app.terminal.clone(), updates: app.updates.clone(),
             shortcut_keys: app.shortcut_keys.clone(), hex_case_upper: app.hex_upper,
@@ -67,6 +70,7 @@ impl Preferences {
         app.tab_close_mode = self.tab_close_mode;
         app.vertical_tabs = self.vertical_tabs;
         app.undo_limit = self.undo_limit.clamp(20, 500);
+        app.minimap_persistent = self.minimap_persistent;
         app.undo_limit_input = None;
         app.undo_limit_error = None;
         app.workspace_font = self.workspace_font;
@@ -254,6 +258,20 @@ mod tests {
             restored.vertical_tabs = !enabled;
             restored.load_preferences().unwrap();
             assert_eq!(restored.vertical_tabs, enabled);
+        }
+    }
+
+    #[test]
+    fn preview_persistence_defaults_to_auto_hide_and_round_trips() {
+        let legacy: Preferences = serde_json::from_str("{}").unwrap();
+        let mut app = LiteTextApp::default(); legacy.apply(&mut app);
+        assert!(!app.minimap_persistent);
+        for enabled in [true, false] {
+            app.minimap_persistent = enabled;
+            let bytes = serde_json::to_vec(&Preferences::capture(&app)).unwrap();
+            let prefs: Preferences = serde_json::from_slice(&bytes).unwrap();
+            let mut restored = LiteTextApp::default(); prefs.apply(&mut restored);
+            assert_eq!(restored.minimap_persistent, enabled);
         }
     }
 

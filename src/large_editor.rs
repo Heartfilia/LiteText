@@ -1187,7 +1187,7 @@ pub(crate) fn show(
                     actual_width + crate::minimap::WIDTH
                 } else { 0.0 }),
                 (24.0 + state.large.visual_starts.last().copied().unwrap_or(count) as f32
-                    * row_height).max(state.fold_scroll_extent),
+                    * row_height + viewport.height() * 0.5).max(state.fold_scroll_extent),
             )));
             let number_gutter = egui::Rect::from_min_max(
                 gutter.min,
@@ -1447,6 +1447,11 @@ pub(crate) fn show(
                     changed = true;
                     ui.close_menu();
                 }
+                if !text.is_empty() && let Some(action) = crate::plugin_menu::submenu(ui, file_id, true, t.plugins == "插件") {
+                    state.context_plugin = Some(action);
+                    state.cursor = state.large.cursor;
+                    ui.close_menu();
+                }
                 let jump_range = if has_selection {
                     Some(
                         state.large.byte_for_char(text, start)
@@ -1483,7 +1488,8 @@ pub(crate) fn show(
                 log::info!(target: "litetext::fold", "Toggle depth: tab_id={file_id}; line={}; collapsed={}", line + 1, state.folds.collapsed(line));
                 state.large.fold_index(&state.folds);
                 let delta = (state.large.visual_starts[line] as f32 - before as f32) * row_height;
-                let height = 24.0 + state.large.visual_starts.last().copied().unwrap_or(0) as f32 * row_height;
+                let height = 24.0 + state.large.visual_starts.last().copied().unwrap_or(0) as f32 * row_height
+                    + viewport.height() * 0.5;
                 let offset = editor::depth_scroll_offset(viewport, delta, height);
                 depth_offset = Some(offset);
                 state.fold_scroll_extent = 0.0;
@@ -1508,6 +1514,7 @@ pub(crate) fn show(
             .filter(|_| tools.find_open)
             && rect.intersects(find) { rect.min.y = rect.min.y.max(find.bottom() + 4.0); }
         let visual_total = state.large.visual_starts.last().copied().unwrap_or(0).max(1);
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("text_minimap", file_id)).with("persistent"), state.minimap_persistent));
         if let Some(y) = state.minimap.show(ui, egui::Id::new(("text_minimap", file_id)), rect,
             visual_total, scroll_output.state.offset.y, scroll_output.content_size.y, viewport.height(), pal,
             |visual| {

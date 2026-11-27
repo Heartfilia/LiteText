@@ -1,6 +1,27 @@
 use crate::*;
 
 #[test]
+fn persistent_preview_is_visible_without_pointer_and_setting_is_selectable() {
+    let ctx = egui::Context::default(); setup_fonts(&ctx);
+    let mut app = LiteTextApp { minimap_persistent: true, ..Default::default() }; app.new_document();
+    app.active_mut().unwrap().draft_text = Some("line\n".repeat(200)); app.active_mut().unwrap().sync_draft();
+    let id = app.active_id.unwrap();
+    for frame in 0..8 { let _ = ctx.run(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0,700.0))),
+        time: Some(frame as f64 * 0.05), ..Default::default()
+    }, |ctx| {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_view_persistent"), app.minimap_persistent));
+        egui::CentralPanel::default().show(ctx, |ui| draft_editor(ui, app.active_mut().unwrap(), &DARK, false, Lang::ZhCn));
+    }); }
+    assert_eq!(ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("text_minimap",id)).with("minimap_visibility"))), Some(1.0));
+    app.show_settings = true;
+    for _ in 0..3 { let _ = ctx.run(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0,700.0))), ..Default::default()
+    }, |ctx| app.settings_window(ctx, &DARK)); }
+    assert!(ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("settings_minimap_persistent").with("button_rect"))).is_some());
+}
+
+#[test]
 fn text_minimap_navigates_both_editors_without_touching_content_and_skips_markdown_views() {
     for large in [false, true] {
         let ctx = egui::Context::default(); setup_fonts(&ctx);

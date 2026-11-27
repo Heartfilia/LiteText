@@ -369,7 +369,8 @@ fn massive_depth_fold_keeps_compact_gutter_real_scroll_range_and_line_one_at_top
                     (gutter.width() - (6.0 + digits as f32 * digit_w + FOLD_WIDTH)).abs() < 1.0
                 );
                 assert!(
-                    size.y <= (24.0 + (siblings + 4) as f32 * 26.0).max(viewport.height() + 4.0),
+                    size.y <= (24.0 + (siblings + 4) as f32 * 26.0 + viewport.height() * 0.5)
+                        .max(viewport.height() + 4.0),
                     "scroll extent includes hidden rows: large={large} wrap={wrap} siblings={siblings} {size:?}"
                 );
                 let bottom_output = scroll_extreme(&ctx, &mut app, id, false);
